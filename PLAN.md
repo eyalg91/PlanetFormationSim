@@ -94,52 +94,36 @@ PlanetFormationSim/
 
 ```mermaid
 graph TD
-%% Files and Modules
-config["config.py
+    config[config.py]
+    state[SimulationState]
+    timeloop[time_stepper.py]
+    diag[diagnostics.py]
+    output[output.py]
 
-(Constants, Parameters)"]
-state["SimulationState
+    subgraph BVP_Loop[BVP Solver Loop - per time step]
+        bvp[bvp_solver.py]
+        odes[odes.py]
+        bcs[boundary_conditions.py]
+    end
 
-(m, r, P, T, L, ρ, t)"]
-eos["eos.py
+    subgraph PhysicsModels[Physics Models - stateless]
+        eos[eos.py]
+        opacity[opacity.py]
+        gradients[gradients.py]
+    end
 
-(Ideal Gas: ρ, c_p, ∇_ad)"]
-opacity["opacity.py
-
-(Bell & Lin 1994 Piecewise)"]
-gradients["gradients.py
-
-(Schwarzschild switch → ∇_eff)"]
-odes["odes.py
-
-(4 ODEs: dr/dm, dP/dm, dL/dm, dT/dm)"]
-bcs["boundary_conditions.py
-
-(Center & Surface BCs)"]
-bvp["bvp_solver.py
-
-(solve_bvp Wrapper)"]
-timeloop["time_stepper.py
-
-(Calculates ∂T/∂t, ∂P/∂t)"]
-
-%% Data Flow
-config -->|Initializes| state
-state -->|Provides previous step| timeloop
-timeloop -->|Passes Time Derivatives| bvp
-
-%% The BVP Solver inner workings
-bvp -->|Evaluates| odes
-bvp -->|Checks| bcs
-
-%% ODE dependencies
-eos -->|Density, Heat Capacity| odes
-gradients -->|Temperature Gradient| odes
-opacity -->|kappa (κ)| gradients
-eos -->|Adiabatic Gradient| gradients
-
-%% Output
-bvp -->|Updates & Saves| state
+    config -->|Initializes| state
+    state -->|Previous step state| timeloop
+    timeloop -->|dT/dt and dP/dt source terms| bvp
+    bvp -->|Evaluates RHS| odes
+    bvp -->|Checks boundary residuals| bcs
+    eos -->|rho and cp| odes
+    gradients -->|grad_eff and is_convective| odes
+    opacity -->|kappa| gradients
+    eos -->|grad_ad| gradients
+    bvp -->|Converged solution| state
+    state -->|Post-solve checks| diag
+    state -->|Per-step snapshots| output
 ```
 
 ---
