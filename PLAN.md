@@ -2,7 +2,7 @@
 
 **Project:** 1D Quasi-Static Planetary Gas Envelope Collapse (Kelvin-Helmholtz Contraction)
 **Course:** Computational Physics
-**Last Updated:** 2026-07-06
+**Last Updated:** 2026-07-13
 
 ---
 
@@ -38,7 +38,7 @@ Simulate the 1D quasi-static spherical collapse of a protoplanetary gas envelope
 - **EOS:** Ideal gas — $P = \dfrac{\rho k_B T}{\mu m_H}$
 - **Opacity:** Bell & Lin (1994) piecewise power-law — $\kappa = \kappa_i \rho^a T^b$ across 8 regimes (see Section 4)
 - **Temperature gradient:** Schwarzschild criterion — $\nabla_\text{eff} = \nabla_\text{rad}$ (radiative) if $\nabla_\text{rad} < \nabla_\text{ad}$; otherwise $\nabla_\text{eff} = \nabla_\text{ad}$ (convective)
-  - $\nabla_\text{rad} = \dfrac{3\kappa L P}{64\pi a c G m T^4}$
+  - `grad_rad = (3 * kappa * L * P) / (16 * pi * a_rad * c * G * m * T^4)`
   - $\nabla_\text{ad} = \dfrac{\gamma - 1}{\gamma}$ for ideal gas
 
 ### Boundary Conditions
@@ -154,7 +154,7 @@ The 8 regimes (CGS units, $\kappa$ in cm² g⁻¹):
 | 1 | Ice grains | $2 \times 10^{-4}$ | 0 | 2 |
 | 2 | Ice grain evaporation | $2 \times 10^{16}$ | 0 | −7 |
 | 3 | Metal grains | $0.1$ | 0 | 1/2 |
-| 4 | Metal grain evaporation | $2 \times 10^{1}$ | 1 | −24 |
+| 4 | Metal grain evaporation | $2 \times 10^{81}$ | 1 | −24 |
 | 5 | Molecules | $10^{-8}$ | 2/3 | 3 |
 | 6 | H⁻ scattering | $10^{-36}$ | 1/3 | 10 |
 | 7 | Bound-free/free-free (Kramers) | $1.5 \times 10^{20}$ | 1 | −5/2 |
@@ -175,6 +175,21 @@ Returns a tuple `(grad_eff, is_convective)` where `is_convective` is a boolean n
 
 $\Delta t \leq \alpha \cdot \min_i\!\left(T_i / |\dot{T}_i|\right)$ — a local thermal timescale limiter. The safety factor $\alpha$ is set in `config.py`. The fixed-dt path is retained for reproducibility and comparison.
 
+### 4.6 Hydrogen Dissociation Halt — Validity Limit of the Quasi-Static Assumption
+
+The quasi-static approximation (hydrostatic equilibrium at every timestep) is valid only while the envelope can radiate away its gravitational energy slowly enough to remain in pressure balance. This assumption breaks down irreversibly when the core temperature approaches **~2000 K**, at which point molecular hydrogen ($H_2$) begins to dissociate into atomic hydrogen ($2H$).
+
+**Physical mechanism:**
+- $H_2$ dissociation is highly endothermic ($\sim 4.5\,\text{eV}$ per molecule). The energy that would otherwise raise the temperature instead goes into breaking molecular bonds.
+- This causes the effective adiabatic index $\gamma_\text{eff}$ to drop well below $4/3$ over the dissociation zone.
+- For an ideal gas, hydrostatic stability requires $\gamma > 4/3$. When $\gamma_\text{eff} < 4/3$, the envelope becomes dynamically unstable: a small compression lowers the pressure support faster than gravity, and the envelope enters **free-fall (dynamic) collapse** on a timescale of seconds to hours — many orders of magnitude faster than the Kelvin-Helmholtz timescale modelled here.
+- Since this code has no hydrodynamic solver, it cannot follow the dynamic collapse phase.
+
+**Consequence for the simulation:**
+When the central temperature $T(m=0)$ reaches `T_DISSOCIATION_LIMIT = 2000.0 K`, the outer time loop in `time_stepper.py` must perform a **graceful halt**: log an informative message (timestep number, current time, $T_\text{center}$), save a final snapshot, and exit cleanly. Continuing beyond this point would produce unphysical quasi-static solutions.
+
+This threshold is stored as `T_DISSOCIATION_LIMIT` in `config.py` and checked after every BVP solve in the outer time loop (Sub-task 8).
+
 ---
 
 ## 5. Sequential Sub-Tasks Breakdown
@@ -190,6 +205,7 @@ $\Delta t \leq \alpha \cdot \min_i\!\left(T_i / |\dot{T}_i|\right)$ — a local 
 **Deliverables:**
 - All CGS physical constants: $G$, $c$, $a_\text{rad}$, $k_B$, $m_H$, $\sigma_\text{SB}$
 - Simulation parameters: $M_\text{total}$, $P_\text{neb}$, $T_\text{neb}$, $\mu$, $\gamma$, `n_grid_points`, `OPACITY_SMOOTH_TRANSITIONS`
+- `T_DISSOCIATION_LIMIT = 2000.0` — core temperature ceiling above which $H_2$ dissociation invalidates the quasi-static assumption (see Section 4.6)
 - `SimulationState` dataclass with typed numpy array fields and a `prev` reference slot
 
 **Exit criterion:** Print all constants; confirm CGS unit self-consistency by hand for 3 key relations (e.g., $P = \rho k_B T / \mu m_H$ gives Pa when inputs are CGS).
@@ -246,7 +262,7 @@ This sub-task is split into five sequential steps due to the complexity of the B
 **Goal:** Implement and validate the Schwarzschild criterion over the full temperature range.
 
 **Deliverables:**
-- `grad_radiative(L, m, P, T, kappa, rho)` using $\nabla_\text{rad} = \dfrac{3\kappa L P}{64\pi a c G m T^4}$
+- `grad_radiative(L, m, P, T, kappa, rho)` using `grad_rad = (3 * kappa * L * P) / (16 * pi * a_rad * c * G * m * T^4)`
 - `effective_gradient(grad_rad, grad_ad)` → `(grad_eff, is_convective)`
 - Assert $\kappa > 0$ at entry (guards against upstream errors in `opacity.py`)
 
@@ -296,11 +312,13 @@ This sub-task is split into five sequential steps due to the complexity of the B
 **Goal:** Verify the $t=0$ solution satisfies global energy constraints.
 
 **Deliverables:**
-- Virial theorem check: $|E_\text{grav}| \approx 2|E_\text{therm}|$ for ideal gas
+- Virial theorem check: `abs(E_grav) ≈ 3*(gamma - 1) * abs(E_therm)` for an ideal gas (general form; reduces to the familiar factor of 2 only for monatomic gas, gamma = 5/3). Since `config.GAMMA = 1.4` (diatomic H2/He mix), the expected coefficient here is `3*(1.4-1) = 1.2`, not 2 — use `config.GAMMA` rather than hardcoding either number.
 - Opacity regime distribution: log the fraction of grid points in each Bell & Lin regime
-- Energy flux check: $L(\text{surface}) = \int \epsilon \, dm$ (if an $\epsilon$ source term is defined)
+- Energy flux check: `L(surface) = integral of epsilon dm` (if an epsilon source term is defined)
 
-**Exit criterion:** Virial theorem deviation $< 1\%$; regime distribution printed and physically sensible (outer grid in grain/molecular regimes, inner grid in Kramers/electron-scattering regime).
+**Exit criterion:** Virial theorem deviation from `3*(gamma - 1)` (using `config.GAMMA`) is `< 1%`; regime distribution printed and physically sensible (outer grid in grain/molecular regimes, inner grid in Kramers/electron-scattering regime).
+
+*Caveat:* the standard derivation assumes zero surface pressure. Since this envelope has a nonzero nebular boundary pressure (`P_NEB`), a rigorous check should include the surface confinement term from integrating hydrostatic equilibrium by parts; if `P_NEB * R_surface^3` is not negligible compared to `E_grav`, note the discrepancy rather than treating it as a failed check.
 
 ---
 
@@ -329,8 +347,9 @@ This sub-task is split into five sequential steps due to the complexity of the B
 - `run(n_steps, dt)`: at each step, compute time derivatives → call BVP solver → update state → call diagnostics → save snapshot
 - Log BVP convergence status at each step; warn (do not raise) on soft convergence failures
 - Store snapshots at configurable intervals
+- **Dissociation halt check:** after each BVP solve, compare `state.T[0]` (central temperature) against `config.T_DISSOCIATION_LIMIT`. If `T_center >= T_DISSOCIATION_LIMIT`, save a final snapshot, emit an informative log message (step number, elapsed time, $T_\text{center}$, and an explanation that $H_2$ dissociation has been reached and dynamic collapse would ensue), and exit the loop cleanly.
 
-**Exit criterion:** Run 10 steps with a large $\Delta t$; confirm $r_\text{surface}$ decreases (envelope contracts) and $L_\text{surface}$ increases monotonically.
+**Exit criterion:** Run 10 steps with a large $\Delta t$; confirm $r_\text{surface}$ decreases (envelope contracts) and $L_\text{surface}$ increases monotonically. Additionally, verify that artificially setting `T_DISSOCIATION_LIMIT` to a value below the initial $T_\text{center}$ causes an immediate graceful halt on step 1.
 
 ---
 
