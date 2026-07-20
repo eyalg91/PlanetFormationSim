@@ -83,7 +83,7 @@ PlanetFormationSim/
 | `gradients.py` | Schwarzschild switch; returns $\nabla_\text{eff}$ and a boolean `is_convective` mask |
 | `odes.py` | Pure function: takes $(m, \mathbf{y}, \dot{T}, \dot{P})$ and returns $d\mathbf{y}/dm$ |
 | `boundary_conditions.py` | Pure function: returns 4 residuals for `solve_bvp` BC interface |
-| `bvp_solver.py` | Manages initial guesses, calls `solve_bvp`, logs convergence, returns new state |
+| `bvp_solver.py` | Manages initial guesses, calls `solve_bvp` for t>0; the t=0 static solve uses a shooting method instead (Sub-task 5, revised) |
 | `time_stepper.py` | Outer time loop; finite-differences time derivatives; dispatches to BVP solver |
 | `diagnostics.py` | Post-solve checks; virial theorem; opacity regime distribution per timestep |
 | `output.py` | Snapshot I/O and matplotlib helpers; no physics |
@@ -290,35 +290,95 @@ This sub-task is split into five sequential steps due to the complexity of the B
 
 ---
 
-#### Sub-task 5 — `bvp_solver.py` (static solve, $t = 0$)
+#### Sub-task 5 — `bvp_solver.py` (static solve, $t = 0$) — REVISED, see PROGRESS.md
 
-**Goal:** Obtain the first converged equilibrium structure.
+**As actually implemented, this sub-task deviates from the deliverables/exit criterion
+originally specified below.** A physics/numerics investigation (documented in full in
+PROGRESS.md's change log) found that:
 
-**Deliverables:**
-- Construct an initial guess (linear / polytropic profiles for $r$, $P$, $T$; zero $L$)
-- Call `scipy.integrate.solve_bvp` with zero time derivatives
-- Log solver status and residual norm; raise `RuntimeError` on hard failure, warning on soft failure
+1. `dT_dt = dP_dt = 0` at $t=0$ forces $dL/dm \equiv 0$ (odes.py), which with the center BC
+   $L(0)=0$ forces $L \equiv 0$ everywhere, which forces $\nabla_\text{rad} \equiv 0 <
+   \nabla_\text{ad}$, which forces $dT/dm \equiv 0$: **the $t=0$ envelope is exactly isothermal
+   at $T_\text{neb}$ and carries zero luminosity, for any solver or initial guess.** This is a
+   hard mathematical consequence of the ODE system, not a convergence artifact.
+2. This is also the physically correct picture, once $T_\text{neb}$, $P_\text{neb}$ were
+   corrected to Hayashi (1981) MMSN values at ~50 AU (the gravitational-instability
+   disk-fragmentation context, Section 1): the envelope is deeply Bonnor-Ebert-subcritical
+   ($M_\text{TOTAL}/M_\text{BE} \approx 0.089$), consistent with a freshly-fragmented,
+   extended, cold GI clump in equilibrium with its disk (not yet contracting).
+3. `scipy.integrate.solve_bvp` proved structurally unreliable for this problem regardless of
+   the above (rank-deficient ODE Jacobian from the source-term-driven energy equation; a
+   near-surface pressure-scale-height boundary layer that broke every mesh/variable-transform
+   strategy tried). `bvp_solver.py` instead uses a **shooting method**
+   (`scipy.integrate.solve_ivp` outward integration + `scipy.optimize.brentq` root-find on the
+   central pressure) on the reduced, well-posed 2-ODE $(r, P)$ system, with $L=0$, $T=T_\text{neb}$
+   assigned directly rather than solved for.
+
+Introducing nonzero $L$ to actually begin Kelvin-Helmholtz contraction is therefore deferred to
+Sub-task 7 (`time_stepper.py`): the bootstrap step for the first real time-evolution step needs
+a literature-motivated assumed initial cooling rate (not the "return zero arrays" bootstrap
+originally envisioned in Sub-task 7 below, which would leave the envelope at this exact fixed
+point indefinitely). Revisit that sub-task's description when it is implemented.
+
+**Deliverables (as implemented):**
+- Shoot on central pressure `P_center` (via `solve_ivp` + `brentq`) to match the surface
+  condition $P(M_\text{TOTAL}) = P_\text{neb}$; assign $L=0$, $T=T_\text{neb}$ directly
+- Log convergence status and residual; raise `RuntimeError` on failure (no silent fallback)
 - Return a populated `SimulationState`
 
-**Exit criterion:**
-- Plot $r(m)$, $P(m)$, $T(m)$, $L(m)$ for the converged solution
-- Verify hydrostatic balance pointwise: $|dP/dr + G M(r) \rho / r^2| / |dP/dr| < 10^{-3}$ at interior points
-- $L(\text{surface})$ is physically reasonable (compare to Kelvin-Helmholtz luminosity estimate $L_{KH} \sim GM^2 / (Rt_{KH})$)
+**Exit criterion (as implemented):**
+- Plot $r(m)$, $P(m)$ for the converged solution ($T$, $L$ are trivially constant/zero)
+- Verify hydrostatic balance pointwise in Eulerian form: $|dP/dr + G M(r) \rho / r^2| / |dP/dr| <
+  10^{-3}$ at interior points (unchanged from the original criterion)
+- ~~$L(\text{surface})$ compared to $L_{KH}$~~ — superseded; $L=0$ exactly at $t=0$ by
+  construction (see above), so this comparison no longer applies at this sub-task
 
 ---
 
-#### Sub-task 6 — `diagnostics.py` (static checks)
+#### Sub-task 6 — `diagnostics.py` (static checks) — REVISED for the Sub-task 5 cold/L=0 state
 
-**Goal:** Verify the $t=0$ solution satisfies global energy constraints.
+**As implemented, this sub-task's checks were revised** to reflect what Sub-task 5 actually
+produces: a cold (T=50K), isothermal, L=0, pressure-confined equilibrium (PROGRESS.md has the
+full reasoning), not the originally-envisioned generic converged structure.
+
+**Goal:** Verify the $t=0$ solution satisfies global energy constraints, given its actual
+physical character.
 
 **Deliverables:**
-- Virial theorem check: `abs(E_grav) ≈ 3*(gamma - 1) * abs(E_therm)` for an ideal gas (general form; reduces to the familiar factor of 2 only for monatomic gas, gamma = 5/3). Since `config.GAMMA = 1.4` (diatomic H2/He mix), the expected coefficient here is `3*(1.4-1) = 1.2`, not 2 — use `config.GAMMA` rather than hardcoding either number.
-- Opacity regime distribution: log the fraction of grid points in each Bell & Lin regime
-- Energy flux check: `L(surface) = integral of epsilon dm` (if an epsilon source term is defined)
+- **Virial theorem check (generalized, with surface confinement term):** the standard
+  zero-surface-pressure virial theorem does not apply here — `P_NEB` is not negligible (it is
+  the entire reason the envelope has the size and structure it does; PLAN.md §4.6/PROGRESS.md's
+  Bonnor-Ebert analysis for Sub-task 5). Integrating hydrostatic equilibrium by parts instead
+  gives the pressure-confined form:
+  $$E_\text{grav} + 3(\gamma - 1) E_\text{therm} = 3 P_\text{neb} V$$
+  where $E_\text{grav} = -\int G m/r \, dm$, $E_\text{therm} = \frac{1}{\gamma-1}\int (P/\rho)
+  \, dm$ (ideal gas, $P=(\gamma-1)\rho u$), and $V = \frac{4}{3}\pi R_\text{surface}^3$. Derived
+  independently (integrate $dP/dr=-Gm\rho/r^2$ by parts) and verified against the converged
+  Sub-task 5 state before implementation: relative imbalance ~8e-6, far tighter than the
+  criterion below suggests is even necessary. Log all three terms (not just the residual) so a
+  future run can see which term dominates, rather than a single pass/fail number.
+- **Opacity regime distribution:** log the fraction of grid points in each Bell & Lin regime.
+  Do *not* expect a spread across regimes — at a uniform T=50K, the whole envelope sits in the
+  single coldest regime ("Ice grains"), confirmed against the actual converged state.
+- **Mass reconstruction check (new):** compute $M(r) = \int 4\pi r^2 \rho \, dr$ from the
+  converged $(r, \rho)$ profile and compare against the Lagrangian grid $m$ directly — an
+  independent check of the continuity equation and the shooting integration together (this
+  works because dr/dm=1/(4πr²ρ) is literally the inverse relation being reconstructed here).
+- ~~Energy flux check~~ — **deferred to Sub-task 7.** With $L\equiv0$ identically (Sub-task 5),
+  any energy flux check is trivially satisfied and carries no diagnostic information; meaningful
+  once real, nonzero $L$ exists.
 
-**Exit criterion:** Virial theorem deviation from `3*(gamma - 1)` (using `config.GAMMA`) is `< 1%`; regime distribution printed and physically sensible (outer grid in grain/molecular regimes, inner grid in Kramers/electron-scattering regime).
-
-*Caveat:* the standard derivation assumes zero surface pressure. Since this envelope has a nonzero nebular boundary pressure (`P_NEB`), a rigorous check should include the surface confinement term from integrating hydrostatic equilibrium by parts; if `P_NEB * R_surface^3` is not negligible compared to `E_grav`, note the discrepancy rather than treating it as a failed check.
+**Exit criterion:**
+- Virial components logged; balance should be dominated by the correct physical terms
+  ($E_\text{grav}$, $E_\text{therm}$, and the $P_\text{neb}V$ surface term all comparable in
+  magnitude — not a spurious near-cancellation or an unexpectedly dominant/negligible term) —
+  not a hard 1% pass/fail, since the point is to verify the *physics*, not chase numerical
+  precision for its own sake
+- Regime distribution is internally consistent with the simulated cold thermodynamic state
+  (not the original "outer grain, inner Kramers" criterion, which assumed a hot, differentiated
+  structure that does not exist at t=0 per Sub-task 5)
+- Mass reconstruction matches the Lagrangian grid to a few percent away from the center (a
+  known, expected finite-resolution effect from r changing rapidly there — not a bug)
 
 ---
 

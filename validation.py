@@ -6,8 +6,13 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+import boundary_conditions
+import bvp_solver
 import config
+import diagnostics
 import eos
+import gradients
+import odes
 import opacity
 
 # ==========================================
@@ -342,6 +347,612 @@ def plot_opacity_along_synthetic_profile(output_path="opacity_profile_preview.pn
 
 
 # ==========================================
+# SECTION: Gradients — Convection Trigger vs. Critical Luminosity
+# ==========================================
+
+def check_convection_triggers_at_grad_rad_exceeds_grad_ad() -> None:
+    """Confirm is_convective flips True exactly where grad_rad crosses grad_ad, sweeping L at fixed (rho, T)."""
+    m_test = 1.0e29     # Representative enclosed mass shell [g]
+    P_test = 1.0e6      # Representative pressure [dyn cm^-2]
+    T_test = 1000.0     # Representative temperature [K]
+    rho_test = 1.0e-6   # Representative density [g cm^-3]
+    kappa_test = opacity.bell_lin_opacity(rho_test, T_test)   # [cm^2 g^-1]
+    grad_ad_test = eos.grad_adiabatic(config.GAMMA)
+
+    # nabla_rad(L) is linear in L, so the crossing nabla_rad = nabla_ad solves directly:
+    # L_crit = nabla_ad * 16*pi*a_rad*c*G*m*T^4 / (3*kappa*P)   [erg s^-1]
+    L_crit = (grad_ad_test * 16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m_test * T_test**4
+              / (3.0 * kappa_test * P_test))
+
+    grad_rad_below = gradients.grad_radiative(0.99 * L_crit, m_test, P_test, T_test, kappa_test)
+    grad_rad_above = gradients.grad_radiative(1.01 * L_crit, m_test, P_test, T_test, kappa_test)
+    _, conv_below = gradients.effective_gradient(grad_rad_below, grad_ad_test)
+    _, conv_above = gradients.effective_gradient(grad_rad_above, grad_ad_test)
+
+    print("Check 12 - gradients.effective_gradient() convection trigger vs. critical luminosity")
+    print(f"  L_crit = {L_crit:.6e} erg/s (where nabla_rad = nabla_ad = {grad_ad_test:.6f})")
+    print(f"  L = 0.99*L_crit -> nabla_rad = {grad_rad_below:.6f}, is_convective = {conv_below}")
+    print(f"  L = 1.01*L_crit -> nabla_rad = {grad_rad_above:.6f}, is_convective = {conv_above}")
+    assert not conv_below, "Below L_crit, envelope should be radiative (is_convective should be False)"
+    assert conv_above, "Above L_crit, envelope should be convective (is_convective should be True)"
+
+
+# ==========================================
+# SECTION: Gradients — Radiative Limit Exactness
+# ==========================================
+
+def check_radiative_limit_grad_eff_equals_grad_rad() -> None:
+    """Confirm grad_eff equals grad_rad exactly (not just approximately) when radiation dominates."""
+    m_test = 1.0e29
+    P_test = 1.0e6
+    T_test = 1000.0
+    rho_test = 1.0e-6
+    kappa_test = opacity.bell_lin_opacity(rho_test, T_test)
+    grad_ad_test = eos.grad_adiabatic(config.GAMMA)
+
+    # Same critical-luminosity construction as Check 12; a luminosity far below it guarantees
+    # nabla_rad << nabla_ad regardless of the absolute magnitude of kappa or T at this point.
+    L_crit = (grad_ad_test * 16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m_test * T_test**4
+              / (3.0 * kappa_test * P_test))
+    L_test = 1.0e-3 * L_crit
+
+    grad_rad_test = gradients.grad_radiative(L_test, m_test, P_test, T_test, kappa_test)
+    grad_eff_test, is_convective_test = gradients.effective_gradient(grad_rad_test, grad_ad_test)
+
+    print("Check 13 - Radiative limit: grad_eff == grad_rad when nabla_rad << nabla_ad")
+    print(f"  L = 1e-3*L_crit -> nabla_rad = {grad_rad_test:.6e}, nabla_ad = {grad_ad_test:.6f}, "
+          f"is_convective = {is_convective_test}")
+    assert not is_convective_test, "Deep radiative regime should not be flagged convective"
+    assert grad_eff_test == grad_rad_test, "grad_eff should equal grad_rad exactly in the radiative limit"
+
+
+# ==========================================
+# SECTION: Gradients — Convective Limit Exactness
+# ==========================================
+
+def check_convective_limit_grad_eff_equals_grad_ad() -> None:
+    """Confirm grad_eff equals grad_ad exactly (not just approximately) when convection dominates."""
+    m_test = 1.0e29
+    P_test = 1.0e6
+    T_test = 1000.0
+    rho_test = 1.0e-6
+    kappa_test = opacity.bell_lin_opacity(rho_test, T_test)
+    grad_ad_test = eos.grad_adiabatic(config.GAMMA)
+
+    L_crit = (grad_ad_test * 16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m_test * T_test**4
+              / (3.0 * kappa_test * P_test))
+    L_test = 1.0e3 * L_crit
+
+    grad_rad_test = gradients.grad_radiative(L_test, m_test, P_test, T_test, kappa_test)
+    grad_eff_test, is_convective_test = gradients.effective_gradient(grad_rad_test, grad_ad_test)
+
+    print("Check 14 - Convective limit: grad_eff == grad_ad when nabla_rad >> nabla_ad")
+    print(f"  L = 1e3*L_crit -> nabla_rad = {grad_rad_test:.6e}, nabla_ad = {grad_ad_test:.6f}, "
+          f"is_convective = {is_convective_test}")
+    assert is_convective_test, "Steep radiative gradient should be flagged convective"
+    assert grad_eff_test == grad_ad_test, "grad_eff should equal grad_ad exactly in the convective limit"
+
+
+# ==========================================
+# SECTION: Gradients — Full Opacity-Regime Sweep
+# ==========================================
+
+def check_grad_radiative_over_full_opacity_regime_sweep() -> None:
+    """Confirm grad_radiative/effective_gradient stay finite and physically bounded across the full T sweep.
+
+    Reuses opacity Check 9's T in [100, 50000] K range so this check exercises every regime
+    kappa can return, not just the one or two the limit checks above happen to land in.
+    """
+    m_test = 1.0e29                              # Representative enclosed mass shell [g]
+    P_test = 1.0e6                                # Representative pressure [dyn cm^-2]
+    rho_test = 1.0e-10                             # Representative density [g cm^-3]
+    T_sweep = np.linspace(100.0, 50000.0, 500)    # [K], matches opacity Check 9's range
+
+    # Kelvin-Helmholtz luminosity estimate, L_KH ~ G*M_TOTAL^2/(R*t_KH) (PLAN.md Sub-task 5
+    # exit criterion), R ~ present Jupiter radius, t_KH ~ 1e6 yr - a representative surface
+    # luminosity scale, not a converged solution (bvp_solver.py does not exist yet).
+    R_test = 7.0e9                    # Representative envelope radius [cm]
+    t_KH_test = 1.0e6 * 3.156e7       # Kelvin-Helmholtz timescale, 1e6 yr in seconds [s]
+    L_test = config.G * config.M_TOTAL**2 / (R_test * t_KH_test)
+
+    kappa_sweep = opacity.bell_lin_opacity(rho_test, T_sweep)
+    grad_ad_test = eos.grad_adiabatic(config.GAMMA)
+
+    grad_rad_sweep = gradients.grad_radiative(L_test, m_test, P_test, T_sweep, kappa_sweep)
+    grad_eff_sweep, is_convective_sweep = gradients.effective_gradient(grad_rad_sweep, grad_ad_test)
+
+    print("Check 15 - gradients over the full T in [100, 50000] K opacity-regime sweep")
+    print(f"  L = {L_test:.3e} erg/s (Kelvin-Helmholtz estimate), rho = {rho_test:.3e} g/cm^3")
+    print(f"  regimes exercised: {sorted(np.unique(opacity.determine_regime(rho_test, T_sweep)))}")
+    print(f"  nabla_rad range: [{grad_rad_sweep.min():.3e}, {grad_rad_sweep.max():.3e}]")
+    print(f"  convective points: {int(np.sum(is_convective_sweep))} / {len(T_sweep)}")
+    assert np.all(np.isfinite(grad_rad_sweep)), "grad_radiative produced non-finite values over the T sweep"
+    assert np.all(grad_rad_sweep > 0.0), "grad_radiative should be strictly positive for L, kappa > 0"
+    assert np.all(grad_eff_sweep <= grad_ad_test), "grad_eff must never exceed the adiabatic ceiling nabla_ad"
+
+
+# ==========================================
+# SECTION: Gradients — Non-Positive Kappa Guard
+# ==========================================
+
+def check_grad_radiative_rejects_nonpositive_kappa() -> None:
+    """Confirm grad_radiative raises (via its assert) when handed a non-positive kappa."""
+    m_test = 1.0e29    # Representative enclosed mass shell [g]
+    P_test = 1.0e6     # Representative pressure [dyn cm^-2]
+    T_test = 1000.0    # Representative temperature [K]
+
+    print("Check 16 - grad_radiative() rejects kappa <= 0")
+    try:
+        gradients.grad_radiative(1.0e25, m_test, P_test, T_test, kappa=0.0)
+    except AssertionError:
+        print("  kappa = 0.0 correctly raised AssertionError")
+    else:
+        raise AssertionError("grad_radiative should reject kappa = 0.0 but did not raise")
+
+    try:
+        gradients.grad_radiative(1.0e25, m_test, P_test, T_test, kappa=-1.0)
+    except AssertionError:
+        print("  kappa = -1.0 correctly raised AssertionError")
+    else:
+        raise AssertionError("grad_radiative should reject kappa < 0 but did not raise")
+
+
+# ==========================================
+# SECTION: ODEs — Constant-Density Analytic Profile Agreement
+# ==========================================
+
+def check_stellar_odes_matches_constant_density_analytic_profile() -> None:
+    """Compare stellar_odes()'s dr/dm, dP/dm, dT/dm against a closed-form uniform-density
+    self-gravitating sphere, restricted to interior mass shells.
+
+    r(m) = (3m/4*pi*rho0)^(1/3) and P(m) = (2/3)*pi*G*rho0^2*(R^2 - r(m)^2) are the classical
+    zero-surface-pressure hydrostatic solution for a constant-density sphere; neither depends on
+    T, so dP/dm can be checked directly against this pair. dr/dm, however, is computed by
+    stellar_odes() from an EOS-derived rho(P,T), not from rho0 directly - so it needs its own T
+    array, T_rho(m) = P(m)*mu*m_H/(k_B*rho0), chosen specifically to invert the ideal gas law
+    back to exactly rho0 at every point. A single T(m) cannot serve both purposes: the profile
+    below also wants an adiabatic T(m) = T_center*(P/P_center)^nabla_ad (forcing full convection
+    with a large L) to test dT/dm, but that relation does not, in general, reproduce rho0 via the
+    EOS, which is exactly why an earlier version of this check failed on dr/dm alone despite
+    dP/dm and dT/dm already agreeing - a real self-consistency gap in the test construction, not
+    a bug in odes.py.
+
+    m = 0 and m = M_TOTAL are excluded: they are genuine coordinate singularities (r=0 makes
+    dr/dm formally divergent) that boundary_conditions.py, not stellar_odes, is responsible for.
+    """
+    rho0 = 1.33   # Representative constant density, ~Jupiter's mean density [g cm^-3]
+    R = (3.0 * config.M_TOTAL / (4.0 * np.pi * rho0)) ** (1.0 / 3.0)   # Sphere radius [cm]
+    m_check = np.linspace(0.01 * config.M_TOTAL, 0.99 * config.M_TOTAL, 1500)   # Interior shells [g]
+
+    r_check = (3.0 * m_check / (4.0 * np.pi * rho0)) ** (1.0 / 3.0)
+    P_center = (2.0 / 3.0) * np.pi * config.G * rho0**2 * R**2
+    P_check = (2.0 / 3.0) * np.pi * config.G * rho0**2 * (R**2 - r_check**2)
+
+    # EOS-inverted temperature: rho = P*mu*m_H/(k_B*T) => T = P*mu*m_H/(k_B*rho0) reproduces
+    # rho0 exactly, by algebraic construction, regardless of P(m)'s shape.
+    T_rho_check = P_check * config.MU * config.M_H / (config.K_B * rho0)
+    dr_dm_analytic = 1.0 / (4.0 * np.pi * r_check**2 * rho0)   # Closed-form target [cm g^-1]
+
+    grad_ad_test = eos.grad_adiabatic(config.GAMMA)
+    T_center = 1500.0   # Representative center temperature, below T_DISSOCIATION_LIMIT [K]
+    T_ad_check = T_center * (P_check / P_center) ** grad_ad_test
+    kappa_check = opacity.bell_lin_opacity(rho0, T_ad_check)
+
+    # Pick L large enough to force convection at every point: L_crit(m) is the luminosity where
+    # nabla_rad = nabla_ad at that point (same construction as gradients Check 12); 1e3x its max
+    # over the profile guarantees nabla_rad > nabla_ad everywhere, so T_ad_check is self-consistent.
+    L_crit_check = (grad_ad_test * 16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G
+                    * m_check * T_ad_check**4 / (3.0 * kappa_check * P_check))
+    L_test = 1.0e3 * np.max(L_crit_check)
+    L_check = np.full_like(m_check, L_test)
+    zero_source = np.zeros_like(m_check)   # dT_dt = dP_dt = 0: static (t=0) solve
+
+    y_rho_check = np.vstack([r_check, P_check, L_check, T_rho_check])
+    dr_dm_computed, dP_dm_computed_rho, _, _ = odes.stellar_odes(
+        m_check, y_rho_check, zero_source, zero_source
+    )
+
+    y_ad_check = np.vstack([r_check, P_check, L_check, T_ad_check])
+    _, dP_dm_computed, dL_dm_computed, dT_dm_computed = odes.stellar_odes(
+        m_check, y_ad_check, zero_source, zero_source
+    )
+
+    dP_dm_fd = np.gradient(P_check, m_check)
+    dT_dm_fd = np.gradient(T_ad_check, m_check)
+
+    # Exclude the first/last few points, where np.gradient falls back to a less accurate
+    # one-sided difference.
+    interior = slice(5, -5)
+    rel_err_r = np.max(np.abs((dr_dm_computed[interior] - dr_dm_analytic[interior]) / dr_dm_analytic[interior]))
+    rel_err_P = np.max(np.abs((dP_dm_computed[interior] - dP_dm_fd[interior]) / dP_dm_fd[interior]))
+    rel_err_T = np.max(np.abs((dT_dm_computed[interior] - dT_dm_fd[interior]) / dT_dm_fd[interior]))
+
+    grad_rad_check = gradients.grad_radiative(L_check, m_check, P_check, T_ad_check, kappa_check)
+    is_fully_convective = np.all(grad_rad_check > grad_ad_test)
+
+    print("Check 17 - stellar_odes() vs. constant-density sphere (dr/dm) and adiabatic profile (dP/dm, dT/dm)")
+    print(f"  rho0 = {rho0} g/cm^3, R = {R:.4e} cm, P_center = {P_center:.4e} dyn/cm^2, "
+          f"T_center = {T_center} K, L = {L_test:.4e} erg/s")
+    print(f"  fully convective across profile: {is_fully_convective}")
+    print(f"  max relative error: dr/dm (vs analytic) = {rel_err_r:.3e}, "
+          f"dP/dm (vs finite diff) = {rel_err_P:.3e}, dT/dm (vs finite diff) = {rel_err_T:.3e}")
+    assert is_fully_convective, "L was not large enough to force convection everywhere; T_ad_check reference is invalid"
+    assert rel_err_r < 1.0e-9, "stellar_odes() dr/dm disagrees with the closed-form 1/(4*pi*r^2*rho0) target"
+    assert rel_err_P < 1.0e-3, "stellar_odes() dP/dm disagrees with the analytic profile's finite-difference derivative"
+    assert rel_err_T < 1.0e-2, "stellar_odes() dT/dm disagrees with the analytic profile's finite-difference derivative"
+    assert np.all(dP_dm_computed_rho == dP_dm_computed), "dP/dm must not depend on T (it doesn't appear in the formula)"
+    assert np.all(dL_dm_computed == 0.0), "dL/dm should be exactly zero when dT_dt = dP_dt = 0 (static solve)"
+
+
+# ==========================================
+# SECTION: ODEs — Output Shape, Finiteness, and Sign Sanity
+# ==========================================
+
+def check_stellar_odes_output_shape_finite_and_signs() -> None:
+    """Confirm stellar_odes() returns the right shape, all-finite values, and physically correct signs."""
+    n_points = 50
+    m_test = np.linspace(1.0e28, 1.0e30, n_points)     # Representative interior mass grid [g]
+    r_test = np.linspace(1.0e9, 7.0e9, n_points)         # Representative radius, increasing outward [cm]
+    P_test = np.linspace(1.0e10, 1.0e4, n_points)        # Representative pressure, decreasing outward [dyn cm^-2]
+    T_test = np.linspace(2000.0, 150.0, n_points)        # Representative temperature, decreasing outward [K]
+    L_test = np.full(n_points, 1.0e28)                   # Representative luminosity [erg s^-1]
+
+    y_test = np.vstack([r_test, P_test, L_test, T_test])
+    zero_source = np.zeros(n_points)
+    dydm = odes.stellar_odes(m_test, y_test, zero_source, zero_source)
+    dr_dm, dP_dm, dL_dm, dT_dm = dydm
+
+    print("Check 18 - stellar_odes() output shape, finiteness, and sign sanity")
+    print(f"  input y shape = {y_test.shape}, output dy/dm shape = {dydm.shape}")
+    assert dydm.shape == y_test.shape, "stellar_odes() output shape must match the input state vector shape"
+    assert np.all(np.isfinite(dydm)), "stellar_odes() produced non-finite values for a physically reasonable profile"
+    # nabla_eff >= 0 always (nabla_rad from positive L, kappa; nabla_ad = (gamma-1)/gamma > 0 for gamma > 1),
+    # so dT/dm's sign is set entirely by dP/dm's sign regardless of radiative vs. convective regime.
+    assert np.all(dr_dm > 0.0), "dr/dm should be positive: radius must increase with enclosed mass"
+    assert np.all(dP_dm < 0.0), "dP/dm should be negative: pressure must decrease outward"
+    assert np.all(dT_dm < 0.0), "dT/dm should be negative for this outward-cooling profile"
+
+
+# ==========================================
+# SECTION: ODEs — Visual Check: Analytic Profile and Residual
+# ==========================================
+
+def plot_constant_density_profile_ode_check(output_path="odes_profile_check.png") -> None:
+    """Save a diagnostic plot of the constant-density analytic profile and the stellar_odes() vs.
+    analytic/finite-difference residual, as a visible sanity check of the whole ODE RHS ahead of
+    bvp_solver.py (Sub-task 5), which is the first module that will produce a real converged
+    profile to compare against. Mirrors the two-temperature-array construction in Check 17
+    (see its docstring): T_rho_check for dr/dm, T_ad_check for dP/dm and dT/dm.
+    """
+    rho0 = 1.33
+    R = (3.0 * config.M_TOTAL / (4.0 * np.pi * rho0)) ** (1.0 / 3.0)
+    m_check = np.linspace(0.01 * config.M_TOTAL, 0.99 * config.M_TOTAL, 1500)
+
+    r_check = (3.0 * m_check / (4.0 * np.pi * rho0)) ** (1.0 / 3.0)
+    P_center = (2.0 / 3.0) * np.pi * config.G * rho0**2 * R**2
+    P_check = (2.0 / 3.0) * np.pi * config.G * rho0**2 * (R**2 - r_check**2)
+
+    T_rho_check = P_check * config.MU * config.M_H / (config.K_B * rho0)
+    dr_dm_analytic = 1.0 / (4.0 * np.pi * r_check**2 * rho0)
+
+    grad_ad_test = eos.grad_adiabatic(config.GAMMA)
+    T_center = 1500.0
+    T_ad_check = T_center * (P_check / P_center) ** grad_ad_test
+    kappa_check = opacity.bell_lin_opacity(rho0, T_ad_check)
+
+    L_crit_check = (grad_ad_test * 16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G
+                    * m_check * T_ad_check**4 / (3.0 * kappa_check * P_check))
+    L_test = 1.0e3 * np.max(L_crit_check)
+    L_check = np.full_like(m_check, L_test)
+    zero_source = np.zeros_like(m_check)
+
+    y_rho_check = np.vstack([r_check, P_check, L_check, T_rho_check])
+    dr_dm_computed, _, _, _ = odes.stellar_odes(m_check, y_rho_check, zero_source, zero_source)
+
+    y_ad_check = np.vstack([r_check, P_check, L_check, T_ad_check])
+    _, dP_dm_computed, _, dT_dm_computed = odes.stellar_odes(m_check, y_ad_check, zero_source, zero_source)
+
+    dP_dm_fd = np.gradient(P_check, m_check)
+    dT_dm_fd = np.gradient(T_ad_check, m_check)
+
+    x = m_check / config.M_TOTAL
+    fig, (ax_profile, ax_resid) = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
+
+    ax_profile.plot(x, r_check / R, label="r(m) / R")
+    ax_profile.plot(x, P_check / P_center, label="P(m) / P_center")
+    ax_profile.plot(x, T_ad_check / T_center, label="T_ad(m) / T_center")
+    ax_profile.set_ylabel("normalized profile")
+    ax_profile.set_title("Constant-density analytic profile (Sub-task 4 ODE check)")
+    ax_profile.legend(loc="best")
+
+    ax_resid.plot(x, np.abs((dr_dm_computed - dr_dm_analytic) / dr_dm_analytic), label="dr/dm residual (vs analytic)")
+    ax_resid.plot(x, np.abs((dP_dm_computed - dP_dm_fd) / dP_dm_fd), label="dP/dm residual (vs finite diff)")
+    ax_resid.plot(x, np.abs((dT_dm_computed - dT_dm_fd) / dT_dm_fd), label="dT/dm residual (vs finite diff)")
+    ax_resid.set_yscale("log")
+    ax_resid.set_xlabel("m / M_TOTAL")
+    ax_resid.set_ylabel("relative residual\n|stellar_odes - finite diff| / |finite diff|")
+    ax_resid.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+    print(f"Saved ODE analytic-profile check plot to {output_path}")
+
+
+# ==========================================
+# SECTION: Boundary Conditions — Residual Indexing and Sign Check
+# ==========================================
+
+def check_boundary_conditions_residuals() -> None:
+    """Confirm boundary_conditions() is exactly zero at the true BCs, and that perturbing each of
+    ya[0], ya[2], yb[1], yb[3] shifts exactly its own residual component and no other."""
+    r_test = 7.0e9         # Representative surface radius [cm]
+    P_center_test = 1.0e13   # Arbitrary center-side pressure, not constrained by the BCs [dyn cm^-2]
+    L_test = 1.0e28         # Arbitrary surface-side luminosity, not constrained by the BCs [erg s^-1]
+    T_center_test = 1500.0   # Arbitrary center-side temperature, not constrained by the BCs [K]
+
+    ya0 = np.array([0.0, P_center_test, 0.0, T_center_test])
+    yb0 = np.array([r_test, config.P_NEB, L_test, config.T_NEB])
+    res0 = boundary_conditions.boundary_conditions(ya0, yb0)
+
+    print("Check 19 - boundary_conditions() residual indexing and sign check")
+    print(f"  residual at exact BCs: {res0}")
+    assert res0.shape == (4,), "boundary_conditions() must return exactly 4 residuals for a 4-ODE system"
+    assert np.allclose(res0, 0.0), "Residual should be exactly zero when ya, yb already satisfy all 4 boundary conditions"
+
+    delta = 1.0e5
+    # (label, which side, index in y, expected residual index that should shift)
+    perturbation_cases = [
+        ("ya[0] (r_center)", "ya", 0, 0),
+        ("ya[2] (L_center)", "ya", 2, 1),
+        ("yb[1] (P_surface)", "yb", 1, 2),
+        ("yb[3] (T_surface)", "yb", 3, 3),
+    ]
+    for label, which, y_idx, res_idx in perturbation_cases:
+        ya, yb = ya0.copy(), yb0.copy()
+        (ya if which == "ya" else yb)[y_idx] += delta
+        res = boundary_conditions.boundary_conditions(ya, yb)
+        shift = res - res0
+        expected_shift = np.zeros(4)
+        expected_shift[res_idx] = delta
+        print(f"  perturb {label} by {delta:.1e} -> residual shift = {shift}")
+        assert np.allclose(shift, expected_shift), f"Perturbing {label} should shift only residual[{res_idx}] by {delta}"
+
+
+# ==========================================
+# SECTION: Nebula Conditions vs. MMSN at 50 AU
+# ==========================================
+
+def check_nebula_conditions_match_mmsn_at_50au() -> None:
+    """Confirm config.T_NEB, config.P_NEB agree with the Hayashi (1981) MMSN midplane at 50 AU."""
+    AU = 1.496e13     # Astronomical unit [cm]
+    M_SUN = 1.989e33  # Solar mass, for the local Keplerian orbital frequency [g]
+    r_AU = 50.0        # Assumed GI-fragmentation disk radius [AU]
+    r = r_AU * AU
+
+    # Hayashi (1981) MMSN midplane temperature: T(r) = 280 K * (r/AU)^-0.5   [K]
+    T_hayashi = 280.0 * r_AU**-0.5
+    # Hayashi (1981) MMSN gas surface density: Sigma_gas(r) = 1700 g/cm^2 * (r/AU)^-1.5   [g cm^-2]
+    Sigma_hayashi = 1700.0 * r_AU**-1.5
+
+    # Vertical hydrostatic disk structure: H = c_s/Omega, rho_mid = Sigma/(sqrt(2*pi)*H),
+    # P_mid = rho_mid*c_s^2   [dyn cm^-2]
+    Omega = np.sqrt(config.G * M_SUN / r**3)
+    c_s2 = config.K_B * T_hayashi / (config.MU * config.M_H)
+    H = np.sqrt(c_s2) / Omega
+    rho_mid = Sigma_hayashi / (np.sqrt(2.0 * np.pi) * H)
+    P_hayashi = rho_mid * c_s2
+
+    T_ratio = config.T_NEB / T_hayashi
+    P_ratio = config.P_NEB / P_hayashi
+
+    print("Check 21 - config.T_NEB, config.P_NEB vs. Hayashi (1981) MMSN midplane at 50 AU")
+    print(f"  Hayashi (1981): T = {T_hayashi:.2f} K, P_mid = {P_hayashi:.3e} dyn/cm^2")
+    print(f"  config.py:      T_NEB = {config.T_NEB} K, P_NEB = {config.P_NEB:.3e} dyn/cm^2")
+    print(f"  ratios: T_NEB/T_hayashi = {T_ratio:.3f}, P_NEB/P_hayashi = {P_ratio:.3f}")
+    assert 0.5 < T_ratio < 2.0, "config.T_NEB is not within a factor of 2 of the Hayashi (1981) MMSN value at 50 AU"
+    assert 0.2 < P_ratio < 5.0, "config.P_NEB is not within a factor of 5 of the Hayashi (1981) MMSN value at 50 AU"
+
+
+# ==========================================
+# SECTION: Bonnor-Ebert Subcriticality
+# ==========================================
+
+def check_envelope_mass_is_bonnor_ebert_subcritical() -> None:
+    """Confirm config.M_TOTAL is below the Bonnor-Ebert critical mass at config.T_NEB, config.P_NEB.
+
+    A pressure-confined isothermal sphere above M_BE has no stable hydrostatic equilibrium at
+    all (Bonnor 1956; Ebert 1955) - this is exactly the failure mode that broke the original
+    T_NEB=150K, P_NEB=1e4 configuration (M_TOTAL/M_BE was ~99). Checking this here means a future
+    change to T_NEB, P_NEB, or M_TOTAL that reopens that crisis fails loudly with a clear physical
+    explanation, rather than surfacing later as an opaque bvp_solver.py convergence failure.
+    """
+    # Bonnor-Ebert critical mass for a pressure-confined isothermal sphere:
+    # M_BE = 1.18 * c_s^4 / sqrt(G^3 * P_ext)   [g]
+    c_s2 = config.K_B * config.T_NEB / (config.MU * config.M_H)
+    M_BE = 1.18 * c_s2**2 / np.sqrt(config.G**3 * config.P_NEB)
+    ratio = config.M_TOTAL / M_BE
+
+    print("Check 22 - Bonnor-Ebert subcriticality: M_TOTAL vs. M_BE(T_neb, P_neb)")
+    print(f"  M_BE = {M_BE:.4e} g,  M_TOTAL = {config.M_TOTAL:.4e} g,  M_TOTAL/M_BE = {ratio:.4f}")
+    assert ratio < 1.0, (
+        "M_TOTAL exceeds the Bonnor-Ebert critical mass: no stable isothermal hydrostatic "
+        "equilibrium exists at these T_neb, P_neb - bvp_solver.py's shooting method would fail"
+    )
+
+
+# ==========================================
+# SECTION: t=0 Static Structure — Hydrostatic Balance
+# ==========================================
+
+def check_static_structure_hydrostatic_balance() -> None:
+    """Confirm bvp_solver.solve_static_structure()'s profile satisfies dP/dr = -G*m*rho/r^2
+    (Eulerian form), the PLAN.md Sub-task 5 exit criterion, on the converged shooting solution."""
+    s = bvp_solver.solve_static_structure()
+
+    dP_dr_fd = np.gradient(s.P, s.r)
+    dP_dr_analytic = -config.G * s.m * s.rho / s.r**2
+
+    # Exclude points near the center (rapidly varying r ~ m^(1/3), finite-difference truncation
+    # error dominates there) and near the surface (one-sided np.gradient difference).
+    interior = slice(20, -15)
+    rel_err = np.abs((dP_dr_fd[interior] - dP_dr_analytic[interior]) / dP_dr_analytic[interior])
+
+    print("Check 23 - solve_static_structure() Eulerian hydrostatic balance: dP/dr vs -G*m*rho/r^2")
+    print(f"  max relative error (interior points) = {rel_err.max():.3e}")
+    assert rel_err.max() < 1.0e-3, "Converged structure fails hydrostatic balance in Eulerian form"
+
+
+# ==========================================
+# SECTION: t=0 Static Structure — Exact Isothermal/Zero-Luminosity and Monotonicity
+# ==========================================
+
+def check_static_structure_isothermal_and_monotonic() -> None:
+    """Confirm solve_static_structure() gives T=T_neb, L=0 exactly, and a monotonic profile
+    with the correct surface pressure."""
+    s = bvp_solver.solve_static_structure()
+
+    print("Check 24 - solve_static_structure() exact isothermal/zero-luminosity and monotonicity")
+    print(f"  r range: {s.r[0]:.4e} to {s.r[-1]:.4e} cm ({s.r[-1] / 1.496e13:.2f} AU)")
+    print(f"  P range: {s.P[0]:.6e} to {s.P[-1]:.6e} dyn/cm^2 (target P_neb = {config.P_NEB:.6e})")
+    assert np.all(s.T == config.T_NEB), "T must equal T_neb exactly everywhere (isothermal, see bvp_solver.py docstring)"
+    assert np.all(s.L == 0.0), "L must equal 0 exactly everywhere (see bvp_solver.py docstring)"
+    assert np.all(np.diff(s.r) > 0.0), "r must be strictly increasing outward"
+    assert np.all(np.diff(s.P) < 0.0), "P must be strictly decreasing outward"
+    assert np.isclose(s.P[-1], config.P_NEB, rtol=config.BVP_TOL * 10.0), "Surface pressure does not match P_neb to the solver tolerance"
+
+
+# ==========================================
+# SECTION: t=0 Static Structure — Visual Check
+# ==========================================
+
+def plot_static_structure_profile(output_path="static_structure_t0.png") -> None:
+    """Save a diagnostic plot of the converged t=0 r(m), P(m) profile.
+
+    T(m) and L(m) are trivially flat/zero by construction (bvp_solver.py docstring) so are noted
+    rather than plotted as their own (degenerate) panels.
+    """
+    s = bvp_solver.solve_static_structure()
+    AU = 1.496e13
+
+    fig, (ax_r, ax_P) = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
+    x = s.m / config.M_TOTAL
+
+    ax_r.plot(x, s.r / AU)
+    ax_r.set_ylabel("r(m) [AU]")
+    ax_r.set_title(f"t=0 static structure: isothermal at T={config.T_NEB} K, L=0")
+
+    ax_P.plot(x, s.P)
+    ax_P.set_yscale("log")
+    ax_P.set_xlabel("m / M_TOTAL")
+    ax_P.set_ylabel("P(m) [dyn cm^-2]")
+    ax_P.axhline(config.P_NEB, color="tab:red", linestyle="--", linewidth=0.8, label="P_neb")
+    ax_P.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+    print(f"Saved t=0 static structure profile plot to {output_path}")
+
+
+# ==========================================
+# SECTION: Sub-task 6 — Pressure-Confined Virial Balance
+# ==========================================
+
+def check_virial_balance_pressure_confined() -> None:
+    """Confirm the converged t=0 state satisfies the pressure-confined virial theorem:
+    E_grav + 3*(gamma-1)*E_therm = 3*P_neb*V (diagnostics.virial_balance).
+
+    Derived independently (integrate hydrostatic equilibrium by parts) and cross-checked
+    against Sub-task 5's Bonnor-Ebert analysis before implementation - this is the same
+    physical balance underlying why config.T_NEB, config.P_NEB admit a stable equilibrium.
+    """
+    s = bvp_solver.solve_static_structure()
+    E_grav, E_therm, surface_term = diagnostics.virial_balance(s)
+    thermal_term = 3.0 * (config.GAMMA - 1.0) * E_therm
+    lhs = E_grav + thermal_term
+    imbalance = abs(lhs - surface_term) / abs(surface_term)
+
+    print("Check 26 - Pressure-confined virial balance: E_grav + 3*(gamma-1)*E_therm = 3*P_neb*V")
+    print(f"  E_grav = {E_grav:.4e} erg, 3*(gamma-1)*E_therm = {thermal_term:.4e} erg")
+    print(f"  LHS = {lhs:.4e} erg, surface term = {surface_term:.4e} erg, relative imbalance = {imbalance:.3e}")
+    assert imbalance < 1.0e-3, "Virial balance violated beyond expected numerical precision"
+    # Every term should be within ~2 orders of magnitude of the others - a term differing by
+    # many more decades would indicate a sign/unit bug hidden behind a coincidental cancellation.
+    assert 0.01 < abs(E_grav) / surface_term < 100.0, "E_grav is not commensurate with the surface confinement term"
+    assert 0.01 < abs(thermal_term) / surface_term < 100.0, "Thermal term is not commensurate with the surface confinement term"
+
+
+# ==========================================
+# SECTION: Sub-task 6 — Opacity Regime Distribution
+# ==========================================
+
+def check_static_structure_opacity_regime_distribution() -> None:
+    """Confirm the converged t=0 state (uniform T=50K) sits entirely in the coldest Bell & Lin regime.
+
+    Sub-task 5's t=0 state is exactly isothermal at T_neb=50K (see bvp_solver.py) - unlike the
+    differentiated hot/cold structure PLAN.md originally envisioned for this check, there is no
+    regime spread to expect here; the correct prediction is a single regime everywhere.
+    """
+    s = bvp_solver.solve_static_structure()
+    fractions = diagnostics.opacity_regime_distribution(s)
+
+    print("Check 27 - Opacity regime distribution at t=0 (uniform T=50K)")
+    for regime, fraction in zip(opacity.REGIMES, fractions):
+        if fraction > 0.0:
+            print(f"  {regime.name:<32s} {fraction:.1%}")
+    assert fractions[0] == 1.0, "At uniform T=50K, the entire envelope should sit in regime 0 (Ice grains)"
+
+
+# ==========================================
+# SECTION: Sub-task 6 — Mass Reconstruction
+# ==========================================
+
+def check_mass_reconstruction_matches_lagrangian_grid() -> None:
+    """Confirm diagnostics.mass_reconstruction() (independent quadrature over the converged
+    (r, rho) profile) matches the Lagrangian grid state.m away from the center.
+
+    An independent check of the continuity equation (dr/dm = 1/(4*pi*r^2*rho)) and the
+    shooting integration together: this quadrature is the inverse relation of that same ODE,
+    computed by a completely different numerical method than the adaptive ODE integrator that
+    produced the profile in the first place.
+    """
+    s = bvp_solver.solve_static_structure()
+    M_recon = diagnostics.mass_reconstruction(s)
+    rel_err = np.abs((M_recon - s.m) / s.m)
+
+    print("Check 28 - Mass reconstruction: integral 4*pi*r^2*rho dr vs. Lagrangian grid m")
+    print(f"  max relative error (full array) = {rel_err.max():.3e}")
+    print(f"  max relative error (excluding first 30 points near center) = {rel_err[30:].max():.3e}")
+    assert rel_err[30:].max() < 1.0e-2, "Mass reconstruction disagrees with the Lagrangian grid away from the center"
+
+
+# ==========================================
+# SECTION: Sub-task 6 — Visual Check: Mass Reconstruction Error
+# ==========================================
+
+def plot_mass_reconstruction_error(output_path="mass_reconstruction_check.png") -> None:
+    """Save a diagnostic plot of the mass-reconstruction relative error vs. radius."""
+    s = bvp_solver.solve_static_structure()
+    M_recon = diagnostics.mass_reconstruction(s)
+    rel_err = np.abs((M_recon - s.m) / s.m)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(s.r / 1.496e13, rel_err)
+    ax.set_yscale("log")
+    ax.set_xlabel("r [AU]")
+    ax.set_ylabel("relative error: |M_reconstructed - m| / m")
+    ax.set_title("Mass reconstruction check (continuity eq. consistency)")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+    print(f"Saved mass reconstruction check plot to {output_path}")
+
+
+# ==========================================
 # SECTION: Constants Printout
 # ==========================================
 
@@ -391,4 +1002,22 @@ if __name__ == "__main__":
     check_regime_ordering_monotonic()
     check_bell_lin_vectorization_stress_test()
     plot_opacity_along_synthetic_profile()
-    print("\nAll CGS unit-consistency and Sub-task 2a-2e checks passed.")
+    check_convection_triggers_at_grad_rad_exceeds_grad_ad()
+    check_radiative_limit_grad_eff_equals_grad_rad()
+    check_convective_limit_grad_eff_equals_grad_ad()
+    check_grad_radiative_over_full_opacity_regime_sweep()
+    check_grad_radiative_rejects_nonpositive_kappa()
+    check_stellar_odes_matches_constant_density_analytic_profile()
+    check_stellar_odes_output_shape_finite_and_signs()
+    plot_constant_density_profile_ode_check()
+    check_boundary_conditions_residuals()
+    check_nebula_conditions_match_mmsn_at_50au()
+    check_envelope_mass_is_bonnor_ebert_subcritical()
+    check_static_structure_hydrostatic_balance()
+    check_static_structure_isothermal_and_monotonic()
+    plot_static_structure_profile()
+    check_virial_balance_pressure_confined()
+    check_static_structure_opacity_regime_distribution()
+    check_mass_reconstruction_matches_lagrangian_grid()
+    plot_mass_reconstruction_error()
+    print("\nAll CGS unit-consistency and Sub-task 1, 2a-2e, 3, 4, 5, 6 checks passed.")
