@@ -56,6 +56,24 @@ RHO_GUESS_INITIAL = 1.0e-6   # Representative density for the shooting-method ra
 BVP_TOL = 1.0e-8             # Relative/absolute tolerance for the bvp_solver.py shooting integration and root-find [dimensionless]
 
 # ==========================================
+# SECTION: Time-Stepping Parameters
+# ==========================================
+
+# ASSUMPTION: the t=0 static structure (bvp_solver.py) is exactly isothermal with L=0 - an
+# exact fixed point of the frozen-source-term time-stepping scheme, since dT_dt=dP_dt=0 there
+# and two identical states always finite-difference to zero. The first real timestep instead
+# derives (dT_dt, dP_dt) from an assumed homologous (self-similar) contraction: every mass
+# shell's radius contracts as r=r0*f(t) with df/dt|0 = -1/T_KH_BOOTSTRAP_S. Mass conservation
+# and hydrostatic equilibrium then force rho=rho0/f^3, P=P0/f^4 (the only P(f) scaling under
+# which dP/dm=-Gm/(4*pi*r^4) stays satisfied at every instant), and the ideal gas law forces
+# T=T0/f. This value is the assumed initial GI-clump contraction timescale, order 1e5-1e6 yr
+# per the disk-fragmentation literature (PROGRESS.md); not derived from the t=0 structure
+# itself, since L (needed to estimate a self-consistent t_KH) is exactly what this bootstrap
+# is trying to produce.
+T_KH_BOOTSTRAP_S = 1.0e6 * 3.156e7   # Assumed initial Kelvin-Helmholtz contraction timescale, ~1 Myr in seconds [s]
+
+
+# ==========================================
 # SECTION: Opacity Model Flags
 # ==========================================
 

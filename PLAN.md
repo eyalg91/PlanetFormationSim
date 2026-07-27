@@ -386,22 +386,73 @@ physical character.
 
 ---
 
-#### Sub-task 7 — Time derivative computation in `time_stepper.py`
+#### Sub-task 7 — Time derivative computation in `time_stepper.py` — REVISED bootstrap, see PROGRESS.md
 
-**Goal:** Implement the finite-difference bridge between timesteps.
+**As implemented, the bootstrap deliverable below must NOT return zero arrays**, contrary to
+the original text. $t=0$ (Sub-task 5) is exactly isothermal with $L\equiv0$ — an exact fixed
+point of this frozen-source-term scheme (zero $\partial T/\partial t, \partial P/\partial t$
+forces $dL/dm\equiv0$, which forces $L\equiv0$, forever, since two identical states always
+difference to zero). A zero-array bootstrap would leave the envelope at $t=0$'s state
+indefinitely; Kelvin-Helmholtz contraction would never begin.
 
-**Deliverables:**
-- `compute_time_derivatives(state_curr, state_prev, dt)` → `(dT_dt, dP_dt)` as numpy arrays on the current grid
-- Bootstrap: for $t = 0 \to t = 1$, return zero arrays
-- Interpolation: if grids shift between steps, interpolate `state_prev` fields onto `state_curr.m` before differencing
+A "hot start" reconstruction of $t=0$ itself (an adiabatic, convective interior at
+$T_\text{center}\sim600$–$1500$K) was considered and rejected as a way around this: verified
+numerically (see PROGRESS.md) that the required luminosity to sustain a genuinely convective
+structure at these `M_TOTAL`/`P_NEB` explodes with $T_\text{center}$ — ~1,940 $L_\odot$ at
+700K, ~61 million $L_\odot$ at 1000K, ~352 billion $L_\odot$ at 1500K — confirming the
+Sub-task 5 finding (deep Bonnor-Ebert subcriticality forces a near-uniform pressure profile
+regardless of assumed interior temperature) generalizes across the requested range rather than
+being specific to the one value already tested. $t=0$ stays the cold, isothermal, $L=0$ state.
 
-**Exit criterion:** Derivative arrays have correct shape and magnitudes consistent with KH timescale estimates ($t_{KH} \sim GM^2/RL \sim 10^6$ yr for a Jupiter-mass envelope).
+**Goal:** Implement the finite-difference bridge between timesteps, including a physically
+motivated way to actually start evolution away from the $t=0$ fixed point.
+
+**Deliverables (as implemented):**
+- `compute_time_derivatives(state_curr, state_prev, dt)` → `(dT_dt, dP_dt)` as numpy arrays
+  on `state_curr.m`. `state_prev=None` signals the bootstrap case (dispatches internally).
+- **Bootstrap:** derives `(dT_dt, dP_dt)` from a **homologous (self-similar) contraction
+  ansatz** rather than zero arrays or a reconstructed hot state. Derivation: every Lagrangian
+  shell contracts as $r=r_0 f(t)$ with $df/dt|_0=-1/t_\text{KH}$; mass conservation forces
+  $\rho=\rho_0/f^3$; the *only* $P(f)$ scaling consistent with hydrostatic equilibrium
+  ($dP/dm\propto1/r^4\propto f^{-4}$) at every instant is $P=P_0f^{-4}$; the ideal gas law
+  then forces $T=T_0f^{-1}$. At $t=0$ this gives $dT/dt=+T/t_\text{KH}$, $dP/dt=+4P/t_\text{KH}$
+  (both positive — contraction *heats* the envelope, the standard negative-heat-capacity
+  behavior of a self-gravitating gas losing energy). Substituting into `odes.py`'s energy
+  equation gives $dL/dm=\frac{3\gamma-4}{\gamma-1}\cdot\frac{k_BT}{\mu m_H t_\text{KH}}$,
+  positive for $\gamma>4/3$ (`config.GAMMA=1.4` satisfies this — the same stability threshold
+  behind `T_DISSOCIATION_LIMIT`) — a genuine, well-defined $L(m)>0$ profile, not an arbitrary
+  nonzero source. $t_\text{KH}$ = `config.T_KH_BOOTSTRAP_S` (assumed, 1 Myr).
+- Interpolation: `state_prev`'s `T`, `P` are interpolated (`np.interp`) onto `state_curr.m`
+  before differencing, for the general (non-bootstrap) finite-difference case.
+- **Rank-deficiency prediction (tested):** confirmed by direct `solve_bvp` experiment — the
+  singular-Jacobian *crash* that broke Sub-task 5's $t=0$ solve does **not** recur once
+  `dP_dt` is genuinely nonzero (5 Newton iterations ran without crashing, vs. an immediate
+  crash at $t=0$). However, `solve_bvp` still does **not** practically converge for a full
+  real timestep: residuals grow after iteration 2 and the mesh explodes toward the node limit
+  (status 1, boundary residuals ~$10^7$–$10^9$) — the same unnormalized-absolute-tolerance
+  problem across vastly different physical scales (r, P, L, T) that forced Sub-task 5 toward
+  a shooting method. **Conclusion for Sub-task 8:** solving a real timestep will need the same
+  kind of non-dimensionalization work (or a shooting-based approach) as Sub-task 5, not a bare
+  `solve_bvp` call — plan for that rather than assuming nonzero `dP_dt` alone is sufficient.
+
+**Exit criterion:** Derivative arrays have correct shape and magnitude, `dT_dt`/`dP_dt`
+positive everywhere (verified), `dL/dm` matches the analytic homologous formula above
+exactly, and the integrated $L(M_\text{TOTAL})$ is within an order of magnitude of the
+independent $|E_\text{grav}|/t_\text{KH}$ estimate (`diagnostics.virial_balance`) — confirmed:
+ratio 2.24.
 
 ---
 
 #### Sub-task 8 — Outer time loop in `time_stepper.py`
 
 **Goal:** Wire the full time-evolution loop.
+
+**Note before implementing "call BVP solver" below:** Sub-task 7 confirmed nonzero `dP_dt`
+fixes the singular-Jacobian *crash* `solve_bvp` hit at $t=0$, but `solve_bvp` still does not
+practically *converge* for a real timestep (mesh explosion, huge unnormalized boundary
+residuals — same root cause as Sub-task 5's boundary-layer/dynamic-range problem). Expect to
+need the same non-dimensionalization treatment, or a shooting-based per-timestep solve
+extending Sub-task 5's approach, rather than a bare `solve_bvp` call.
 
 **Deliverables:**
 - `run(n_steps, dt)`: at each step, compute time derivatives → call BVP solver → update state → call diagnostics → save snapshot
