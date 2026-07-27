@@ -79,19 +79,37 @@ def check_continuity_equation() -> None:
 # ==========================================
 
 def check_ideal_gas_density_inverts_pressure() -> None:
-    """Confirm eos.density(P, T, mu) reproduces a hand-solved rho from the ideal gas law."""
-    P_test = 1.0e4    # Test pressure [dyn cm^-2]
-    T_test = 150.0    # Test temperature [K]
-    mu_test = 2.34    # Mean molecular weight, H2/He mix [dimensionless]
+    """Confirm eos.density(P, T, mu, mu_e) reduces to the hand-solved ideal-gas rho at a
+    density far below the electron-degeneracy crossover (Sub-task 2f) - not exact equality
+    anymore (the combined EOS has a small, quantifiable degenerate correction even here), but
+    a deviation matching the analytically-predicted first-order correction
+    P_degenerate(rho_ideal)/P, confirming eos.density's Newton solve behaves as expected in
+    the regime where the original (pre-Sub-task-2f) ideal-gas-only formula should dominate."""
+    P_test = 5.291281895336678e-3    # Test pressure [dyn cm^-2], chosen so rho_ideal ~ 1e-12 g/cm^3
+    T_test = 150.0                    # Test temperature [K]
+    mu_test = 2.34                    # Mean molecular weight, H2/He mix [dimensionless]
 
-    # Hand-solved: rho = P*mu*m_H/(k_B*T)  [g cm^-3]
-    rho_expected = P_test * mu_test * config.M_H / (config.K_B * T_test)
-    rho_computed = eos.density(P_test, T_test, mu_test)
+    # Hand-solved ideal-gas-only value: rho = P*mu*m_H/(k_B*T)  [g cm^-3]
+    rho_ideal = P_test * mu_test * config.M_H / (config.K_B * T_test)
+    rho_computed = eos.density(P_test, T_test, mu_test, config.MU_E)
 
-    print("Check 4 - eos.density() inverts the ideal gas law")
-    print(f"  P = {P_test:.3e} dyn/cm^2, T = {T_test:.3e} K, mu = {mu_test}")
-    print(f"  -> rho_computed = {rho_computed:.6e} g/cm^3, rho_expected = {rho_expected:.6e} g/cm^3")
-    assert np.isclose(rho_computed, rho_expected, rtol=1e-12), "eos.density() does not match hand-solved ideal gas law"
+    # First-order correction: at this rho, the combined EOS carries a small degenerate
+    # pressure fraction P_degenerate(rho_ideal)/P_test that pulls rho_computed slightly below
+    # rho_ideal (some of P_test is already supplied by degeneracy, so less ideal-gas density
+    # is needed) - the SAME fraction, to leading order, as the relative rho deviation.
+    predicted_fractional_deviation = eos.degenerate_pressure(rho_ideal, config.MU_E) / P_test
+    actual_fractional_deviation = (rho_ideal - rho_computed) / rho_ideal
+
+    print("Check 4 - eos.density() reduces to the ideal-gas limit far below the degenerate crossover")
+    print(f"  P = {P_test:.6e} dyn/cm^2, T = {T_test:.3e} K, mu = {mu_test}")
+    print(f"  -> rho_computed = {rho_computed:.6e} g/cm^3, rho_ideal (old formula) = {rho_ideal:.6e} g/cm^3")
+    print(f"  predicted fractional deviation (P_degenerate/P) = {predicted_fractional_deviation:.6e}")
+    print(f"  actual fractional deviation = {actual_fractional_deviation:.6e}")
+    assert np.isclose(actual_fractional_deviation, predicted_fractional_deviation, rtol=0.05), (
+        "eos.density()'s deviation from the ideal-gas limit does not match the predicted "
+        "first-order degenerate-pressure correction"
+    )
+    assert actual_fractional_deviation < 1.0e-4, "test point is not far enough below the degenerate crossover to isolate the ideal-gas limit"
 
 
 # ==========================================
@@ -119,6 +137,103 @@ def check_adiabatic_gradient_and_cp_limits() -> None:
     print(f"  c_p(gamma={gamma_diatomic}) = {cp_diatomic:.6e} erg g^-1 K^-1")
     assert cp_monatomic > 0.0 and np.isfinite(cp_monatomic), "specific_heat_cp is non-physical for monatomic gas"
     assert cp_diatomic > 0.0 and np.isfinite(cp_diatomic), "specific_heat_cp is non-physical for diatomic gas"
+
+
+# ==========================================
+# SECTION: EOS — Electron Degeneracy Pressure (Sub-task 2f)
+# ==========================================
+
+def check_degenerate_pressure_reference_point() -> None:
+    """Confirm eos.degenerate_pressure(rho, mu_e) matches a hand-computed value at a
+    reference point, guarding against a sign/unit/exponent error in the formula."""
+    rho_test = 1.0     # Reference density [g cm^-3]
+    mu_e_test = 2.0    # Reference mean molecular weight per electron [dimensionless]
+
+    # Hand-computed: P = (h^2/(20*m_e)) * (3/pi)^(2/3) * (rho/(mu_e*m_H))^(5/3)  [dyn cm^-2]
+    n_e_expected = rho_test / (mu_e_test * config.M_H)
+    P_expected = (config.PLANCK_H**2 / (20.0 * config.M_E)) * (3.0 / np.pi) ** (2.0 / 3.0) * n_e_expected ** (5.0 / 3.0)
+    P_computed = eos.degenerate_pressure(rho_test, mu_e_test)
+
+    print("Check 33 - eos.degenerate_pressure() matches the hand-computed Fermi-gas formula")
+    print(f"  rho = {rho_test} g/cm^3, mu_e = {mu_e_test}")
+    print(f"  -> P_computed = {P_computed:.6e} dyn/cm^2, P_expected = {P_expected:.6e} dyn/cm^2")
+    assert np.isclose(P_computed, P_expected, rtol=1e-12), "degenerate_pressure() does not match the hand-computed reference value"
+    assert P_computed > 0.0 and np.isfinite(P_computed), "degenerate_pressure() produced a non-physical pressure"
+
+
+def check_combined_eos_asymptotic_limits() -> None:
+    """Confirm the combined EOS correctly reduces to pure ideal gas at low density and to
+    pure electron degeneracy at high density, at fixed T=T_CENTER_INITIAL - the two
+    physical limits the additive combination (Sub-task 2f) is designed to interpolate
+    between."""
+    T_test = config.T_CENTER_INITIAL
+    # Crossover density where P_ideal = P_degenerate at T_test (PROGRESS.md Sub-task 2f):
+    # rho_cross = [k_B*T/(mu*m_H*K1)]^1.5, K1 from degenerate_pressure(1,mu_e)/1^(5/3).
+    K1 = eos.degenerate_pressure(1.0, config.MU_E)
+    rho_cross = (config.K_B * T_test / (config.MU * config.M_H * K1)) ** 1.5
+
+    rho_low = rho_cross * 1.0e-8    # deep ideal-gas regime
+    rho_high = rho_cross * 1.0e8    # deep degenerate regime
+
+    P_ideal_low = rho_low * config.K_B * T_test / (config.MU * config.M_H)
+    P_deg_low = eos.degenerate_pressure(rho_low, config.MU_E)
+    P_ideal_high = rho_high * config.K_B * T_test / (config.MU * config.M_H)
+    P_deg_high = eos.degenerate_pressure(rho_high, config.MU_E)
+
+    print("Check 34 - combined EOS reduces to the correct limit far below/above the crossover density")
+    print(f"  T = {T_test} K, rho_cross = {rho_cross:.6e} g/cm^3")
+    print(f"  rho_low  = {rho_low:.3e}: P_deg/P_ideal = {P_deg_low/P_ideal_low:.3e} (expect << 1)")
+    print(f"  rho_high = {rho_high:.3e}: P_ideal/P_deg = {P_ideal_high/P_deg_high:.3e} (expect << 1)")
+    assert P_deg_low / P_ideal_low < 1.0e-4, "degenerate pressure not negligible far below the crossover density"
+    assert P_ideal_high / P_deg_high < 1.0e-4, "ideal-gas pressure not negligible far above the crossover density"
+
+
+def check_density_inverts_combined_eos() -> None:
+    """Confirm eos.density()'s Newton-Raphson solve correctly inverts P=P_ideal(rho,T)+
+    P_degenerate(rho) across a range of densities spanning the ideal/degenerate crossover
+    (not just the ideal-gas limit, Check 4) - the critical correctness check for the new
+    iterative solve, which has no closed-form inverse to compare against directly."""
+    T_test = config.T_CENTER_INITIAL
+    K1 = eos.degenerate_pressure(1.0, config.MU_E)
+    rho_cross = (config.K_B * T_test / (config.MU * config.M_H * K1)) ** 1.5
+
+    print("Check 35 - eos.density() round-trips the combined EOS across the ideal/degenerate crossover")
+    for factor in [1.0e-4, 1.0e-1, 1.0, 1.0e1, 1.0e4]:
+        rho_true = rho_cross * factor
+        P_total = rho_true * config.K_B * T_test / (config.MU * config.M_H) + eos.degenerate_pressure(rho_true, config.MU_E)
+        rho_recovered = eos.density(P_total, T_test, config.MU, config.MU_E)
+        rel_err = abs(rho_recovered - rho_true) / rho_true
+        print(f"  rho/rho_cross = {factor:.1e}: rho_true = {rho_true:.6e}, rho_recovered = {rho_recovered:.6e}, rel_err = {rel_err:.3e}")
+        assert rel_err < 1.0e-6, f"eos.density() failed to invert the combined EOS at rho/rho_cross={factor:.1e}"
+
+
+def plot_combined_eos_pressure_vs_density() -> None:
+    """Visible check: P_ideal(rho), P_degenerate(rho), and their sum vs. rho at
+    T=T_CENTER_INITIAL, log-log, with the crossover density marked - shows the new EOS's
+    interpolation between the two physical regimes directly (CLAUDE.md preference for a
+    visible check wherever one naturally fits)."""
+    T_test = config.T_CENTER_INITIAL
+    K1 = eos.degenerate_pressure(1.0, config.MU_E)
+    rho_cross = (config.K_B * T_test / (config.MU * config.M_H * K1)) ** 1.5
+
+    rho_grid = np.logspace(np.log10(rho_cross) - 6, np.log10(rho_cross) + 6, 200)
+    P_ideal = rho_grid * config.K_B * T_test / (config.MU * config.M_H)
+    P_deg = eos.degenerate_pressure(rho_grid, config.MU_E)
+    P_total = P_ideal + P_deg
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.loglog(rho_grid, P_ideal, "--", label="P_ideal(rho)")
+    ax.loglog(rho_grid, P_deg, "--", label="P_degenerate(rho)")
+    ax.loglog(rho_grid, P_total, "-", color="black", label="P_total (combined EOS)")
+    ax.axvline(rho_cross, color="gray", linestyle=":", label=f"rho_cross = {rho_cross:.2e} g/cm^3")
+    ax.set_xlabel("rho [g/cm^3]")
+    ax.set_ylabel("P [dyn/cm^2]")
+    ax.set_title(f"Combined ideal-gas + electron-degeneracy EOS at T={T_test:.0f} K")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig("combined_eos_pressure_vs_density.png", dpi=150)
+    plt.close(fig)
+    print("Check 36 - saved combined_eos_pressure_vs_density.png (visible check)")
 
 
 # ==========================================
@@ -687,15 +802,22 @@ def plot_constant_density_profile_ode_check(output_path="odes_profile_check.png"
 # ==========================================
 
 def check_boundary_conditions_residuals() -> None:
-    """Confirm boundary_conditions() is exactly zero at the true BCs, and that perturbing each of
-    ya[0], ya[2], yb[1], yb[3] shifts exactly its own residual component and no other."""
+    """Confirm boundary_conditions() is exactly zero at the true BCs, that perturbing each of
+    ya[0], ya[2], yb[1] shifts exactly its own (linear) residual component and no other, and
+    that the net-flux radiative surface condition (nonlinear in T_b, r_b) matches its exact
+    analytic formula under perturbation of yb[3] and yb[0].
+
+    Revised for the boundary_conditions.py surface thermal condition change (Sub-task 8,
+    PROGRESS.md): T_b - T_neb replaced with L_b - 4*pi*r_b^2*sigma_SB*(T_b^4-T_neb^4), so the
+    surface residual is no longer linear in T_b or independent of r_b.
+    """
     r_test = 7.0e9         # Representative surface radius [cm]
     P_center_test = 1.0e13   # Arbitrary center-side pressure, not constrained by the BCs [dyn cm^-2]
-    L_test = 1.0e28         # Arbitrary surface-side luminosity, not constrained by the BCs [erg s^-1]
     T_center_test = 1500.0   # Arbitrary center-side temperature, not constrained by the BCs [K]
 
     ya0 = np.array([0.0, P_center_test, 0.0, T_center_test])
-    yb0 = np.array([r_test, config.P_NEB, L_test, config.T_NEB])
+    # L_b = 0 matches the net-flux radiative condition exactly when T_b = T_neb (equilibrium).
+    yb0 = np.array([r_test, config.P_NEB, 0.0, config.T_NEB])
     res0 = boundary_conditions.boundary_conditions(ya0, yb0)
 
     print("Check 19 - boundary_conditions() residual indexing and sign check")
@@ -704,14 +826,13 @@ def check_boundary_conditions_residuals() -> None:
     assert np.allclose(res0, 0.0), "Residual should be exactly zero when ya, yb already satisfy all 4 boundary conditions"
 
     delta = 1.0e5
-    # (label, which side, index in y, expected residual index that should shift)
-    perturbation_cases = [
+    # (label, which side, index in y, expected residual index that should shift) - linear terms only
+    linear_cases = [
         ("ya[0] (r_center)", "ya", 0, 0),
         ("ya[2] (L_center)", "ya", 2, 1),
         ("yb[1] (P_surface)", "yb", 1, 2),
-        ("yb[3] (T_surface)", "yb", 3, 3),
     ]
-    for label, which, y_idx, res_idx in perturbation_cases:
+    for label, which, y_idx, res_idx in linear_cases:
         ya, yb = ya0.copy(), yb0.copy()
         (ya if which == "ya" else yb)[y_idx] += delta
         res = boundary_conditions.boundary_conditions(ya, yb)
@@ -720,6 +841,20 @@ def check_boundary_conditions_residuals() -> None:
         expected_shift[res_idx] = delta
         print(f"  perturb {label} by {delta:.1e} -> residual shift = {shift}")
         assert np.allclose(shift, expected_shift), f"Perturbing {label} should shift only residual[{res_idx}] by {delta}"
+
+    # yb[3] (T_surface) and yb[0] (r_surface) both enter the new radiative term nonlinearly -
+    # verify against the exact analytic formula rather than a simple linear delta, and confirm
+    # residuals 0-2 stay unaffected.
+    for label, y_idx in [("yb[3] (T_surface)", 3), ("yb[0] (r_surface)", 0)]:
+        yb = yb0.copy()
+        yb[y_idx] += delta
+        res = boundary_conditions.boundary_conditions(ya0, yb)
+        r_b, _, L_b, T_b = yb
+        L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
+        expected_res3 = L_b - L_expected
+        print(f"  perturb {label} by {delta:.1e} -> residual[3] = {res[3]:.6e} (analytic: {expected_res3:.6e})")
+        assert np.isclose(res[3], expected_res3), f"Perturbing {label} should match the exact radiative-flux formula in residual[3]"
+        assert np.allclose(res[:3], res0[:3]), f"Perturbing {label} should not affect residuals 0-2"
 
 
 # ==========================================
@@ -1109,6 +1244,10 @@ if __name__ == "__main__":
     check_continuity_equation()
     check_ideal_gas_density_inverts_pressure()
     check_adiabatic_gradient_and_cp_limits()
+    check_degenerate_pressure_reference_point()
+    check_combined_eos_asymptotic_limits()
+    check_density_inverts_combined_eos()
+    plot_combined_eos_pressure_vs_density()
     check_regime_table_reference_points()
     check_transition_temperature_loglog_slopes()
     plot_transition_temperatures()

@@ -44,3 +44,23 @@ def effective_gradient(grad_rad, grad_ad):
     is_convective = grad_rad_b > grad_ad_b
     grad_eff = np.where(is_convective, grad_ad_b, grad_rad_b)
     return grad_eff, is_convective
+
+
+# ==========================================
+# SECTION: Marginally Efficient Convection — Diagnostic Luminosity
+# ==========================================
+
+def marginal_convective_luminosity(m, P, T, kappa, grad_ad):
+    """L such that radiative diffusion alone would exactly carry the adiabatic gradient
+    (nabla_rad(L,...) = nabla_ad), i.e. the "marginally efficient convection" closure.
+
+    Used only where a fully convective interior's structure (r, P, T) is constructed directly
+    from the adiabat, independent of L (bvp_solver.py's t=0 compact-protoplanet construction) -
+    this backs out a physically meaningful diagnostic L(m) afterward, by inverting
+    grad_radiative's formula rather than assuming any particular actual radiative/convective
+    flux split. Not used by any RHS/ODE integration - a real trial L would need to come from
+    solving the full coupled system (odes.py), which this construction deliberately bypasses.
+    """
+    # Invert nabla_rad = 3*kappa*L*P / (16*pi*a_rad*c*G*m*T^4) for L at nabla_rad = nabla_ad:
+    # L = nabla_ad * 16*pi*a_rad*c*G*m*T^4 / (3*kappa*P)   [erg s^-1]
+    return grad_ad * (16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m * T**4) / (3.0 * kappa * P)

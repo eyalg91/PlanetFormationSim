@@ -2,7 +2,7 @@
 
 **Project:** 1D Quasi-Static Planetary Gas Envelope Collapse (Kelvin-Helmholtz Contraction)
 **Course:** Computational Physics
-**Last Updated:** 2026-07-13
+**Last Updated:** 2026-07-27
 
 ---
 
@@ -19,7 +19,41 @@
 ## 1. Physics Overview
 
 ### Goal
-Simulate the 1D quasi-static spherical collapse of a protoplanetary gas envelope via Kelvin-Helmholtz contraction. No hydrodynamics — only time-evolution of structural (stellar-interior-type) equations on a Lagrangian mass grid.
+Simulate the slow, quasi-static Kelvin-Helmholtz contraction of a self-gravitating gas
+envelope on a Lagrangian mass grid — from just after it has already formed a
+gravitationally bound object, down to the point where central conditions approach H2
+dissociation. No hydrodynamics, no radiative transfer beyond a diffusion-limit opacity
+closure — only time-evolution of structural (stellar-interior-type) equations.
+
+### Formation Scenario and Scope
+
+The envelope is assumed to have formed via gravitational instability (GI) / disk
+fragmentation in the outer regions (~50 AU) of a protoplanetary disk. That physical picture
+splits into two phases with very different character, and this project only models one of
+them:
+
+1. **Initial collapse (out of scope).** A locally dense, gravitationally unstable region
+   of the disk undergoes fast, inertia-dominated, hydrodynamic free-fall collapse into a
+   bound clump. A quasi-static/hydrostatic-equilibrium solver is structurally incapable of
+   representing this — force balance is assumed at every instant, which is the opposite of
+   free-fall. This is the same reason `T_DISSOCIATION_LIMIT` (§4.6) halts the code at the
+   *far* end of validity, once H2 dissociation triggers a second dynamical collapse.
+   Standard practice in the literature (pre-main-sequence Henyey-track modeling;
+   Bodenheimer & Pollack 1986; Marley et al. 2007 "hot start" gas-giant models) is to never
+   simulate this phase directly — hand off from an assumed or externally-computed
+   post-collapse state instead.
+2. **Kelvin-Helmholtz contraction (this project's actual scope).** The already-collapsed,
+   compact, high-entropy object slowly radiates away its formation heat and contracts over
+   a ~Myr timescale, remaining close to hydrostatic equilibrium throughout. This is what
+   the 4-ODE system below models.
+
+Consequently, `t=0` in this simulation is **not** a diffuse pre-collapse cloud — it is a
+compact, hot, high-entropy "just-collapsed" protoplanet (Sub-task 5). An earlier version of
+this project instead started from a diffuse, disk-pressure-confined cloud and tried to
+evolve it forward quasi-statically; that premise turned out to be a genuine mathematical
+dead end (proven, not a numerical artifact — a diffuse cloud already in stable equilibrium
+with fixed ambient conditions has no reason to evolve) and was abandoned. See PROGRESS.md
+for the full investigation behind this change.
 
 ### Grid
 - **Coordinate:** Lagrangian mass coordinate $m$ (mass enclosed within radius $r$)
@@ -35,8 +69,16 @@ Simulate the 1D quasi-static spherical collapse of a protoplanetary gas envelope
 | 4 | $\dfrac{dT}{dm} = \dfrac{T}{P} \nabla_\text{eff} \dfrac{dP}{dm}$ | Temperature structure (Schwarzschild criterion) |
 
 ### Constitutive Relations
-- **EOS:** Ideal gas — $P = \dfrac{\rho k_B T}{\mu m_H}$
-- **Opacity:** Bell & Lin (1994) piecewise power-law — $\kappa = \kappa_i \rho^a T^b$ across 8 regimes (see Section 4)
+- **EOS:** Combined ideal gas + non-relativistic electron degeneracy (Sub-task 2f, done) —
+  $P = P_\text{ideal}(\rho,T) + P_\text{degenerate}(\rho)$, $P_\text{ideal}=\dfrac{\rho k_B
+  T}{\mu m_H}$, $P_\text{degenerate}=\dfrac{h^2}{20m_e}\left(\dfrac{3}{\pi}\right)^{2/3}
+  \left(\dfrac{\rho}{\mu_e m_H}\right)^{5/3}$. Ideal-gas-only thermal pressure cannot support
+  a Jupiter-mass object in compact hydrostatic equilibrium at any physically reasonable
+  (sub-dissociation) temperature; real gas giants and brown dwarfs are partially
+  electron-degenerate essentially from formation onward (Zapolsky & Salpeter 1969), not
+  just late in a cooling history. `eos.density(P,T,mu,mu_e)` inverts this (no closed form)
+  via vectorized Newton-Raphson.
+- **Opacity:** Bell & Lin (1994) piecewise power-law — $\kappa = \kappa_i \rho^a T^b$ across 8 regimes (see §4.3)
 - **Temperature gradient:** Schwarzschild criterion — $\nabla_\text{eff} = \nabla_\text{rad}$ (radiative) if $\nabla_\text{rad} < \nabla_\text{ad}$; otherwise $\nabla_\text{eff} = \nabla_\text{ad}$ (convective)
   - `grad_rad = (3 * kappa * L * P) / (16 * pi * a_rad * c * G * m * T^4)`
   - $\nabla_\text{ad} = \dfrac{\gamma - 1}{\gamma}$ for ideal gas
@@ -46,11 +88,18 @@ Simulate the 1D quasi-static spherical collapse of a protoplanetary gas envelope
 | Location | Condition |
 |---|---|
 | Center ($m = 0$) | $r = 0$, $L = 0$ |
-| Surface ($m = M_\text{total}$) | $P = P_\text{nebula}$, $T = T_\text{nebula}$ |
+| Surface ($m = M_\text{total}$) | $P = P_\text{nebula}$ (mechanical); $L = 4\pi R^2\sigma_\text{SB}(T^4 - T_\text{nebula}^4)$ (thermal — net radiative flux balance, §4.7; **not** a rigid $T=T_\text{nebula}$ clamp) |
 
 ### Numerical Approach
-- **Inner spatial solver:** Boundary Value Problem (BVP) solved at each time step using `scipy.integrate.solve_bvp` (collocation method). State vector: $\mathbf{y} = [r, P, L, T]$, independent variable $m$.
-- **Outer time loop:** Advances time by $\Delta t$; finite-differences $\partial T/\partial t$ and $\partial P/\partial t$ from the previous step's state; injects them as frozen source terms into ODE 3; calls the BVP solver.
+- **Inner spatial solver:** a **shooting method** (`scipy.integrate.solve_ivp` outward
+  integration + root-finding on the central conditions), used for both the $t=0$ structure
+  and every $t>0$ timestep. `scipy.integrate.solve_bvp` was the original design and was
+  abandoned for both cases — see §4.2 and PROGRESS.md for why.
+- **Outer time loop:** advances time by $\Delta t$ via a genuinely implicit (Henyey-style)
+  scheme — $\partial T/\partial t$, $\partial P/\partial t$ in ODE 3 are computed directly
+  from the difference between the current trial state and the previous converged state,
+  divided by $dt$. Not frozen, and not supplemented by any additional assumed forcing term
+  (§4.8 records why an earlier attempt to add one was reverted).
 
 ---
 
@@ -61,13 +110,13 @@ PlanetFormationSim/
 ├── main.py                   # Orchestrator: parse config, run time loop, save output
 ├── config.py                 # Physical constants, nebula params, grid settings, flags
 ├── state.py                  # SimulationState dataclass: all field arrays + time
-├── eos.py                    # Constitutive relations (ideal gas: ρ, c_p, ∇_ad)
+├── eos.py                    # Constitutive relations (ideal gas + planned degeneracy term)
 ├── opacity.py                # Bell & Lin (1994) 8-regime piecewise opacity
-├── gradients.py              # ∇_rad, ∇_ad, Schwarzschild criterion → ∇_eff
-├── odes.py                   # RHS of the 4-ODE system for solve_bvp
-├── boundary_conditions.py    # BVP boundary residuals (center + surface)
-├── bvp_solver.py             # Wrapper: initial guess, call solve_bvp, handle failures
-├── time_stepper.py           # Outer loop: compute ∂T/∂t, ∂P/∂t, advance state
+├── gradients.py               # ∇_rad, ∇_ad, Schwarzschild criterion → ∇_eff
+├── odes.py                    # RHS of the 4-ODE system
+├── boundary_conditions.py    # Center + surface residuals (net-flux radiative surface BC)
+├── bvp_solver.py              # Shooting-method solver: t=0 structure and every t>0 step
+├── time_stepper.py           # Outer loop: run(); compute_time_derivatives (diagnostic only)
 ├── diagnostics.py            # Virial theorem, energy conservation, regime logging
 └── output.py                 # NPZ snapshots, matplotlib plotting helpers
 ```
@@ -78,13 +127,13 @@ PlanetFormationSim/
 |---|---|
 | `config.py` | Single source of truth for all numerical values and simulation flags; no computation |
 | `state.py` | `SimulationState` dataclass holding the current and previous grid + field arrays |
-| `eos.py` | Vectorized ideal-gas constitutive relations; no side effects |
+| `eos.py` | Vectorized constitutive relations (ideal gas; non-relativistic electron-degeneracy pressure planned, Sub-task 2f); no side effects |
 | `opacity.py` | Bell & Lin piecewise opacity with density-dependent regime boundaries |
-| `gradients.py` | Schwarzschild switch; returns $\nabla_\text{eff}$ and a boolean `is_convective` mask |
+| `gradients.py` | Schwarzschild switch; returns $\nabla_\text{eff}$ and a boolean `is_convective` mask; also a marginal-convection diagnostic luminosity helper |
 | `odes.py` | Pure function: takes $(m, \mathbf{y}, \dot{T}, \dot{P})$ and returns $d\mathbf{y}/dm$ |
-| `boundary_conditions.py` | Pure function: returns 4 residuals for `solve_bvp` BC interface |
-| `bvp_solver.py` | Manages initial guesses, calls `solve_bvp` for t>0; the t=0 static solve uses a shooting method instead (Sub-task 5, revised) |
-| `time_stepper.py` | Outer time loop; finite-differences time derivatives; dispatches to BVP solver |
+| `boundary_conditions.py` | Pure function: 4 residuals — center ($r=0$, $L=0$) and surface ($P=P_\text{neb}$, net-flux radiative) |
+| `bvp_solver.py` | Shooting-method solver for both the $t=0$ compact hot-start structure and every $t>0$ implicit timestep; `solve_bvp` is not used anywhere |
+| `time_stepper.py` | Outer time loop (`run`); `compute_time_derivatives` retained as a post-hoc finite-difference diagnostic only — not on the critical solve path |
 | `diagnostics.py` | Post-solve checks; virial theorem; opacity regime distribution per timestep |
 | `output.py` | Snapshot I/O and matplotlib helpers; no physics |
 
@@ -100,7 +149,7 @@ graph TD
     diag[diagnostics.py]
     output[output.py]
 
-    subgraph BVP_Loop[BVP Solver Loop - per time step]
+    subgraph BVP_Loop[Shooting Solver - t=0 and every t>0 step]
         bvp[bvp_solver.py]
         odes[odes.py]
         bcs[boundary_conditions.py]
@@ -114,7 +163,7 @@ graph TD
 
     config -->|Initializes| state
     state -->|Previous step state| timeloop
-    timeloop -->|dT/dt and dP/dt source terms| bvp
+    timeloop -->|Previous state, dt| bvp
     bvp -->|Evaluates RHS| odes
     bvp -->|Checks boundary residuals| bcs
     eos -->|rho and cp| odes
@@ -134,12 +183,23 @@ graph TD
 
 A `@dataclass` holding `m` (mass grid), `r`, `P`, `T`, `L`, `rho` (numpy arrays), current time `t`, and a reference to the previous state. All modules receive state and return new state — none hold mutable state themselves. This enforces functional purity and simplifies testing.
 
-### 4.2 `solve_bvp` Formulation
+### 4.2 Shooting-Method Formulation (supersedes an earlier `solve_bvp` design)
 
-- State vector: $\mathbf{y} = [r, P, L, T]$, independent variable $m$
-- `fun(m, y, dT_dt, dP_dt)` → $d\mathbf{y}/dm$ (time derivatives are frozen source arrays interpolated from the previous timestep)
-- `bc(ya, yb)` → 4 residuals: `[ya[0], ya[2], yb[1] - P_neb, yb[3] - T_neb]`
-- At $t = 0$: `dT_dt` and `dP_dt` are zero arrays → first solve is purely static
+`scipy.integrate.solve_bvp` was the original design (state vector $\mathbf{y}=[r,P,L,T]$,
+independent variable $m$) but proved structurally unreliable for this problem at both
+$t=0$ and $t>0$: a source-term-driven energy equation gives a rank-deficient Jacobian, and
+the near-surface pressure-scale-height boundary layer (P dropping many decades over a small
+mass range) breaks its collocation mesh regardless of the scaling strategy tried. Every
+solve in this codebase instead uses a **shooting method**: integrate outward from the
+center with `scipy.integrate.solve_ivp` (adaptive, no global Jacobian) from trial central
+conditions, and root-find on those trial values until the surface conditions are met.
+
+- **$t=0$:** shoot on $P_\text{center}$ alone ($T_\text{center}$ fixed at
+  `config.T_CENTER_INITIAL`, a prescribed "hot start" parameter — not a shooting unknown)
+  to match $P(M_\text{total})=P_\text{neb}$.
+- **$t>0$:** shoot on $(\ln P_\text{center}, \ln T_\text{center})$ (log-parametrized for
+  guaranteed positivity) to match both $P(M_\text{total})=P_\text{neb}$ and the net-flux
+  radiative surface condition (§4.7), via `scipy.optimize.fsolve`.
 
 ### 4.3 Bell & Lin (1994) Opacity — Density-Dependent Regime Boundaries
 
@@ -169,11 +229,11 @@ The 8 regimes (CGS units, $\kappa$ in cm² g⁻¹):
 
 ### 4.4 `gradients.py` Interface Contract
 
-Returns a tuple `(grad_eff, is_convective)` where `is_convective` is a boolean numpy array. This mask is passed to `diagnostics.py` for per-timestep regime reporting, and can be used by `output.py` to shade convective zones on temperature-profile plots.
+Returns a tuple `(grad_eff, is_convective)` where `is_convective` is a boolean numpy array. This mask is passed to `diagnostics.py` for per-timestep regime reporting, and can be used by `output.py` to shade convective zones on temperature-profile plots. `gradients.py` also provides `marginal_convective_luminosity(m, P, T, kappa, grad_ad)`, a diagnostic-only helper used by `bvp_solver.py`'s $t=0$ construction (§5, Sub-task 5) to populate a physically meaningful $L(m)$ for a structure whose $T(m)$ was built directly from the adiabat rather than solved for.
 
 ### 4.5 Adaptive Time-Stepping
 
-$\Delta t \leq \alpha \cdot \min_i\!\left(T_i / |\dot{T}_i|\right)$ — a local thermal timescale limiter. The safety factor $\alpha$ is set in `config.py`. The fixed-dt path is retained for reproducibility and comparison.
+$\Delta t \leq \alpha \cdot \min_i\!\left(T_i / |\dot{T}_i|\right)$ — a local thermal timescale limiter. The safety factor $\alpha$ is set in `config.py`. The fixed-dt path is retained for reproducibility and comparison. (Sub-task 9, not started — blocked behind Sub-tasks 5–8.)
 
 ### 4.6 Hydrogen Dissociation Halt — Validity Limit of the Quasi-Static Assumption
 
@@ -188,7 +248,47 @@ The quasi-static approximation (hydrostatic equilibrium at every timestep) is va
 **Consequence for the simulation:**
 When the central temperature $T(m=0)$ reaches `T_DISSOCIATION_LIMIT = 2000.0 K`, the outer time loop in `time_stepper.py` must perform a **graceful halt**: log an informative message (timestep number, current time, $T_\text{center}$), save a final snapshot, and exit cleanly. Continuing beyond this point would produce unphysical quasi-static solutions.
 
-This threshold is stored as `T_DISSOCIATION_LIMIT` in `config.py` and checked after every BVP solve in the outer time loop (Sub-task 8).
+This threshold is stored as `T_DISSOCIATION_LIMIT` in `config.py` and checked after every solve in the outer time loop (Sub-task 8).
+
+### 4.7 Net-Flux Radiative Surface Condition (replaces a rigid $T=T_\text{neb}$ clamp)
+
+The surface thermal boundary condition is
+$$L(M_\text{total}) = 4\pi R^2\sigma_\text{SB}\left(T^4-T_\text{neb}^4\right)$$
+— the photosphere emits at its own $T$ and absorbs from the ambient field at $T_\text{neb}$;
+net emission is the difference. This reduces to exactly $T=T_\text{neb}$, $L=0$ at
+equilibrium, but — unlike a rigid clamp — does not force $T$ back to $T_\text{neb}$ once
+something has displaced the envelope from it.
+
+**Why this matters (confirmed, both analytically and numerically):** a rigid
+$T=T_\text{neb}$ clamp makes "no change at all" an *exact* algebraic solution of the
+governing equations for any $dt$, whenever the previous state already satisfies the
+(fixed) outer boundary conditions — which every converged state does by construction. If
+nothing changes, $\partial T/\partial t=\partial P/\partial t=0 \Rightarrow dL/dm\equiv0
+\Rightarrow L\equiv0$ (center BC) $\Rightarrow \nabla_\text{rad}\equiv0 \Rightarrow
+dT/dm\equiv0$, self-consistent with $T$ staying put. Confirmed numerically across $dt$
+spanning six orders of magnitude and six wildly different shooting starting guesses, all
+converging to the same machine-precision-identical answer. This holds regardless of
+explicit vs. implicit time-differencing — it is a structural property of re-solving a
+static boundary-value problem each step against a rigidly fixed external condition, not a
+scheme artifact. The net-flux condition above removes this specific degeneracy (though see
+§5's Sub-task 5 entry — removing it was necessary but not sufficient for sustained
+evolution; the deeper fix is the compact hot-start premise in §1).
+
+### 4.8 Energy Equation: No Added Forcing Term (a rejected alternative, recorded to prevent repeating it)
+
+The energy equation is used in its textbook implicit form only:
+$$\frac{dL}{dm} = -c_P\frac{T_\text{new}-T_\text{prev}}{dt} + \frac{1}{\rho}\frac{P_\text{new}-P_\text{prev}}{dt}$$
+An earlier attempt added an extra, externally-assumed homologous-contraction rate
+($T_\text{prev}/t_\text{KH}$, $4P_\text{prev}/t_\text{KH}$) on top of this, intended to keep
+evolution going past a single step. **That double-counts compressional heating**: the
+implicit difference already *is* the complete statement of how a mass shell's thermal state
+changed over $dt$, from whatever physically happened (including contraction) — there is no
+second, independent channel for gravitational contraction to enter the energy budget.
+Proof it was wrong: it produced a state that was *exactly* frozen step-to-step yet
+continued to radiate a constant, non-decaying $L$ — a direct violation of energy
+conservation (there is no reservoir to radiate from if nothing is changing). Real evolution
+past the first step instead comes from `t=0` already being a genuine thermal
+disequilibrium (§1, §5's Sub-task 5), not an injected rate law inside this equation.
 
 ---
 
@@ -205,16 +305,18 @@ This threshold is stored as `T_DISSOCIATION_LIMIT` in `config.py` and checked af
 **Deliverables:**
 - All CGS physical constants: $G$, $c$, $a_\text{rad}$, $k_B$, $m_H$, $\sigma_\text{SB}$
 - Simulation parameters: $M_\text{total}$, $P_\text{neb}$, $T_\text{neb}$, $\mu$, $\gamma$, `n_grid_points`, `OPACITY_SMOOTH_TRANSITIONS`
-- `T_DISSOCIATION_LIMIT = 2000.0` — core temperature ceiling above which $H_2$ dissociation invalidates the quasi-static assumption (see Section 4.6)
+- `T_DISSOCIATION_LIMIT = 2000.0` — core temperature ceiling above which $H_2$ dissociation invalidates the quasi-static assumption (see §4.6)
 - `SimulationState` dataclass with typed numpy array fields and a `prev` reference slot
 
 **Exit criterion:** Print all constants; confirm CGS unit self-consistency by hand for 3 key relations (e.g., $P = \rho k_B T / \mu m_H$ gives Pa when inputs are CGS).
+
+**Status: Done.**
 
 ---
 
 #### Sub-task 2 — `eos.py` + `opacity.py`
 
-This sub-task is split into five sequential steps due to the complexity of the Bell & Lin opacity model.
+This sub-task is split into sequential steps due to the complexity of the Bell & Lin opacity model.
 
 **Sub-task 2a — `eos.py` and raw power-law evaluator**
 
@@ -222,22 +324,22 @@ This sub-task is split into five sequential steps due to the complexity of the B
 - Define the `RegimeParams` namedtuple and the immutable `REGIMES` table (all 8 rows)
 - Implement `evaluate_regime(kappa_i, a, b, rho, T)` — a single vectorized power-law call
 
-*Exit criterion:* Each of the 8 rows evaluates correctly at a hand-verified (ρ, T) reference point.
+*Exit criterion:* Each of the 8 rows evaluates correctly at a hand-verified (ρ, T) reference point. **Status: Done** (revised by Sub-task 2f below).
 
 **Sub-task 2b — Transition temperature function**
 
-- Implement `transition_temperature(rho, n)` using the analytic formula in Section 4.3
+- Implement `transition_temperature(rho, n)` using the analytic formula in §4.3
 - Handle the degenerate case $b_n = b_{n+1}$ (log a warning; this would indicate a data error)
 - Plot $T_{n \to n+1}(\rho)$ over $\rho \in [10^{-15},\, 10^{-5}]$ g cm⁻³ for all 7 transitions
 
-*Exit criterion:* Transition curve slopes in log-log space match the analytic exponent $[(a_{n+1}-a_n)/(b_n - b_{n+1})]$ for each pair.
+*Exit criterion:* Transition curve slopes in log-log space match the analytic exponent $[(a_{n+1}-a_n)/(b_n - b_{n+1})]$ for each pair. **Status: Done.**
 
 **Sub-task 2c — `determine_regime` and `bell_lin_opacity`**
 
 - Implement `determine_regime(rho, T)` vectorized; compute all 7 transition temperatures per point and find the bin (e.g., via `np.searchsorted` on the sorted transition array)
 - Implement `bell_lin_opacity(rho, T)` as the sole public API function; dispatches to the correct regime using array indexing / `np.where`
 
-*Exit criterion:* Function accepts and returns numpy arrays of arbitrary shape with no Python-level loops; no NaN or Inf over the physically relevant domain.
+*Exit criterion:* Function accepts and returns numpy arrays of arbitrary shape with no Python-level loops; no NaN or Inf over the physically relevant domain. **Status: Done.**
 
 **Sub-task 2d — Validation suite (4 specific checks)**
 
@@ -248,12 +350,75 @@ This sub-task is split into five sequential steps due to the complexity of the B
 | **Reference point check** | Evaluate $\kappa$ at 3–4 (ρ, T) pairs traceable to Bell & Lin (1994) | Agree within the paper's own rounding |
 | **Vectorization stress test** | Pass a 2D mesh covering all 8 regimes simultaneously | Output shape matches input; no NaN/Inf |
 
+**Status: Done.**
+
 **Sub-task 2e — `opacity.py` ↔ `gradients.py` interface preview**
 
 - Call `bell_lin_opacity` along a representative 1D profile (varying T with depth, ρ from a polytropic estimate)
 - Plot $\kappa(m)$ and visually confirm that regime transitions occur at physically plausible depths
 
-*Exit criterion:* Profile plot shows expected qualitative behavior (high $\kappa$ from grain/molecular opacity in cool outer layers, Kramers-like behavior in hot inner regions).
+*Exit criterion:* Profile plot shows expected qualitative behavior. **Status: Done.**
+
+---
+
+#### Sub-task 2f — `eos.py`: Non-Ideal EOS — Electron Degeneracy Pressure — **DONE (2026-07-27)**
+
+**Status: implemented and validated — the hypothesis was confirmed.** Sub-task 5's compact hot-start
+construction (below) hit two numerical dead ends this session: a pure ideal-gas adiabat at
+a physically reasonable central temperature settles at $R\approx300\,R_\text{Jup}$, not a
+genuinely compact few-$R_\text{Jup}$ structure, and a fully self-consistent version of the
+same construction (using the real 4-ODE system rather than a shortcut) settles at an *even
+more* extended $R\approx27{,}000\,R_\text{Jup}$. **Strong physical inference, not yet
+directly confirmed in this codebase:** both are symptoms of the same missing physics —
+ideal-gas thermal pressure alone cannot support a Jupiter-mass object in compact
+hydrostatic equilibrium at any temperature below H2 dissociation. Real gas giants and brown
+dwarfs are partially electron-degenerate essentially from formation onward — not just late
+in a cooling history, the common but incorrect intuition (at Jupiter's characteristic
+density, the electron Fermi temperature is order $10^5$–$10^6$ K, far above any plausible
+formation temperature, so degeneracy is significant from the start; classic reference:
+Zapolsky & Salpeter 1969). This is why published gas-giant thermal-evolution codes
+(Bodenheimer & Pollack 1986; Pollack et al. 1996; Marley et al. 2007; and essentially the
+whole subsequent literature) universally use a non-ideal EOS (typically built on Saumon,
+Chabrier & van Horn 1995) rather than pure ideal gas, even for their earliest, hottest
+models.
+
+**Goal:** add the minimal physics needed to test this hypothesis, before touching
+`bvp_solver.py` again.
+
+**Deliverables:**
+- A non-relativistic electron-degeneracy pressure term, the classical free-electron-gas
+  result (Chandrasekhar 1939; Kippenhahn & Weigert Ch. 15):
+  $$P_\text{degenerate} = \frac{h^2}{20\, m_e}\left(\frac{3}{\pi}\right)^{2/3}
+  \left(\frac{\rho}{\mu_e m_H}\right)^{5/3}$$
+  combined additively with the existing ideal-gas pressure: $P = P_\text{ideal} +
+  P_\text{degenerate}$ (a standard first-order approximation for this purpose, not a full
+  equation-of-state table). Requires three new constants in `config.py`, none currently
+  present: Planck's constant $h$ and electron mass $m_e$ (only $G$, $c$, $a_\text{rad}$,
+  $k_B$, $m_H$, $\sigma_\text{SB}$ exist today), and a mean-molecular-weight-per-electron
+  $\mu_e$, distinct from `config.MU` (mean weight per particle).
+- Re-derive the Sub-task 5 compact-structure estimate analytically/semi-analytically with
+  this term included (extending the Lane-Emden-type approach already used for the
+  ideal-gas-only case, or an equivalent numerical check) **before** resuming any
+  shooting-method work, to confirm the hypothesis actually predicts a few-$R_\text{Jup}$
+  radius at a reasonable $T_\text{center}$.
+
+**Exit criterion:** an analytic or semi-analytic check that including
+$P_\text{degenerate}$ moves the self-consistent radius at `config.T_CENTER_INITIAL` from
+$\sim300\,R_\text{Jup}$ down to a genuinely compact (few $R_\text{Jup}$) value.
+
+**Met, exactly as predicted.** The pure T=0 degenerate (Zapolsky-Salpeter-style) analytic
+estimate gave $R\approx3.11\,R_\text{Jup}$; the actual shooting code, once the combined EOS
+was wired in (`eos.degenerate_pressure`, `eos.density` revised to a vectorized
+Newton-Raphson inversion of the additive combined pressure), converged to
+$R\approx3.17\,R_\text{Jup}$ — close agreement. 4 new `validation.py` checks added and
+passing (reference-point, asymptotic-limit, round-trip-inversion, and a visible $P(\rho)$
+plot). **However, resuming Sub-task 5's structural solver work exposed a second, more
+fundamental blocker, not resolved by this sub-task**: the inherited
+$P(M_\text{total})=P_\text{neb}$ outer boundary condition has no solution at all for the
+degenerate-supported structure (a genuine gap in achievable surface pressure, not a
+numerical-precision issue — PROGRESS.md has the full numerical trail). Sub-task 5 is now
+blocked on redesigning that boundary condition, not on this sub-task's EOS work, which
+stands as complete.
 
 ---
 
@@ -262,7 +427,7 @@ This sub-task is split into five sequential steps due to the complexity of the B
 **Goal:** Implement and validate the Schwarzschild criterion over the full temperature range.
 
 **Deliverables:**
-- `grad_radiative(L, m, P, T, kappa, rho)` using `grad_rad = (3 * kappa * L * P) / (16 * pi * a_rad * c * G * m * T^4)`
+- `grad_radiative(L, m, P, T, kappa)` using `grad_rad = (3 * kappa * L * P) / (16 * pi * a_rad * c * G * m * T^4)`
 - `effective_gradient(grad_rad, grad_ad)` → `(grad_eff, is_convective)`
 - Assert $\kappa > 0$ at entry (guards against upstream errors in `opacity.py`)
 
@@ -271,114 +436,146 @@ This sub-task is split into five sequential steps due to the complexity of the B
 - Run validation over $T \in [100\,\text{K},\; 50\,000\,\text{K}]$ to exercise all opacity regimes
 - Confirm `is_convective` mask is correct for both limiting cases
 
+**Status: Done.** (Also gained `marginal_convective_luminosity`, §4.4, for Sub-task 5's use.)
+
 ---
 
 #### Sub-task 4 — `odes.py` + `boundary_conditions.py`
 
-**Goal:** Formulate the 4-ODE RHS and BVP boundary residuals.
+**Goal:** Formulate the 4-ODE RHS and boundary residuals.
 
 **Deliverables:**
-- `stellar_odes(m, y, dT_dt, dP_dt, params)` → `[dr/dm, dP/dm, dL/dm, dT/dm]`
+- `stellar_odes(m, y, dT_dt, dP_dt)` → `[dr/dm, dP/dm, dL/dm, dT/dm]`
   - `y = [r, P, L, T]`; `rho` derived internally from EOS
-  - `dT_dt`, `dP_dt` are pre-interpolated frozen arrays (zero at $t=0$)
-- `boundary_conditions(ya, yb, params)` → 4 residuals:
-  `[ya[0], ya[2], yb[1] - P_neb, yb[3] - T_neb]`
+  - `dT_dt`, `dP_dt` are pre-computed arrays (implicit differencing, $t>0$; unused at $t=0$)
+- `boundary_conditions(ya, yb)` → 4 residuals, with `r_b, P_b, L_b, T_b = yb`:
+  `[ya[0], ya[2], P_b - P_neb, L_b - L_expected(T_b, r_b)]` (§4.7)
 
 **Exit criterion:**
 - Feed in a known analytic profile (constant-density sphere); verify each ODE term's numerical magnitude is dimensionally consistent
 - Confirm 4 ODEs + 4 BCs → well-posed system
 
----
-
-#### Sub-task 5 — `bvp_solver.py` (static solve, $t = 0$) — REVISED, see PROGRESS.md
-
-**As actually implemented, this sub-task deviates from the deliverables/exit criterion
-originally specified below.** A physics/numerics investigation (documented in full in
-PROGRESS.md's change log) found that:
-
-1. `dT_dt = dP_dt = 0` at $t=0$ forces $dL/dm \equiv 0$ (odes.py), which with the center BC
-   $L(0)=0$ forces $L \equiv 0$ everywhere, which forces $\nabla_\text{rad} \equiv 0 <
-   \nabla_\text{ad}$, which forces $dT/dm \equiv 0$: **the $t=0$ envelope is exactly isothermal
-   at $T_\text{neb}$ and carries zero luminosity, for any solver or initial guess.** This is a
-   hard mathematical consequence of the ODE system, not a convergence artifact.
-2. This is also the physically correct picture, once $T_\text{neb}$, $P_\text{neb}$ were
-   corrected to Hayashi (1981) MMSN values at ~50 AU (the gravitational-instability
-   disk-fragmentation context, Section 1): the envelope is deeply Bonnor-Ebert-subcritical
-   ($M_\text{TOTAL}/M_\text{BE} \approx 0.089$), consistent with a freshly-fragmented,
-   extended, cold GI clump in equilibrium with its disk (not yet contracting).
-3. `scipy.integrate.solve_bvp` proved structurally unreliable for this problem regardless of
-   the above (rank-deficient ODE Jacobian from the source-term-driven energy equation; a
-   near-surface pressure-scale-height boundary layer that broke every mesh/variable-transform
-   strategy tried). `bvp_solver.py` instead uses a **shooting method**
-   (`scipy.integrate.solve_ivp` outward integration + `scipy.optimize.brentq` root-find on the
-   central pressure) on the reduced, well-posed 2-ODE $(r, P)$ system, with $L=0$, $T=T_\text{neb}$
-   assigned directly rather than solved for.
-
-Introducing nonzero $L$ to actually begin Kelvin-Helmholtz contraction is therefore deferred to
-Sub-task 7 (`time_stepper.py`): the bootstrap step for the first real time-evolution step needs
-a literature-motivated assumed initial cooling rate (not the "return zero arrays" bootstrap
-originally envisioned in Sub-task 7 below, which would leave the envelope at this exact fixed
-point indefinitely). Revisit that sub-task's description when it is implemented.
-
-**Deliverables (as implemented):**
-- Shoot on central pressure `P_center` (via `solve_ivp` + `brentq`) to match the surface
-  condition $P(M_\text{TOTAL}) = P_\text{neb}$; assign $L=0$, $T=T_\text{neb}$ directly
-- Log convergence status and residual; raise `RuntimeError` on failure (no silent fallback)
-- Return a populated `SimulationState`
-
-**Exit criterion (as implemented):**
-- Plot $r(m)$, $P(m)$ for the converged solution ($T$, $L$ are trivially constant/zero)
-- Verify hydrostatic balance pointwise in Eulerian form: $|dP/dr + G M(r) \rho / r^2| / |dP/dr| <
-  10^{-3}$ at interior points (unchanged from the original criterion)
-- ~~$L(\text{surface})$ compared to $L_{KH}$~~ — superseded; $L=0$ exactly at $t=0$ by
-  construction (see above), so this comparison no longer applies at this sub-task
+**Status: Done.** (`boundary_conditions.py`'s surface thermal residual was revised in place, §4.7 — the mechanical residual and center residuals are unchanged.)
 
 ---
 
-#### Sub-task 6 — `diagnostics.py` (static checks) — REVISED for the Sub-task 5 cold/L=0 state
+#### Sub-task 5 — `bvp_solver.py` ($t=0$ structure) — REVISED TWICE, **⏸ PAUSED mid-implementation (2026-07-27)**
 
-**As implemented, this sub-task's checks were revised** to reflect what Sub-task 5 actually
-produces: a cold (T=50K), isothermal, L=0, pressure-confined equilibrium (PROGRESS.md has the
-full reasoning), not the originally-envisioned generic converged structure.
+This sub-task has gone through two major premise changes; PROGRESS.md has the full
+investigation behind each.
 
-**Goal:** Verify the $t=0$ solution satisfies global energy constraints, given its actual
-physical character.
+**Premise 1 (original, superseded): diffuse pre-collapse clump.** The first
+implementation built $t=0$ as a diffuse, disk-pressure-confined cloud in isothermal
+equilibrium at $T_\text{neb}$ ($L\equiv0$) — a hard mathematical consequence of
+$\partial T/\partial t=\partial P/\partial t=0$ at a genuine $t=0$ (no previous state to
+difference against), and also a real, Bonnor-Ebert-subcritical equilibrium
+($M_\text{TOTAL}/M_\text{BE}\approx0.089$) given the corrected Hayashi (1981) MMSN nebula
+conditions at ~50 AU. This converged cleanly ($R\approx13$ AU) but turned out to be a
+genuine, unbreakable fixed point under time-stepping (§4.7) — not fixable by any
+per-timestep scheme, because the *premise itself* (a diffuse, pre-collapse object evolved
+quasi-statically) was physically wrong (§1).
 
-**Deliverables:**
-- **Virial theorem check (generalized, with surface confinement term):** the standard
-  zero-surface-pressure virial theorem does not apply here — `P_NEB` is not negligible (it is
-  the entire reason the envelope has the size and structure it does; PLAN.md §4.6/PROGRESS.md's
-  Bonnor-Ebert analysis for Sub-task 5). Integrating hydrostatic equilibrium by parts instead
-  gives the pressure-confined form:
-  $$E_\text{grav} + 3(\gamma - 1) E_\text{therm} = 3 P_\text{neb} V$$
-  where $E_\text{grav} = -\int G m/r \, dm$, $E_\text{therm} = \frac{1}{\gamma-1}\int (P/\rho)
-  \, dm$ (ideal gas, $P=(\gamma-1)\rho u$), and $V = \frac{4}{3}\pi R_\text{surface}^3$. Derived
-  independently (integrate $dP/dr=-Gm\rho/r^2$ by parts) and verified against the converged
-  Sub-task 5 state before implementation: relative imbalance ~8e-6, far tighter than the
-  criterion below suggests is even necessary. Log all three terms (not just the residual) so a
-  future run can see which term dominates, rather than a single pass/fail number.
-- **Opacity regime distribution:** log the fraction of grid points in each Bell & Lin regime.
-  Do *not* expect a spread across regimes — at a uniform T=50K, the whole envelope sits in the
-  single coldest regime ("Ice grains"), confirmed against the actual converged state.
-- **Mass reconstruction check (new):** compute $M(r) = \int 4\pi r^2 \rho \, dr$ from the
-  converged $(r, \rho)$ profile and compare against the Lagrangian grid $m$ directly — an
-  independent check of the continuity equation and the shooting integration together (this
-  works because dr/dm=1/(4πr²ρ) is literally the inverse relation being reconstructed here).
-- ~~Energy flux check~~ — **deferred to Sub-task 7.** With $L\equiv0$ identically (Sub-task 5),
-  any energy flux check is trivially satisfied and carries no diagnostic information; meaningful
-  once real, nonzero $L$ exists.
+**Premise 2 (current): compact, hot, post-collapse protoplanet.** $t=0$ is instead a fully
+convective object with a *prescribed* central temperature (`config.T_CENTER_INITIAL`),
+representing a "just-collapsed" first core — standard practice in the literature (§1,
+§4.7). This is implemented (`solve_static_structure`, shoots on $P_\text{center}$ alone via
+a Lane-Emden-informed bracket + `brentq`) and runs without crashing, but its result is
+**not yet a validated deliverable**:
 
-**Exit criterion:**
-- Virial components logged; balance should be dominated by the correct physical terms
-  ($E_\text{grav}$, $E_\text{therm}$, and the $P_\text{neb}V$ surface term all comparable in
-  magnitude — not a spurious near-cancellation or an unexpectedly dominant/negligible term) —
-  not a hard 1% pass/fail, since the point is to verify the *physics*, not chase numerical
-  precision for its own sake
-- Regime distribution is internally consistent with the simulated cold thermodynamic state
-  (not the original "outer grain, inner Kramers" criterion, which assumed a hot, differentiated
-  structure that does not exist at t=0 per Sub-task 5)
-- Mass reconstruction matches the Lagrangian grid to a few percent away from the center (a
-  known, expected finite-resolution effect from r changing rapidly there — not a bug)
+- Numerically clean, but not compact: at `T_CENTER_INITIAL`=1200 K, the converged
+  pure-ideal-gas adiabat gives $R\approx300\,R_\text{Jup}$ — confirmed via an independent
+  Lane-Emden analytic solution (cross-checked against tabulated $n=1.5$/$n=3.0$ results
+  before trusting it for this project's $n=2.5$ case).
+- Not self-consistent with the real 4-ODE system: this construction bypasses
+  `odes.stellar_odes`'s Schwarzschild criterion (it forces $dT/dm=\nabla_\text{ad}\cdot
+  (T/P)\cdot dP/dm$ directly, since no self-consistent $L$ is available for a purely
+  assumed-convective construction). Feeding it to `solve_timestep` as `state_prev` produces
+  a huge residual ($\sim10^8$) even evaluated at its own unperturbed center values, and
+  that residual is essentially insensitive to $dt$ (confirmed: a 10x smaller $dt$ barely
+  changed it) — this state is not close to a genuine solution of the equations
+  `solve_timestep` uses.
+- A genuinely self-consistent alternative (full 4-ODE, real Schwarzschild criterion, $L$
+  sourced from an assumed homologous contraction rate) does have a solution matching
+  $P(M_\text{total})=P_\text{neb}$ at the same $T_\text{center}$, but it is *more* extended
+  ($R\approx27{,}000\,R_\text{Jup}$), not compact — confirmed numerically (a clean,
+  monotonic root-find, not a bracketing artifact), but the underlying reason has not been
+  directly diagnosed (leading guess, unverified: the assumed contraction rate under-sources
+  $L$ near the surface relative to what a true adiabat would need, letting the profile
+  drift onto a shallower, more isothermal-like gradient there).
+
+**Sub-task 2f (electron degeneracy pressure) is done and confirmed the missing-EOS
+hypothesis exactly**: the analytic prediction ($R\approx3.11\,R_\text{Jup}$) was reproduced
+almost exactly by the actual shooting code ($R\approx3.17\,R_\text{Jup}$). **But this
+exposed the second, independent gap found during the 2026-07-27 correctness review as a
+hard blocker, not just a follow-up.** With the combined EOS in place, no $P_\text{center}$
+reaches anywhere near $P_\text{neb}$ at all — $P_\text{end}$ jumps discontinuously from
+trapped below $\sim0.05$-$0.08\,\text{dyn/cm}^2$ (integration fails) to
+$\ge2.79\times10^6\,\text{dyn/cm}^2$ (integration succeeds), confirmed not a
+numerical-precision artifact (PROGRESS.md has the full trail). This is the same underlying
+issue the correctness review found in the self-consistent (~27,000 $R_\text{Jup}$)
+construction — a genuine transition to a radiative, nearly-isothermal, extended envelope
+once the bulk equation of state is pushed to bridge all the way down to the tiny ambient
+$P_\text{neb}$ — now sharper because the degenerate-supported interior is far stiffer.
+Electron degeneracy pressure is negligible at the low densities where this forms, so
+Sub-task 2f could not have fixed it. The real fix is replacing the inherited
+$P(M_\text{total})=P_\text{neb}$ outer boundary condition with a physically-motivated
+photospheric one — flagged as a concern for the diffuse-cloud design early in the project
+(PROJECT_CONTEXT.md) but not revisited under the compact hot-start premise until this
+session.
+
+**Photospheric ($\tau=2/3$) outer BC: DONE, validated.** `solve_static_structure()`
+converges cleanly: $R\approx3.172\,R_\text{Jup}$, mass relative residual $\approx0.16\%$.
+Both shooting routines now locate the surface via a `solve_ivp` *event* (photosphere
+crossing), matching enclosed mass to $M_\text{total}$, rather than a residual at a fixed
+mass endpoint — full derivation and implementation detail in PROGRESS.md's 2026-07-27
+entries.
+
+**Bridging to `solve_timestep`: implemented, PAUSED, not working yet.**
+`solve_static_structure`'s output is not itself a genuine solution of `solve_timestep`'s
+real 4-ODE equations (confirmed sharply: evaluating them at its own values diverges,
+$T\to3.4$ million K in one step) — standard "initial model relaxation" territory, not a bug.
+`bvp_solver.relax_initial_state(state_0)` implements this via homotopy on
+$\nabla_\text{eff}$ (blending the pure adiabat at $\alpha=0$, matching `state_0`'s own
+construction exactly, toward the real Schwarzschild-selected value at $\alpha=1$) — its
+first pseudo-step converges cleanly, validating the approach, but later steps hit a cascade
+of `scipy` stiff-solver numerical edge cases (floating-point cancellation, `eos.density`
+Newton non-convergence, negative-domain probing, clamp-induced overflow). **Two principled
+fixes proposed, neither implemented — evaluate next session before touching this code
+again:** (1) log-transformed state variables ($\ln P$, $\ln T$) for structural positivity;
+(2) graceful degradation inside `eos.density` (bounded penalty instead of a hard assertion
+on an unconvergeable probe). Full blow-by-blow, exact failure traces, and the rejected
+"scale dL/dm by alpha" trap (a real mathematical dead end, not just a bad idea — collapses
+to the original isothermal degeneracy) are in PROGRESS.md's 2026-07-27 entry — read it
+before resuming.
+
+**Deliverables (remaining):** resolve the relaxation numerical issue (Path 1 or 2 above);
+confirm `relax_initial_state`'s output is genuinely self-consistent with `solve_timestep`'s
+equations; re-validate `solve_timestep` starting from that state.
+
+**Exit criterion:** `relax_initial_state` completes all 11 pseudo-steps without numerical
+failure; the resulting state, fed to `solve_timestep(state, dt)` for a real `dt`, shows a
+small residual at a reasonable starting guess (not divergence).
+
+---
+
+#### Sub-task 6 — `diagnostics.py` — **BLOCKED, pending Sub-task 5's final structure**
+
+The existing checks (pressure-confined virial form, single-opacity-regime prediction) were
+written for Premise 1's isothermal, pressure-confined state and no longer apply once $t=0$
+is a compact, self-gravitating, differentiated structure:
+
+- **Virial theorem → standard (unconfined) form expected.** A self-gravitating object with
+  negligible surface pressure (compact radius, $P_\text{neb}$ many orders of magnitude
+  below $P_\text{center}$) should satisfy the textbook
+  $E_\text{grav}+3(\gamma-1)E_\text{therm}\approx0$, not the pressure-confined form Premise
+  1 needed.
+- **Opacity regime distribution → multi-regime expected.** A hot center cooling to a
+  cold surface should span several Bell & Lin regimes, not sit entirely in "Ice grains."
+- **Mass reconstruction check** (continuity-equation self-consistency, `diagnostics.
+  mass_reconstruction`) is regime-independent and should transfer directly once Sub-task 5
+  has a final structure to check.
+
+Revision deferred until Sub-task 5 produces a final, validated structure.
 
 ---
 
@@ -386,81 +583,51 @@ physical character.
 
 ---
 
-#### Sub-task 7 — Time derivative computation in `time_stepper.py` — REVISED bootstrap, see PROGRESS.md
+#### Sub-task 7 — `time_stepper.py` time derivatives — bootstrap mechanism now **OBSOLETE**
 
-**As implemented, the bootstrap deliverable below must NOT return zero arrays**, contrary to
-the original text. $t=0$ (Sub-task 5) is exactly isothermal with $L\equiv0$ — an exact fixed
-point of this frozen-source-term scheme (zero $\partial T/\partial t, \partial P/\partial t$
-forces $dL/dm\equiv0$, which forces $L\equiv0$, forever, since two identical states always
-difference to zero). A zero-array bootstrap would leave the envelope at $t=0$'s state
-indefinitely; Kelvin-Helmholtz contraction would never begin.
+**The original homologous-contraction "bootstrap" — and every kick/forcing variant tried
+this session — is no longer needed and should be removed.** It existed solely to break
+Premise 1's isothermal fixed point (§4.7); once $t=0$ is genuinely hot and non-isothermal
+(Premise 2), `solve_timestep` runs directly from `state_0` with no special first-step
+handling. Two mechanisms were tried and rejected as *general* per-timestep drivers before
+this was understood: a one-time "kick" construction (superseded along with Premise 1), and
+an explicit forcing term added to the energy equation (§4.8 — rejected, double-counts
+energy).
 
-A "hot start" reconstruction of $t=0$ itself (an adiabatic, convective interior at
-$T_\text{center}\sim600$–$1500$K) was considered and rejected as a way around this: verified
-numerically (see PROGRESS.md) that the required luminosity to sustain a genuinely convective
-structure at these `M_TOTAL`/`P_NEB` explodes with $T_\text{center}$ — ~1,940 $L_\odot$ at
-700K, ~61 million $L_\odot$ at 1000K, ~352 billion $L_\odot$ at 1500K — confirming the
-Sub-task 5 finding (deep Bonnor-Ebert subcriticality forces a near-uniform pressure profile
-regardless of assumed interior temperature) generalizes across the requested range rather than
-being specific to the one value already tested. $t=0$ stays the cold, isothermal, $L=0$ state.
+**What remains genuinely useful:** `compute_time_derivatives(state_curr, state_prev, dt)`'s
+plain finite-difference branch (no bootstrap dispatch) is retained as a post-hoc diagnostic
+utility — e.g. reporting the realized $\partial T/\partial t$, $\partial P/\partial t$ after
+a step converges. It is not on the critical solve path (`bvp_solver._implicit_rhs_logm`
+does its own inline differencing).
 
-**Goal:** Implement the finite-difference bridge between timesteps, including a physically
-motivated way to actually start evolution away from the $t=0$ fixed point.
-
-**Deliverables (as implemented):**
-- `compute_time_derivatives(state_curr, state_prev, dt)` → `(dT_dt, dP_dt)` as numpy arrays
-  on `state_curr.m`. `state_prev=None` signals the bootstrap case (dispatches internally).
-- **Bootstrap:** derives `(dT_dt, dP_dt)` from a **homologous (self-similar) contraction
-  ansatz** rather than zero arrays or a reconstructed hot state. Derivation: every Lagrangian
-  shell contracts as $r=r_0 f(t)$ with $df/dt|_0=-1/t_\text{KH}$; mass conservation forces
-  $\rho=\rho_0/f^3$; the *only* $P(f)$ scaling consistent with hydrostatic equilibrium
-  ($dP/dm\propto1/r^4\propto f^{-4}$) at every instant is $P=P_0f^{-4}$; the ideal gas law
-  then forces $T=T_0f^{-1}$. At $t=0$ this gives $dT/dt=+T/t_\text{KH}$, $dP/dt=+4P/t_\text{KH}$
-  (both positive — contraction *heats* the envelope, the standard negative-heat-capacity
-  behavior of a self-gravitating gas losing energy). Substituting into `odes.py`'s energy
-  equation gives $dL/dm=\frac{3\gamma-4}{\gamma-1}\cdot\frac{k_BT}{\mu m_H t_\text{KH}}$,
-  positive for $\gamma>4/3$ (`config.GAMMA=1.4` satisfies this — the same stability threshold
-  behind `T_DISSOCIATION_LIMIT`) — a genuine, well-defined $L(m)>0$ profile, not an arbitrary
-  nonzero source. $t_\text{KH}$ = `config.T_KH_BOOTSTRAP_S` (assumed, 1 Myr).
-- Interpolation: `state_prev`'s `T`, `P` are interpolated (`np.interp`) onto `state_curr.m`
-  before differencing, for the general (non-bootstrap) finite-difference case.
-- **Rank-deficiency prediction (tested):** confirmed by direct `solve_bvp` experiment — the
-  singular-Jacobian *crash* that broke Sub-task 5's $t=0$ solve does **not** recur once
-  `dP_dt` is genuinely nonzero (5 Newton iterations ran without crashing, vs. an immediate
-  crash at $t=0$). However, `solve_bvp` still does **not** practically converge for a full
-  real timestep: residuals grow after iteration 2 and the mesh explodes toward the node limit
-  (status 1, boundary residuals ~$10^7$–$10^9$) — the same unnormalized-absolute-tolerance
-  problem across vastly different physical scales (r, P, L, T) that forced Sub-task 5 toward
-  a shooting method. **Conclusion for Sub-task 8:** solving a real timestep will need the same
-  kind of non-dimensionalization work (or a shooting-based approach) as Sub-task 5, not a bare
-  `solve_bvp` call — plan for that rather than assuming nonzero `dP_dt` alone is sufficient.
-
-**Exit criterion:** Derivative arrays have correct shape and magnitude, `dT_dt`/`dP_dt`
-positive everywhere (verified), `dL/dm` matches the analytic homologous formula above
-exactly, and the integrated $L(M_\text{TOTAL})$ is within an order of magnitude of the
-independent $|E_\text{grav}|/t_\text{KH}$ estimate (`diagnostics.virial_balance`) — confirmed:
-ratio 2.24.
+**Not yet implemented in code:** `time_stepper.py` still contains the original bootstrap
+dispatch (`_bootstrap_time_derivatives`, the `state_prev=None` branch) as of this writing.
+Removing it and updating the module docstring is pending, tracked together with Sub-task 8
+below since both land in the same pass.
 
 ---
 
-#### Sub-task 8 — Outer time loop in `time_stepper.py`
+#### Sub-task 8 — Outer time loop `time_stepper.run()` — **BLOCKED, pending Sub-tasks 5–7**
 
-**Goal:** Wire the full time-evolution loop.
+**Deliverables (once unblocked):**
+- `run(n_steps, dt)`: `state_0 = bvp_solver.solve_static_structure()` → repeated
+  `bvp_solver.solve_timestep(state_prev, dt)` calls — no bootstrap/kick step of any kind.
+- Energy equation stays in its pure implicit form (§4.8) — no added forcing term.
+- Log convergence status at each step; warn (do not raise) on soft convergence failures.
+- Store snapshots at configurable intervals.
+- **Dissociation halt check** (unchanged from the original design): after each solve,
+  compare `state.T[0]` against `config.T_DISSOCIATION_LIMIT`; if reached, save a final
+  snapshot, log step/time/$T_\text{center}$, and exit cleanly.
+- Remove `time_stepper.py`'s bootstrap dispatch (Sub-task 7).
 
-**Note before implementing "call BVP solver" below:** Sub-task 7 confirmed nonzero `dP_dt`
-fixes the singular-Jacobian *crash* `solve_bvp` hit at $t=0$, but `solve_bvp` still does not
-practically *converge* for a real timestep (mesh explosion, huge unnormalized boundary
-residuals — same root cause as Sub-task 5's boundary-layer/dynamic-range problem). Expect to
-need the same non-dimensionalization treatment, or a shooting-based per-timestep solve
-extending Sub-task 5's approach, rather than a bare `solve_bvp` call.
+**Exit criterion (revised):** a clear, sustained, monotonic trend ($r_\text{surface}$
+decreasing, $L_\text{surface}$ staying nonzero and not decaying back toward zero,
+$T_\text{center}$ increasing) over enough steps to be clearly above numerical noise — exact
+step count/$dt$ to be determined empirically once Sub-task 5 is unblocked and validated.
+Additionally verify the dissociation halt with an artificially-lowered
+`T_DISSOCIATION_LIMIT`.
 
-**Deliverables:**
-- `run(n_steps, dt)`: at each step, compute time derivatives → call BVP solver → update state → call diagnostics → save snapshot
-- Log BVP convergence status at each step; warn (do not raise) on soft convergence failures
-- Store snapshots at configurable intervals
-- **Dissociation halt check:** after each BVP solve, compare `state.T[0]` (central temperature) against `config.T_DISSOCIATION_LIMIT`. If `T_center >= T_DISSOCIATION_LIMIT`, save a final snapshot, emit an informative log message (step number, elapsed time, $T_\text{center}$, and an explanation that $H_2$ dissociation has been reached and dynamic collapse would ensue), and exit the loop cleanly.
-
-**Exit criterion:** Run 10 steps with a large $\Delta t$; confirm $r_\text{surface}$ decreases (envelope contracts) and $L_\text{surface}$ increases monotonically. Additionally, verify that artificially setting `T_DISSOCIATION_LIMIT` to a value below the initial $T_\text{center}$ causes an immediate graceful halt on step 1.
+**Not yet started in code** — `time_stepper.py` is unchanged from Sub-task 7's original implementation as of this writing.
 
 ---
 
@@ -473,6 +640,8 @@ extending Sub-task 5's approach, rather than a bare `solve_bvp` call.
 - Fixed-dt path retained via a `USE_ADAPTIVE_DT: bool` flag in `config.py`
 
 **Exit criterion:** Compare fixed vs. adaptive $\Delta t$ runs; adaptive run conserves total energy measurably better over 100 steps.
+
+**Status: Not started — blocked behind Sub-tasks 5–8.**
 
 ---
 
@@ -488,6 +657,8 @@ extending Sub-task 5's approach, rather than a bare `solve_bvp` call.
 
 **Exit criterion:** All plots generated from saved `.npz` files without re-running the simulation.
 
+**Status: Not started — blocked behind Sub-tasks 5–8.**
+
 ---
 
 ### Phase 3 — Extensions (Post-Course)
@@ -497,23 +668,26 @@ extending Sub-task 5's approach, rather than a bare `solve_bvp` call.
 | 11 | Replace Bell & Lin with OPAL tabulated opacity (bilinear interpolation) | `opacity.py` Layer 3 API unchanged |
 | 12 | Solid core inner BC: $m = M_\text{core} > 0$, $r = R_\text{core}$ fixed | `boundary_conditions.py` |
 | 13 | Accretion luminosity surface term | `boundary_conditions.py` + `time_stepper.py` |
+| 14 | Full non-ideal EOS (tabulated, e.g. SCvH-style) if Sub-task 2f's minimal degeneracy term proves insufficient | `eos.py` |
 
 ---
 
 ## Implementation Order Summary
 
-| # | File(s) | Depends on | Exit Criterion |
-|---|---|---|---|
-| 1 | `config.py`, `state.py` | — | CGS unit consistency |
-| 2a | `eos.py`, regime table | 1 | 8 reference-point checks |
-| 2b | `transition_temperature` | 2a | Log-log slope matches analytic |
-| 2c | `determine_regime`, `bell_lin_opacity` | 2b | Vectorized, no NaN/Inf |
-| 2d | Validation suite | 2c | 4 checks pass |
-| 2e | Interface preview | 2d, 3 scaffold | $\kappa(m)$ profile sensible |
-| 3 | `gradients.py` | 2c | Schwarzschild switch correct over full T range |
-| 4 | `odes.py`, `boundary_conditions.py` | 1–3 | Dimensional consistency check |
-| 5 | `bvp_solver.py` (static) | 4 | Converged $t=0$ structure |
-| 6 | `diagnostics.py` | 5 | Virial theorem $<1\%$ error |
-| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time |
-| 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation |
-| 10 | `output.py` | all | Reproducible plots from `.npz` |
+| # | File(s) | Depends on | Exit Criterion | Status |
+|---|---|---|---|---|
+| 1 | `config.py`, `state.py` | — | CGS unit consistency | Done |
+| 2a | `eos.py`, regime table | 1 | 8 reference-point checks | Done |
+| 2b | `transition_temperature` | 2a | Log-log slope matches analytic | Done |
+| 2c | `determine_regime`, `bell_lin_opacity` | 2b | Vectorized, no NaN/Inf | Done |
+| 2d | Validation suite | 2c | 4 checks pass | Done |
+| 2e | Interface preview | 2d, 3 scaffold | $\kappa(m)$ profile sensible | Done |
+| 2f | `eos.py` non-ideal EOS (electron degeneracy) | 2a | Analytic/semi-analytic check: compact radius at reasonable $T_\text{center}$ | Done (2026-07-27) |
+| 3 | `gradients.py` | 2c | Schwarzschild switch correct over full T range | Done |
+| 4 | `odes.py`, `boundary_conditions.py` | 1–3 | Dimensional consistency check | Done |
+| **5a** | **`bvp_solver.py` outer BC redesign (photospheric, replaces $P=P_\text{neb}$)** | **2f, 4** | **Compact structure reaches a physically-motivated surface condition, not a $\sim10^7$ relative residual** | **Next milestone — design under review** |
+| 5 | `bvp_solver.py` ($t=0$, compact hot start) | 4, 2f, **5a** | Compact, self-consistent $t=0$ structure | Blocked on 5a |
+| 6 | `diagnostics.py` | 5 | Standard (unconfined) virial theorem; multi-regime opacity | Blocked on 5 |
+| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Blocked on 5–6 |
+| 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation | Blocked on 7–8 |
+| 10 | `output.py` | all | Reproducible plots from `.npz` | Blocked on 7–8 |

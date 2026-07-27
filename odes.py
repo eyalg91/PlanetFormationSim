@@ -22,9 +22,10 @@ def stellar_odes(m, y, dT_dt, dP_dt):
     """
     r, P, L, T = y
 
-    # Ideal gas EOS: rho = P*mu*m_H/(k_B*T)  [g cm^-3]  (eos.py)
-    # ASSUMPTION: ideal gas — breaks down near H2 dissociation (config.T_DISSOCIATION_LIMIT)
-    rho = eos.density(P, T, config.MU)
+    # Combined ideal-gas + electron-degeneracy EOS (eos.py): P = P_ideal(rho,T) + P_degenerate(rho)
+    # ASSUMPTION: ideal-gas term breaks down near H2 dissociation (config.T_DISSOCIATION_LIMIT);
+    # degenerate term is non-relativistic only (eos.degenerate_pressure)
+    rho = eos.density(P, T, config.MU, config.MU_E)
 
     kappa = opacity.bell_lin_opacity(rho, T)     # Bell & Lin (1994) opacity [cm^2 g^-1]
     grad_ad = eos.grad_adiabatic(config.GAMMA)   # nabla_ad = (gamma-1)/gamma [dimensionless]
