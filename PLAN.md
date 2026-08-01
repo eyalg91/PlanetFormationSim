@@ -602,7 +602,23 @@ is a compact, self-gravitating, differentiated structure:
   mass_reconstruction`) is regime-independent and should transfer directly once Sub-task 5
   has a final structure to check.
 
-Revision deferred until Sub-task 5 produces a final, validated structure.
+Revision deferred until Sub-task 5 produces a final, validated structure — Sub-task 5 is now
+done (above), so this revision is unblocked.
+
+**Visual diagnostic plots (added to scope 2026-08-01, per CLAUDE.md's stated preference for
+a visible check over a print-only one):** `run_diagnostics`'s existing report is print-only;
+for a converged structure this compact and differentiated, seeing the profiles is more
+informative than scalar summaries alone. Three plots, each taking a `SimulationState` and an
+`output_path`, matching `validation.py`'s existing `plt.subplots`/`savefig` house style:
+- **`plot_structure_profile`** — $T(m)$, $\rho(m)$, $P(m)$ as a 3-panel figure (log-scale,
+  shared $m/M_\text{total}$ x-axis) — the primary visual sanity check on the converged
+  structure.
+- **`plot_mass_radius`** — $m(r)$, showing how mass concentrates toward the center for this
+  degenerate-supported structure.
+- **`plot_convective_zones`** — $\nabla_\text{rad}(m)$ vs $\nabla_\text{ad}$ (Schwarzschild
+  criterion, `gradients.effective_gradient`), with convective zones shaded — visually
+  confirms which layers are convective vs radiative, directly checking the same physics
+  `_adiabatic_rhs_logm`'s fully-convective assumption (Sub-task 5) relies on.
 
 ---
 

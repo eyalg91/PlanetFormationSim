@@ -510,9 +510,23 @@ at the photosphere event point, not a fixed grid endpoint). **Still not validate
 
 ### `diagnostics.py` — post-solve physical diagnostics
 
-Unchanged in code. Its existing checks (pressure-confined virial form, single-regime
-opacity expectation) were written for Premise 1's isothermal state and are expected to need
-revision once Sub-task 5 lands a final structure — see PLAN.md's Sub-task 6 entry.
+**New this session (2026-08-01):** three visual diagnostic plots — `plot_structure_profile`
+($T$, $\rho$, $P$ vs $m$), `plot_mass_radius` ($m$ vs $r$), `plot_convective_zones`
+($\nabla_\text{rad}$ vs $\nabla_\text{ad}$, convective regions shaded) — plus
+`plot_diagnostics(state)`, a convenience wrapper generating all three. Generated against the
+cached, fully-relaxed state (`dev_cache.py`) and visually inspected:
+`structure_profile.png`, `mass_radius.png`, and `convective_zones.png` all show smooth,
+monotonic, physically sensible profiles. Notably, `convective_zones.png` shows
+$\nabla_\text{rad}\gg\nabla_\text{ad}$ (by ~7 orders of magnitude) across the *entire*
+structure — an independent visual confirmation, from the real Schwarzschild criterion
+evaluated on the genuinely-relaxed state, that the fully-convective assumption
+`_adiabatic_rhs_logm` forces for the $t=0$ construction is physically justified for this
+object, not just a simplifying assumption.
+
+**Still unchanged/pending**: `virial_balance`'s pressure-confined form (written for Premise
+1's isothermal state) still needs rewriting to the standard unconfined form; the opacity
+regime census hasn't been re-checked against the new compact structure. See PLAN.md's
+Sub-task 6 entry.
 
 ### `time_stepper.py` — time-derivative bridge between timesteps
 
@@ -615,6 +629,30 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-01 — Sub-task 6 started: visual diagnostic plots for the relaxed $t=0$ structure
+
+PLAN.md's existing Sub-task 6 scope covered only scalar/print diagnostics (virial balance,
+opacity regime census, mass reconstruction) — no plots, despite CLAUDE.md's stated
+preference for a visible check over a print-only one wherever a check naturally has
+something to look at. Added to scope and implemented: `diagnostics.plot_structure_profile`
+($T$, $\rho$, $P$ vs $m$), `plot_mass_radius` ($m$ vs $r$), `plot_convective_zones`
+($\nabla_\text{rad}$ vs $\nabla_\text{ad}$, Schwarzschild criterion, convective regions
+shaded), and `plot_diagnostics(state)` tying all three together — matching
+`validation.py`'s existing `plt.subplots`/`savefig` house style.
+
+Generated against the cached, fully-relaxed state from `dev_cache.py` (per the new
+Development Workflow rule — no solver re-run, plots generated in well under a second) and
+visually inspected. All three are smooth and physically sensible. `convective_zones.png` in
+particular shows $\nabla_\text{rad}\gg\nabla_\text{ad}$ (~7 orders of magnitude) across the
+*entire* structure, independently confirming — via the real Schwarzschild criterion
+evaluated on the genuinely-relaxed state, not just assumed — that this object really is
+fully convective throughout, exactly the assumption `_adiabatic_rhs_logm` forces for the
+$t=0$ construction.
+
+`virial_balance`'s pressure-confined form and the opacity-regime census (both flagged as
+needing revision once Sub-task 5 landed a final structure) are **not yet revised** — out of
+scope for this pass, which focused specifically on the requested visual plots.
 
 ### 2026-08-01 — $\nabla_\text{rad}$ floor fixes the relaxation blocker; solve_timestep's own seed needed the same cancellation nudge; Sub-task 5 DONE
 
