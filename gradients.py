@@ -18,14 +18,20 @@ def grad_radiative(L, m, P, T, kappa):
     # propagating silently into the temperature structure equation.
     assert np.all(kappa_b > 0.0), "grad_radiative: kappa must be strictly positive"
 
+    # ASSUMPTION: this formula is derived for strictly outward radiative flux (L>=0). Dividing
+    # by T^4 (which -> 0 near a photosphere) makes it pathologically sensitive to any negative
+    # excursion in L there, which would otherwise drive nabla_rad - and hence dT/dm via the
+    # Schwarzschild selection in effective_gradient - to force an unphysical temperature
+    # inversion (see PROGRESS.md for the numerical trace). Floored here, at the point the
+    # outward-flux assumption actually breaks down, rather than patched downstream.
+    L_safe = np.maximum(L, 0.0)
+
     # Radiative diffusion gradient (Kippenhahn & Weigert stellar-structure form):
     # nabla_rad = 3*kappa*L*P / (16*pi*a_rad*c*G*m*T^4)   [dimensionless]
-    # Units: [cm^2 g^-1][erg s^-1][dyn cm^-2] / ([erg cm^-3 K^-4][cm s^-1][cm^3 g^-1 s^-2][g][K^4])
-    #      = (cm^3 g s^-5) / (cm^3 g s^-5) = dimensionless
     # ASSUMPTION: diverges as m -> 0. At the center L(m=0) = 0 by the inner boundary condition,
-    # so the ratio is a removable 0/0; this function does not special-case it, so callers
-    # (bvp_solver.py, odes.py) must not evaluate it exactly at m = 0.
-    return (3.0 * kappa_b * L * P) / (16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m * T**4)
+    # so the ratio is a removable 0/0; callers (bvp_solver.py, odes.py) must not evaluate this
+    # exactly at m = 0.
+    return (3.0 * kappa_b * L_safe * P) / (16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m * T**4)
 
 
 # ==========================================

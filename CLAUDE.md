@@ -21,6 +21,11 @@ You are an expert computational physicist assisting with a 1D quasi-static plane
 - If a physical relation needs a consistency verification, describe why (e.g., "to catch grid-point index errors") and ask for my approval before implementing the test.
 - Prefer a visible check (a plot of a profile, a residual vs. a coordinate, a comparison curve — like `opacity_profile_preview.png`) over a print-only assert whenever a check naturally has something to look at. This isn't limited to opacity — apply it wherever it fits (new profiles, new ODE terms, new solver output, etc.), not only where a prior example already did it. Pure scalar/reference-point checks (e.g. unit-consistency algebra) don't need a plot — use judgment.
 
+## Development Workflow
+- **Caching:** never re-run a heavy numerical solve (e.g. `relax_initial_state`, or a full `solve_static_structure` → relaxation chain) just to test unrelated downstream logic. Cache the intermediate `SimulationState` to disk once it's produced (`dev_cache.py`), and develop/debug downstream functions against the cached state.
+- **Sterile before wet:** when building a new wrapper or outer-loop feature (e.g. the adaptive time loop), first develop and test its own control flow against a lightweight mock or a cached/pre-computed state sequence, not the live physics solver. Only run it against the real solver once the outer logic is validated on its own.
+- **Visibility on long runs:** any heavy iterative process (a multi-step relaxation ramp, an outer time loop) must log progress periodically (e.g. every step or every Nth step) — never run silently for minutes with no output.
+
 ## Documentation Protocol
 - `PROGRESS.md` is the running project log for the user, a physicist tracking this project over time. After completing each task, update it — do not treat this as optional or wait to be asked.
 - Update the relevant subsection(s) of `PROGRESS.md`'s Module Reference so it always reflects the current state of the code, and append a dated entry to its Change Log describing what changed and the physical/architectural reasoning behind it.

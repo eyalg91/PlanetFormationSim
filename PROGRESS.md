@@ -11,28 +11,53 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
-**⏸ IMPLEMENTATION PAUSED (end of 2026-07-27 session) — pick up here.** Sub-task 2f (EOS) and
-the photospheric outer BC redesign for `solve_static_structure` are DONE and validated
-($R\approx3.17\,R_\text{Jup}$, matching the analytic prediction). The remaining piece —
-bridging `solve_static_structure`'s output into a state that's genuinely self-consistent
-with `solve_timestep`'s real 4-ODE equations, via a homotopy/relaxation scheme
-(`bvp_solver.relax_initial_state`) — is **implemented but not working**: its first pseudo-step
-converges beautifully (validating the physical approach), but later steps hit a cascading
-series of numerical edge cases in `scipy`'s stiff-solver internals, not yet resolved with a
-principled fix. **Two candidate fixes are on the table, not yet evaluated or implemented** —
-see §5's "Sub-task 5: initial-state relaxation" entry below for the full detail, exact
-failure trace, and both proposals. Do not resume by re-guessing at domain-clamp values —
-read that entry first.
+**✅ Sub-task 5 is DONE and verified end-to-end (2026-08-01 session).** Three blockers were
+found and fixed in sequence this session, each traced to its root cause before being patched
+(no ad hoc clamp-tuning):
+
+1. **Clamp-cascade in `relax_initial_state`'s $\alpha$-ramp** (§5, 2026-07-27 entry) — fixed
+   by switching `bvp_solver.py`'s inner `solve_ivp` state to logarithmic $P$, $T$ ("Path 1"),
+   removing the `1e-300` floor clamps entirely so positivity holds by construction.
+2. **A $\nabla_\text{rad}$ blow-up near the photosphere** once $\alpha>0$ blended in the real
+   Schwarzschild-selected gradient — traced to `gradients.grad_radiative`'s
+   $\nabla_\text{rad}\propto\kappa LP/(mT^4)$ becoming pathologically sensitive as $T^4\to0$
+   near the photosphere, so a small $L$-sign deviation flips $\nabla_\text{rad}$'s sign and
+   forces an unphysical temperature inversion. Fixed by flooring $L$ at its actual point of
+   use in `grad_radiative` (not downstream in `effective_gradient`) — confirmed the floor
+   engages only transiently (for $\alpha\le0.7$) and is never active at the converged
+   $\alpha=1$ solution, i.e. it has zero footprint on the final physics.
+3. **A catastrophic-cancellation collapse in `solve_timestep`** when seeded from an
+   already-self-consistent `state_prev` (the relaxed state) — the trial and `state_prev`
+   coincide to near machine precision right at the seed, so
+   $dT/dt=(T-T_\text{prev})/dt$ amplifies floating-point noise into a spurious blow-up near
+   $m=0$. Fixed with the same tiny (`1e-6` relative) seed nudge `relax_initial_state` already
+   used for the identical reason.
+
+**Verified end-to-end**: `solve_static_structure()` → `relax_initial_state()` (all 11
+$\alpha$ pseudo-steps converge, residuals $\lesssim10^{-5}$) → `solve_timestep()` (converges
+from the relaxed state with residuals $[2.4\times10^{-10}, 3.1\times10^{-8}]$, giving a
+physically sensible first step: $T_\text{center}$ cools $1251.9\to1215.3\,$K,
+$r_\text{surface}\approx3.17\,R_\text{Jup}$, mass matched to $10^{-8}$). See §5's 2026-08-01
+entries for the full numerical trace of all three fixes.
+
+**Also this session**: a `dev_cache.py` utility (pickle save/load for a `SimulationState`)
+and a new CLAUDE.md "Development Workflow" section were added, so future debugging of
+downstream logic doesn't require re-running the ~15-20 minute `solve_static_structure`+
+`relax_initial_state` chain from scratch. `bvp_solver.py`/`gradients.py` comments were also
+cleaned of session-narrative content (kept: physical reasoning and ASSUMPTION flags; PROGRESS.md
+remains the place for numerical trails and debugging history).
+
+**Per the original Sub-task 5 instruction: stop and check in before starting Sub-task 6.**
 
 | Sub-task | Scope | Status |
 |---|---|---|
 | 1 | `config.py` + `state.py` | Done |
 | 2a–2e | `eos.py` (ideal-gas part) + `opacity.py` + validation | Done |
 | 2f | `eos.py` — non-ideal EOS, electron degeneracy pressure | Done, validated (2026-07-27) |
-| 3 | `gradients.py` (Schwarzschild criterion) | Done |
+| 3 | `gradients.py` (Schwarzschild criterion) | Done (includes the `L>=0` floor in `grad_radiative`, 2026-08-01) |
 | 4 | `odes.py` + `boundary_conditions.py` | Done (surface conditions revised, §5) |
-| 5 | `bvp_solver.py` ($t=0$ structure + relaxation to self-consistency) | `solve_static_structure` done & validated (photospheric BC); **`relax_initial_state` implemented but blocked — paused, see above** |
-| 6 | `diagnostics.py` | Blocked on 5 |
+| 5 | `bvp_solver.py` ($t=0$ structure + relaxation to self-consistency) | **Done, verified end-to-end (2026-08-01)** — `solve_static_structure`, `relax_initial_state`, and `solve_timestep` all converge cleanly in sequence |
+| 6 | `diagnostics.py` | Ready to start — checks need rewriting for the compact/degenerate structure (§5 history), not yet begun |
 | 7 | `time_stepper.py` time derivatives | Original bootstrap now obsolete; code not yet updated |
 | 8–10 | Outer time loop, adaptive dt, output | Not started — blocked on 5–7 |
 
@@ -143,33 +168,31 @@ directly re-derived or tested inside this codebase:**
   Eddington/grey-atmosphere $\tau=2/3$, $P_\text{photosphere}\approx\frac{2}{3}\frac{g}{\kappa}$)
   has not yet been designed in detail or implemented — this is the immediate next step.
 
-### What works right now, concretely
+### What works right now, concretely (updated 2026-08-01)
 
-- `config.py`, `gradients.py` (including the new `marginal_convective_luminosity` helper) —
-  clean, no known issues.
-- `boundary_conditions.py`'s net-flux radiative surface condition — implemented, and its
-  indexing/formula correctness is covered by validation.py's Check 19 (revised this
-  session for the new formula).
-- `bvp_solver.solve_static_structure()` — runs without crashing, produces a finite,
-  monotonic, genuinely non-isothermal hot structure. **Not compact and not yet shown
-  self-consistent with `solve_timestep`** (see above) — treat its output as a
-  work-in-progress, not a validated deliverable.
-- `bvp_solver.solve_timestep()` — the shooting/root-find machinery itself runs without
-  crashing given a reasonable starting `state_prev`, but has not been validated as
-  producing a *correct* result, since the only `state_prev` available to test it with
-  (the current `solve_static_structure()` output) is itself not self-consistent.
+- `config.py`, `gradients.py` (including `marginal_convective_luminosity` and the new
+  `L>=0` floor in `grad_radiative`), `eos.py`, `opacity.py`, `odes.py`, `boundary_conditions.py`
+  — clean, no known issues.
+- `bvp_solver.solve_static_structure()` — converges cleanly, compact
+  ($R\approx3.17\,R_\text{Jup}$, matching the analytic degenerate-polytrope prediction).
+- `bvp_solver.relax_initial_state()` — all 11 $\alpha$ pseudo-steps converge, producing a
+  state genuinely self-consistent with `solve_timestep`'s real 4-ODE equations (not just
+  `solve_static_structure`'s forced adiabat).
+- `bvp_solver.solve_timestep()` — verified end-to-end from a relaxed state: converges with
+  residuals $\lesssim10^{-8}$, producing a physically sensible first step.
+- `dev_cache.py` — pickle save/load for a `SimulationState`, for cheap iterative debugging
+  of downstream logic without re-running the full solve chain.
 
 ### What's blocked / not working
 
-- `bvp_solver.py`'s $t=0$ construction needs the Sub-task 2f EOS work before it can be
-  finalized (§5, Sub-task 5 in PLAN.md).
 - `time_stepper.py` is **unchanged** from its original Sub-task 7 implementation — it still
   contains the now-obsolete bootstrap dispatch (`_bootstrap_time_derivatives`,
   `state_prev=None` branch). Not yet edited.
 - `time_stepper.run()` (Sub-task 8) does not exist yet.
-- `validation.py` has **not** been re-run successfully since `bvp_solver.py`'s premise
-  change — several checks (see §4) are known to be stale relative to the current code and
-  would fail if run today.
+- `validation.py` has **not** been re-run successfully since Sub-task 5's premise change —
+  several checks (see §4) are known to be stale relative to the current code (in particular
+  Check 19, which still references the pre-photospheric-BC residual formula) and would fail
+  if run today.
 
 ---
 
@@ -592,6 +615,140 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-01 — $\nabla_\text{rad}$ floor fixes the relaxation blocker; solve_timestep's own seed needed the same cancellation nudge; Sub-task 5 DONE
+
+**Sub-task 5 is complete and verified end-to-end** — this entry closes out the blocker
+opened in the entry directly below.
+
+**$\nabla_\text{rad}$ blow-up: diagnosed and fixed.** User's diagnosis (evaluated and agreed
+before implementing): `gradients.grad_radiative`'s $\nabla_\text{rad}\propto\kappa LP/(mT^4)$
+is derived assuming strictly outward flux ($L\ge0$); dividing by $T^4$, which $\to0$ near the
+photosphere, makes it pathologically sensitive to any negative $L$ excursion there. Floored
+$L$ at zero at its point of use inside `grad_radiative` itself (not downstream in
+`effective_gradient`) — anchors the guard exactly where the outward-flux assumption breaks
+down, rather than patching a symptom two steps removed. **Verified**: `relax_initial_state`
+now completes all 11 $\alpha$ steps cleanly (residuals $\lesssim10^{-5}$,
+$r_\text{surface}=3.184\,R_\text{Jup}$, $m_\text{surface}/M_\text{total}=1.0000026$).
+Specifically checked (per request) whether the floor is a permanent physics change or a
+bootstrapping-only artifact: it engages (min $L<0$ on the trial trajectory) for
+$\alpha\le0.7$, shrinking in magnitude as $\alpha\to1$, and is **never active at the
+converged $\alpha=1$ solution** (min $L=0$ exactly for $\alpha=0.8$–$1.0$) — confirms it is
+a pure bootstrapping aid with zero footprint on the final, real physics.
+
+**A third, different blocker then appeared**: `solve_timestep(relaxed, dt)` failed
+immediately at its own seed point — not the photosphere-region instability just fixed, but a
+violent collapse right at the center ($T$ underflowing to 0, $r$ exploding 13 orders of
+magnitude within the first 0.002% of the mass, `solve_ivp` status $-1$, "step size less than
+spacing between numbers"). Traced (not guessed) by sampling the trajectory: this is the same
+catastrophic-cancellation mechanism already diagnosed and fixed once this session in
+`relax_initial_state`'s $\alpha=0$ seed — `solve_timestep`'s seed
+(`u0=[ln P_center, ln T_center]` from `state_prev` itself) has no nudge, so when
+`state_prev` is already a genuine self-consistent solution (as `relaxed` now is), the trial
+and `state_prev` coincide to near machine precision right at the seed, and
+$dT/dt=(T-T_\text{prev})/dt$ amplifies the floating-point noise into a spurious blow-up.
+**Fixed** with the identical `1e-6` relative seed nudge `relax_initial_state` already uses.
+**Verified end-to-end** (via the new `dev_cache.py` workflow, see below): loading the cached
+relaxed state and calling `solve_timestep()` converges with residuals
+$[2.4\times10^{-10}, 3.1\times10^{-8}]$, giving a physically sensible first step
+($T_\text{center}$ cools $1251.9\to1215.3\,$K over $dt=0.01\,t_\text{KH}$,
+$r_\text{surface}\approx3.17\,R_\text{Jup}$, mass matched to $10^{-8}$).
+
+**Development workflow overhaul** (user-directed, now in CLAUDE.md's Development Workflow
+section): the `relax_initial_state` chain takes ~15-20 minutes per run, which had turned
+each downstream debugging round into a long wait. Added `dev_cache.py` (pickle save/load
+for a `SimulationState`) so a relaxed state is computed once and reused for all subsequent
+`solve_timestep` debugging — the seed-nudge diagnosis above was confirmed against a cached
+state in seconds, not minutes. Also adopted: a sterile-before-wet development approach for
+upcoming wrapper code (PLAN.md's Sub-tasks 8-9 now specify mock/cached-state testing before
+a full solver "wet test"), and a standing rule to keep long-running processes logging
+periodically rather than silent.
+
+**Code cleanup**: `bvp_solver.py` and `gradients.py`'s comments were pared down —
+session-narrative content (numeric failure traces, "confirmed via X", references to specific
+conversational exchanges) removed in favor of terse, present-tense physical/algorithmic
+reasoning; ASSUMPTION flags and formula citations kept. PROGRESS.md (this file) remains the
+place for the numerical trails and debugging history; code comments now explain the current
+design, not how it was arrived at. Verified behavior-preserving (`solve_static_structure()`
+reproduces bit-identical output before/after).
+
+**Not yet done**: `validation.py` Check 19 still references the pre-photospheric-BC residual
+formula and needs rewriting; no new checks have been proposed for the photospheric condition,
+the relaxation homotopy, or the `L>=0` floor. Per the original Sub-task 5 instruction: stop
+and check in before starting Sub-task 6.
+
+### 2026-08-01 — Path 1 (logarithmic P, T state variables) implemented and verified; new $\nabla_\text{rad}$ blow-up blocker found, PAUSED
+
+**⏸ Session paused here. Resume by reading this entry in full before touching
+`gradients.py`/`odes.py`/`bvp_solver.py` again — do not re-guess.**
+
+Picking up from the 2026-07-27 pause (below): reviewed the two candidate fixes for the
+`relax_initial_state` clamp cascade. Diagnosis (proposed by the user, verified before
+implementing): tracing the four-round failure cascade back to its origin shows the `1e-300`
+floor clamps were never the root problem, only a reactive patch — the AssertionError from
+`eos.density` (failure #2) happened *before* any clamp existed, meaning Radau's own internal
+stiff-solver Jacobian probing was already generating non-positive trial $P$/$T$ on its own;
+the clamps then created a *second*, independent failure (an over/underflow from flooring $P$
+and $T$ independently and distorting their ratio). Agreed root cause: nothing in the linear
+$(P,T)$ state representation stops Radau's internal probing from going non-positive.
+**Verified no hidden traps** in the proposed fix beyond implementation bookkeeping (solver
+`atol` needs re-deriving for the log components; scope correctly limited to $P$/$T$, not
+$r$/$L$; `eos.density`'s own internal `rho` floor is a *different* clamp, protecting a
+converging Newton iterate rather than external probing, and was deliberately left in place).
+
+**Implemented** (plan reviewed and approved before coding): both `_adiabatic_rhs_logm` and
+`_implicit_rhs_logm` now integrate $(\ln P,\ln T)$ instead of $(P,T)$ — $P=e^{\ln P}>0$,
+$T=e^{\ln T}>0$ by construction, eliminating the entire non-positive-probe failure family
+rather than patching each symptom. This is also the standard Henyey/MESA-style state
+representation for stellar-structure codes, not a one-off workaround. Side benefit: the
+$\alpha$-homotopy blend simplifies to $d(\ln T)/dm=\nabla_\text{ad}\cdot d(\ln P)/dm$
+directly, the literal definition of $\nabla_\text{ad}\equiv d\ln T/d\ln P$. `eos.py`,
+`odes.py`, `opacity.py`, `boundary_conditions.py` are all untouched — they still
+receive/return linear, physical $(P,T)$, preserving their pure-function signatures; only the
+`bvp_solver.py` wrappers convert at entry/exit (event functions, the two `residual()`
+closures' `boundary_conditions()` calls, and the three `sol.sol(...)`-unpacking call sites).
+The `1e-300` clamps and their justifying comment in `_implicit_rhs_logm` are removed outright.
+
+**Verified**: `solve_static_structure()` reproduces the pre-existing validated result exactly
+($P_\text{center}=7.686\times10^{11}$, $r_\text{surface}=3.172\,R_\text{Jup}$, mass residual
+$1.554\times10^{-3}$) — confirms the log-transform is numerically transparent absent
+pathological probing, as expected. `relax_initial_state`'s $\alpha=0.000$ step now converges
+*cleanly*, with no crash of any kind (residuals $[-1.4\times10^{-12},-1.1\times10^{-9}]$,
+tighter than the pre-fix run) — the clamp-cascade blocker is gone. **Path 1 is complete and
+did exactly what it was diagnosed to do.**
+
+**But ramping $\alpha$ to $0.05$–$0.10$ exposed a new, different, more fundamental problem**
+— not a crash, a wrong answer. Traced directly (not guessed) by sampling $T(m)$, $L(m)$
+along the trajectory at the exact (non-perturbed) $\alpha=0.05$ seed point: from the center
+out through $m/M_\text{total}\approx0.60$, the profile is smooth and physical ($T$ dropping
+$1252\to720\,$K, $L$ rising to $8.5\times10^{27}\,\text{erg/s}$, consistent with the
+$\alpha=0$/pure-adiabat trajectory). Between $m/M_\text{total}\approx0.60$ and
+$\approx1.09$ — right around where the pure-adiabat structure's own photosphere sits
+($T\approx7.7\,$K there at $\alpha=0$) — the profile catastrophically diverges: $T$ jumps to
+$\approx1.26\times10^5\,$K and $L$ flips to $\approx-6.4\times10^{30}\,\text{erg/s}$, after
+which the structure never cools back down and balloons outward ($r\to10^{12}\,$cm,
+$\approx14\,R_\text{Jup}$) without ever crossing the photospheric-pressure threshold, even
+out to $50\times M_\text{total}$.
+
+**Likely mechanism** (grounded in `gradients.grad_radiative`'s formula, not yet confirmed
+further): $\nabla_\text{rad}=3\kappa LP/(16\pi a_\text{rad}cGmT^4)$. Near the photosphere,
+$T$ is dropping toward a few K on the adiabat, making $T^4$ tiny — this makes
+$\nabla_\text{rad}$ extremely sensitive to $L$ there. Once $\alpha>0$ introduces even a
+slightly different $dT/dt$, $dP/dt$ trajectory than the pure adiabat, $L$ (built up via
+$dL/dm=-c_p\,dT/dt+dP/dt/\rho$, integrated from the center) can swing sign near that same
+sensitive region. A sign-flipped $\nabla_\text{rad}$ then gets selected directly by
+`gradients.effective_gradient`'s Schwarzschild criterion (`is_convective = grad_rad >
+grad_ad`; a negative $\nabla_\text{rad}$ fails that test, so $\nabla_\text{eff}=\nabla_\text{rad}$
+is used as-is) and fed into $dT/dm=(T/P)\nabla_\text{eff}(dP/dm)$ with the wrong sign,
+flipping $T$'s trend from decreasing to increasing outward.
+
+**Not yet diagnosed further or fixed.** This is architecturally distinct from the clamp
+cascade Path 1 targeted — it lives in `gradients.py`/`odes.py`'s core physics formula near a
+$T\to0$ sensitive limit, not in `bvp_solver.py`'s state representation, and touching it
+needs the same before-writing-code review this session's other structural changes have had.
+`bvp_solver.py`'s Path 1 changes are done, correct, and should not be reverted or touched
+further while diagnosing this — the new failure is confirmed present with `solve_ivp`
+reporting clean success (no crash, no assertion), so it is not related to the log-transform.
 
 ### 2026-07-27 — Photospheric outer BC implemented and validated; initial-state relaxation designed, partially working, PAUSED
 

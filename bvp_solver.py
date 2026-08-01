@@ -1,53 +1,31 @@
 # bvp_solver.py — Solves the t=0 compact-protoplanet structure and the per-timestep implicit
 # structure for t>0, returning a populated SimulationState in each case.
 #
-# PHYSICAL NOTE (Sub-task 5 pivot, PROGRESS.md has the full investigation): t=0 used to be
-# constructed as a diffuse, pre-collapse GI clump in isothermal equilibrium with the ambient
-# nebula (T=T_neb, L=0 everywhere) - a physically real result (deeply Bonnor-Ebert subcritical,
-# M_TOTAL/M_BE~0.089) but an exact, unbreakable fixed point under hydrostatic time-stepping: any
-# scheme re-solving against fixed outer boundary conditions from a state that already satisfies
-# them exactly reproduces "no change" for any dt. Root-cause analysis found the premise itself
-# was the problem: initial GI collapse is inertia-dominated hydrodynamic free-fall, structurally
-# outside what a quasi-static/hydrostatic solver can represent - the same reason
-# config.T_DISSOCIATION_LIMIT halts the code at the far end of validity. Standard practice (PMS
-# Henyey tracks; Bodenheimer & Pollack 1986; Marley et al. 2007 "hot start" gas-giant models) is
-# to hand off from an assumed compact, high-entropy post-collapse state and evolve forward
-# quasi-statically from there, never simulating the dynamical collapse itself.
+# PHYSICAL PICTURE: t=0 is a hot, compact, fully convective post-collapse protoplanet with a
+# PRESCRIBED central temperature (config.T_CENTER_INITIAL - a chosen "hot start" parameter,
+# not derived; standard practice for gas-giant "hot start" models, e.g. Marley et al. 2007).
+# It is not static (dT_dt=dP_dt=0): it is already contracting at its natural Kelvin-Helmholtz
+# rate (T/t_KH, 4P/t_KH, config.T_KH_TIMESCALE_S), evaluated on the current trial profile.
+# Compactness (a few R_Jup, not a few hundred) requires non-relativistic electron-degeneracy
+# pressure (eos.py), included additively with the ideal-gas term.
 #
-# t=0 is therefore now a fully convective, hot protoplanet with a PRESCRIBED central temperature
-# (config.T_CENTER_INITIAL, a chosen "hot start" parameter, not derived - see config.py). It is
-# NOT static in the sense of dT_dt=dP_dt=0: a freshly-collapsed object is already contracting at
-# its natural Kelvin-Helmholtz rate, and using genuinely zero time-derivatives would force L=0
-# and reproduce the same isothermal degeneracy this pivot exists to escape. Instead the full
-# 4-ODE system (odes.py, unchanged) is integrated with dT_dt, dP_dt set to the homologous-
-# contraction rate (T/t_KH, 4P/t_KH, config.T_KH_TIMESCALE_S) evaluated on the current trial
-# profile - physically honest for an object caught mid-collapse-relaxation, not a degeneracy-
-# breaking trick (contrast with an earlier, rejected attempt this session to inject the same
-# rate as an ADDITIONAL term inside solve_timestep's per-step energy equation, which double-
-# counted compressional heating - see that function's docstring below).
-#
-# NUMERICAL/PHYSICAL NOTE (Sub-task 2f + outer BC redesign): ideal gas alone cannot support a
-# genuinely compact (few-R_Jup) structure at any physically sane T_center - real gas-giant
-# compactness comes from electron-degeneracy pressure (eos.degenerate_pressure), now included
-# additively with the ideal-gas term (eos.density). This alone reproduces the analytic
-# Zapolsky & Salpeter (1969)-style prediction almost exactly (R~3.1-3.2 R_Jup at
-# T_CENTER_INITIAL). But the degenerate-supported structure exposed a second, independent gap:
-# the inherited P(M_TOTAL)=P_neb mechanical surface condition has NO SOLUTION AT ALL for this
-# structure (not a hard-to-find root - a genuine gap in achievable surface pressure, confirmed
-# not a numerical-precision artifact; PROGRESS.md has the full trail). Replaced with a
-# physically-motivated photospheric condition (Eddington tau=2/3, boundary_conditions.py) -
-# see that module's docstring for the derivation. This changes HOW the surface is located, not
-# just the residual formula: both shooting routines below now integrate outward with the
-# photosphere as a solve_ivp EVENT (mirroring _solve_lane_emden's own surface-crossing event)
+# OUTER BOUNDARY: the photosphere (Eddington tau=2/3, boundary_conditions.py), not a fixed
+# ambient pressure P_neb - a degenerate-supported structure's atmosphere hands off to a
+# photosphere at a pressure set by its own surface gravity and opacity, not by the ambient
+# nebula. Both shooting routines integrate outward with the photosphere as a solve_ivp EVENT
 # and match the ENCLOSED MASS at that event to M_TOTAL, rather than checking a residual at a
-# fixed m=M_TOTAL grid endpoint - a fixed-endpoint version of the photospheric condition was
-# tested and found to have the same reachability-gap problem the old P=P_neb condition did.
+# fixed m=M_TOTAL grid endpoint.
 #
-# SOLVER NOTE: scipy.integrate.solve_bvp is not used (established in the original isothermal
-# construction and unchanged here): the surface pressure boundary layer and the wide dynamic
-# range of P, T across the mass grid defeat its collocation Jacobian. Both t=0 and t>0 use a
-# shooting method (scipy.integrate.solve_ivp outward integration + root-finding on the central
-# conditions) instead.
+# SOLVER: shooting (scipy.integrate.solve_ivp, Radau, outward integration + root-finding on
+# the central conditions), not scipy.integrate.solve_bvp - the surface pressure boundary
+# layer and the wide dynamic range of P, T across the mass grid defeat its collocation
+# Jacobian.
+#
+# STATE REPRESENTATION: both RHS functions below integrate ln P, ln T rather than P, T
+# directly, so P=exp(lnP)>0, T=exp(lnT)>0 hold by construction through the stiff solver's
+# internal probing - the standard Henyey/MESA-style representation. See PROGRESS.md for the
+# full physical/numerical history behind these design choices (photospheric BC, log state
+# variables, the L>=0 floor in gradients.grad_radiative).
 
 import warnings
 
@@ -73,7 +51,7 @@ def _solve_lane_emden(n):
     (dimensionless surface radius, -xi_1^2*theta'(xi_1)) - the two dimensionless constants
     needed to scale a physical (M, T_center) pair to (R, P_center, rho_center) for an ideal-gas,
     fully convective sphere (Kippenhahn & Weigert; Chandrasekhar 1939). Verified against
-    tabulated values for n=1.5 (xi_1=3.65375) and n=3.0 (xi_1=6.89685) during development.
+    tabulated values for n=1.5 (xi_1=3.65375) and n=3.0 (xi_1=6.89685).
     """
     def rhs(xi, y):
         theta, dtheta = y
@@ -97,22 +75,16 @@ def _solve_lane_emden(n):
 
 def _adiabatic_center_guess():
     """Analytic (Lane-Emden) central pressure and radius bracket SEED for the real shooting
-    below - not the final answer (the real shooting includes BOTH the ideal-gas and
-    degenerate pressure terms and locates the exact photospheric surface, not this idealized
-    polytrope's own P->0 natural surface).
+    below - not the final answer (the real shooting includes both the ideal-gas and degenerate
+    pressure terms and locates the exact photospheric surface, not this idealized polytrope's
+    own P->0 natural surface).
 
-    ASSUMPTION (Sub-task 2f): uses the pure T=0 electron-degeneracy limit (an n=3/2
-    polytrope, P=K1*rho^(5/3) - Zapolsky & Salpeter 1969 style) rather than the pure ideal-gas
-    adiabat used before Sub-task 2f. Justified because degeneracy dominates the interior by
-    ~2-3 orders of magnitude in pressure at the density this seed predicts (PROGRESS.md
-    Sub-task 2f: rho_center here is ~600x the ideal/degenerate crossover density at
-    T_CENTER_INITIAL) - a pure-degenerate polytrope is now the better-motivated seed than a
-    pure ideal-gas one. There is no closed-form Lane-Emden solution for the real, additive
-    combined EOS (not a pure power law in rho), so this remains an approximate seed - a blind
-    numerical P_center search does NOT reliably find the true root, and this analytic estimate
-    pins the right order of magnitude to bracket reliably via geometric expansion (see
-    solve_static_structure). Still a reasonable seed regardless of how the surface is defined
-    (photospheric vs. fixed-pressure), since the interior remains degeneracy-dominated either way.
+    ASSUMPTION: uses the pure T=0 electron-degeneracy limit (n=3/2 polytrope, P=K1*rho^(5/3) -
+    Zapolsky & Salpeter 1969 style), since degeneracy dominates the interior by 2-3 orders of
+    magnitude in pressure at the density this seed predicts. There is no closed-form Lane-Emden
+    solution for the real, additive combined EOS, so this remains an approximate seed - it pins
+    the right order of magnitude to bracket reliably via geometric expansion (see
+    solve_static_structure).
     """
     n = 1.5   # non-relativistic electron degeneracy: P=K1*rho^(5/3), gamma=5/3, n=1/(gamma-1)
     xi_1, mass_constant = _solve_lane_emden(n)
@@ -136,20 +108,21 @@ def _adiabatic_center_guess():
 # SECTION: Photosphere Event (tau=2/3 surface location)
 # ==========================================
 # Both shooting routines below terminate their outward integration at the photosphere
-# (boundary_conditions.photospheric_pressure), not at a fixed m=M_TOTAL grid endpoint - see
-# that module's docstring for the physical reasoning and module docstring above for why a
-# fixed-endpoint version doesn't work for the degenerate-supported structure. The event
-# functions differ only in how they unpack the two RHS's different state vectors.
+# (boundary_conditions.photospheric_pressure) via a solve_ivp EVENT, not a residual at a fixed
+# m=M_TOTAL grid endpoint - see that module's docstring for the physical reasoning. The two
+# event functions differ only in how they unpack the RHS's state vector.
 
 def _photosphere_event_adiabatic(x, y):
-    r, P, T = y
+    r, lnP, lnT = y
+    P, T = np.exp(lnP), np.exp(lnT)
     return P - boundary_conditions.photospheric_pressure(r, P, T, config.MU, config.MU_E)
 _photosphere_event_adiabatic.terminal = True
 _photosphere_event_adiabatic.direction = -1
 
 
 def _photosphere_event_implicit(x, y):
-    r, P, L, T = y
+    r, lnP, L, lnT = y
+    P, T = np.exp(lnP), np.exp(lnT)
     return P - boundary_conditions.photospheric_pressure(r, P, T, config.MU, config.MU_E)
 _photosphere_event_implicit.terminal = True
 _photosphere_event_implicit.direction = -1
@@ -160,38 +133,46 @@ _photosphere_event_implicit.direction = -1
 # ==========================================
 
 def _adiabatic_rhs_logm(x, y):
-    """dr/dx, dP/dx, dT/dx (x=ln(m)) for a fully convective sphere.
+    """dr/dx, dlnP/dx, dlnT/dx (x=ln(m)) for a fully convective sphere.
 
-    ASSUMPTION: dT/dm = (T/P)*grad_ad*dP/dm identically - a fresh, high-entropy post-collapse
-    object is assumed fully convective throughout (standard Hayashi-track picture), not derived
-    via the Schwarzschild criterion. NOT routed through odes.stellar_odes: that function picks
-    grad_eff=min(grad_rad, grad_ad), which needs a self-consistent L - unavailable (and not the
-    physical picture being assumed) for this purely-convective structural construction.
+    ASSUMPTION: dlnT/dm = grad_ad*dlnP/dm identically - a fresh, high-entropy post-collapse
+    object is assumed fully convective throughout (standard Hayashi-track picture), not
+    derived via the Schwarzschild criterion. Not routed through odes.stellar_odes, which needs
+    a self-consistent L unavailable for this purely-convective construction.
 
-    ASSUMPTION (Sub-task 2f): the THERMAL profile (T vs P, via grad_ad) still follows the pure
-    ideal-gas adiabat unchanged - a full treatment would re-derive the adiabatic index for the
-    combined ideal+degenerate EOS's actual entropy, which is out of scope for this minimal,
-    additive-pressure-only fix. Only the MECHANICAL structure (rho, hence dr/dm) uses the new
-    combined EOS (eos.density). This is a first-order approximation, not fully self-consistent
-    thermodynamically - see PROGRESS.md Sub-task 2f entry.
+    ASSUMPTION: the thermal profile (T vs P) follows the pure ideal-gas adiabat; only the
+    mechanical structure (rho, hence dr/dm) uses the combined ideal+degenerate EOS
+    (eos.density) - a first-order approximation, not fully self-consistent thermodynamically.
+
+    State is (r, lnP, lnT), not (r, P, T), so P=exp(lnP)>0, T=exp(lnT)>0 hold by construction
+    (module docstring). eos.density still receives/returns linear, physical (P, T).
     """
     m = np.exp(x)
-    r, P, T = y
+    r, lnP, lnT = y
+    P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
     dr_dm = 1.0 / (4.0 * np.pi * r**2 * rho)
     dP_dm = -config.G * m / (4.0 * np.pi * r**4)
-    dT_dm = (T / P) * eos.grad_adiabatic(config.GAMMA) * dP_dm
-    return [dr_dm * m, dP_dm * m, dT_dm * m]
+    dlnP_dm = dP_dm / P
+    # grad_ad is DEFINED as dlnT/dlnP (eos.grad_adiabatic), so dlnT/dm = grad_ad*dlnP/dm
+    # directly - simpler than converting through the linear dT_dm = (T/P)*grad_ad*dP_dm form.
+    dlnT_dm = eos.grad_adiabatic(config.GAMMA) * dlnP_dm
+    return [dr_dm * m, dlnP_dm * m, dlnT_dm * m]
 
 
 def _integrate_adiabatic_outward(P_center, x_span, r_start):
-    """Integrate (r, P, T) outward from x_span[0] (r=r_start, T=config.T_CENTER_INITIAL) for a
-    trial P_center, terminating at the photosphere event. See solve_static_structure's
-    ASSUMPTION note on atol scaling."""
+    """Integrate (r, lnP, lnT) outward from x_span[0] (r=r_start, T=config.T_CENTER_INITIAL)
+    for a trial P_center, terminating at the photosphere event.
+
+    atol=config.BVP_TOL on the log components is approximately a RELATIVE tolerance on the
+    physical P, T (d(lnP)=dP/P), giving uniform relative precision across their many-decade
+    range - reuses the single tolerance constant already in config.py.
+    """
     return solve_ivp(
-        _adiabatic_rhs_logm, x_span, [r_start, P_center, config.T_CENTER_INITIAL], method="Radau",
+        _adiabatic_rhs_logm, x_span,
+        [r_start, np.log(P_center), np.log(config.T_CENTER_INITIAL)], method="Radau",
         dense_output=True, events=_photosphere_event_adiabatic,
-        rtol=config.BVP_TOL, atol=[1.0, config.P_NEB * config.BVP_TOL, 1.0e-6],
+        rtol=config.BVP_TOL, atol=[1.0, config.BVP_TOL, config.BVP_TOL],
     )
 
 
@@ -210,9 +191,9 @@ def solve_static_structure() -> state.SimulationState:
     the analytic Lane-Emden estimate (_adiabatic_center_guess) rather than a blind search.
     """
     m_min = config.M_MIN_FRACTION * config.M_TOTAL
-    # Generous margin past M_TOTAL for the photosphere event to trigger within - empirically
-    # (PROGRESS.md Sub-task 5 outer-BC entry) the event triggers within ~1.4x of M_TOTAL even
-    # for a P_center 3x too high, so this is cheap headroom, never expected to bind.
+    # Generous margin past M_TOTAL for the photosphere event to trigger within - empirically the
+    # event triggers within ~1.4x of M_TOTAL even for a substantially too-high P_center, so this
+    # is cheap headroom, never expected to bind.
     x_span = (np.log(m_min), np.log(50.0 * config.M_TOTAL))
 
     P_center_guess, R_guess = _adiabatic_center_guess()
@@ -232,12 +213,11 @@ def solve_static_structure() -> state.SimulationState:
     if e_seed == 0.0:
         P_low = P_high = P_center_guess
     else:
-        # ASSUMPTION (Sub-task 2f): which direction (increasing or decreasing P_center)
-        # reduces the mass-matching residual is NOT fixed - it depends on whether the
-        # ideal-gas or degenerate term dominates the structure (a genuine consequence of the
-        # inverted mass-radius relation for degenerate objects, R~M^-1/3 - PROGRESS.md has the
-        # numerical trail, not a bracketing bug). Expand in both directions simultaneously,
-        # taking whichever finds a sign change first, rather than assuming a fixed direction.
+        # ASSUMPTION: which direction (increasing or decreasing P_center) reduces the
+        # mass-matching residual is not fixed - it depends on whether the ideal-gas or
+        # degenerate term dominates (the mass-radius relation inverts, R~M^-1/3, for degenerate
+        # objects). Expand in both directions simultaneously, taking whichever finds a sign
+        # change first, rather than assuming a fixed direction.
         P_up = P_down = P_center_guess
         P_low = P_high = None
         for _ in range(200):
@@ -263,11 +243,12 @@ def solve_static_structure() -> state.SimulationState:
     residual_norm = abs(m_surface - config.M_TOTAL) / config.M_TOTAL
 
     m = np.logspace(np.log10(m_min), np.log10(m_surface), config.N_GRID_POINTS)
-    r, P, T = sol.sol(np.log(m))
+    r, lnP, lnT = sol.sol(np.log(m))
+    P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
 
     # Diagnostic L(m): marginally-efficient-convection closure (gradients.py), NOT consumed by
-    # solve_timestep (which only ever interpolates state_prev.T, .P - see _implicit_rhs_logm)-
+    # solve_timestep (which only ever interpolates state_prev.T, .P - see _implicit_rhs_logm) -
     # exists to make state_0 a fully populated, physically meaningful SimulationState for
     # diagnostics/plots. Automatically satisfies the center BC L->0 as m->m_min (L is
     # proportional to m in this formula), no special-casing needed.
@@ -287,42 +268,23 @@ def solve_static_structure() -> state.SimulationState:
 # ==========================================
 
 def _implicit_rhs_logm(x, y, state_prev, dt, alpha=1.0):
-    """dy/dx (x=ln(m)) for the full 4-ODE system, dT_dt, dP_dt computed ON THE FLY from the
-    CURRENT trial (T, P) differenced against state_prev's (interpolated) profile - the textbook
-    implicit (Henyey-style) form: dt enters directly, and the energy equation's source term is
-    exactly this state difference, nothing added on top.
+    """dy/dx (x=ln(m)) for the full 4-ODE system. dT_dt, dP_dt are computed from the current
+    trial (T, P) differenced against state_prev's (interpolated) profile - the implicit
+    (Henyey-style) form: the energy equation's source term is exactly this state difference.
 
-    PHYSICAL NOTE: an earlier version of this function added an EXTRA explicit homologous-
-    contraction term (T_prev/t_KH, 4*P_prev/t_KH) on top of the implicit difference, intended to
-    keep evolution going past a single step. That double-counted compressional heating - proven
-    via energy-conservation violation (a state exactly frozen step-to-step nonetheless radiated
-    a constant, non-decaying L, with no reservoir to draw from) - and was reverted. Real
-    per-timestep evolution instead comes from t=0 already being a genuine, self-consistent
-    thermal disequilibrium (module docstring above), not an injected rate law here.
+    alpha blends nabla_eff between the pure adiabat (alpha=0, matches solve_static_structure's
+    own construction) and the real Schwarzschild-selected value (alpha=1, the default - every
+    genuine solve_timestep() call uses this; only relax_initial_state()'s pseudo-steps use
+    alpha<1). At alpha=0 this reduces to dlnT_dm = grad_ad*dlnP_dm exactly. dL/dm is NEVER
+    scaled by alpha - dL/dm has no other source in this codebase, so scaling it would force
+    dL/dm=0 identically at alpha=0.
 
-    RELAXATION NOTE (alpha, see relax_initial_state): nabla_eff is blended between the pure
-    adiabat (alpha=0, matching solve_static_structure's own construction exactly - a genuinely
-    self-consistent starting point, NOT the isothermal one) and the real Schwarzschild-selected
-    value (alpha=1, the standard, unmodified formula below). dL/dm itself is NEVER scaled by
-    alpha - an earlier, rejected version of this relaxation idea scaled the whole energy-
-    equation source term instead, which forces dL/dm=0 identically at alpha=0 (dL/dm has no
-    other source in this codebase) - reproducing the exact isothermal degeneracy proven
-    unbreakable at the very start of this investigation (PROGRESS.md). alpha=1.0 (the default)
-    reproduces the original formula exactly - every genuine per-timestep solve_timestep() call
-    uses this default; only relax_initial_state()'s pseudo-steps use alpha<1.
+    State is (r, lnP, L, lnT); P=exp(lnP)>0, T=exp(lnT)>0 hold by construction (module
+    docstring) - odes.stellar_odes and eos.density still receive/return linear, physical (P, T).
     """
     m = np.exp(x)
-    r, P, L, T = y
-    # ASSUMPTION: Radau's own internal stiff-solver Newton iteration probes trial y-vectors
-    # while estimating its collocation Jacobian, and can probe P or T slightly negative -
-    # unphysical (no EOS solution exists for negative pressure or temperature), which would
-    # otherwise crash eos.density's own Newton solve regardless of iteration count. Clamping
-    # to a tiny positive floor here (a domain guard on the RHS's OWN inputs, not a fabricated
-    # result) lets Radau's adaptive step control naturally back away from the bad region,
-    # rather than crashing on an intermediate probe that was never going to be the accepted
-    # step - the same spirit as eos.density's own rho-positivity clamp.
-    P = max(P, 1.0e-300)
-    T = max(T, 1.0e-300)
+    r, lnP, L, lnT = y
+    P, T = np.exp(lnP), np.exp(lnT)
     T_prev = np.interp(m, state_prev.m, state_prev.T)
     P_prev = np.interp(m, state_prev.m, state_prev.P)
     dT_dt = (T - T_prev) / dt
@@ -331,26 +293,31 @@ def _implicit_rhs_logm(x, y, state_prev, dt, alpha=1.0):
     dr_dm, dP_dm, dL_dm, dT_dm_real = odes.stellar_odes(
         np.array([m]), y_full, np.array([dT_dt]), np.array([dP_dt])
     )
+    dlnP_dm = dP_dm[0] / P
     if alpha == 1.0:
-        dT_dm = dT_dm_real
+        dlnT_dm = dT_dm_real[0] / T
     else:
-        # Same (T/P)*grad_ad*dP_dm form as _adiabatic_rhs_logm (eos.grad_adiabatic, single
-        # source of truth for grad_ad); dP_dm is shared (hydrostatic equilibrium doesn't
-        # depend on the temperature gradient), so only dT_dm needs recombining.
-        dT_dm_adiabatic = (T / P) * eos.grad_adiabatic(config.GAMMA) * dP_dm
-        dT_dm = (1.0 - alpha) * dT_dm_adiabatic + alpha * dT_dm_real
-    return [dr_dm[0] * m, dP_dm[0] * m, dL_dm[0] * m, dT_dm[0] * m]
+        # grad_ad=dlnT/dlnP by definition (eos.grad_adiabatic, single source of truth); dlnP_dm
+        # is shared (hydrostatic equilibrium doesn't depend on the temperature gradient), so
+        # only the temperature-gradient term needs recombining.
+        dlnT_dm_adiabatic = eos.grad_adiabatic(config.GAMMA) * dlnP_dm
+        dlnT_dm = (1.0 - alpha) * dlnT_dm_adiabatic + alpha * (dT_dm_real[0] / T)
+    return [dr_dm[0] * m, dlnP_dm * m, dL_dm[0] * m, dlnT_dm * m]
 
 
 def _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_prev, dt, alpha=1.0):
     """Integrate the full 4-ODE system outward for a trial (P_center, T_center), terminating
-    at the photosphere event; see _implicit_rhs_logm. L starts at exactly 0 (center BC)."""
+    at the photosphere event; see _implicit_rhs_logm. L starts at exactly 0 (center BC).
+
+    atol=config.BVP_TOL on the log components gives uniform relative precision on P, T across
+    their many-decade range (see _integrate_adiabatic_outward).
+    """
     def rhs(x, y):
         return _implicit_rhs_logm(x, y, state_prev, dt, alpha)
     return solve_ivp(
-        rhs, x_span, [r_start, P_center, 0.0, T_center], method="Radau", dense_output=True,
-        events=_photosphere_event_implicit,
-        rtol=config.BVP_TOL, atol=[1.0, config.P_NEB * config.BVP_TOL, 1.0, 1.0e-6],
+        rhs, x_span, [r_start, np.log(P_center), 0.0, np.log(T_center)], method="Radau",
+        dense_output=True, events=_photosphere_event_implicit,
+        rtol=config.BVP_TOL, atol=[1.0, config.BVP_TOL, 1.0, config.BVP_TOL],
     )
 
 
@@ -359,39 +326,25 @@ def _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_prev,
 # ==========================================
 
 def relax_initial_state(state_0) -> state.SimulationState:
-    """Relax state_0 (solve_static_structure's output - a fully convective structure built by
-    FORCING the pure ideal-gas adiabat, not a genuine solution of the real 4-ODE system's
-    Schwarzschild-selected temperature gradient) into a state that IS self-consistent with the
-    same implicit equations solve_timestep() uses, via continuation in alpha
-    (_implicit_rhs_logm's nabla_eff blend fraction).
+    """Relax state_0 (solve_static_structure's output - built by forcing the pure ideal-gas
+    adiabat, not a genuine solution of the real 4-ODE system's Schwarzschild-selected
+    temperature gradient) into a state that IS self-consistent with the same implicit
+    equations solve_timestep() uses, via continuation in alpha (_implicit_rhs_logm's
+    nabla_eff blend fraction).
 
-    PHYSICAL MOTIVATION: t=0 is, by this project's own premise, a prescribed hand-off snapshot
-    (T_CENTER_INITIAL is chosen, not derived) - not something with a physical basis for being
-    an exact root of solve_timestep's real-time-differenced equations, since there is no
-    previous state to difference against at t=0 to derive one from. Directly evaluating
-    solve_timestep's real 4-ODE system AT state_0's own values confirmed this mismatch is
-    large: T diverges to ~3.4 million K within one full-sized implicit step (dt=0.01*t_KH).
-    This is standard "initial model relaxation" territory (MESA-style pre-main-sequence
-    relaxation; classical Henyey-code ZAMS model construction): rather than demanding state_0
-    already be a perfect root, or inventing an unphysical driving term to force it to be one,
-    walk a continuous path of INCREASINGLY REAL problems from a genuinely easy starting point
-    (alpha=0, which reproduces state_0's OWN construction exactly, by design - not the
-    isothermal degeneracy an earlier, rejected version of this idea collapsed to, see
-    _implicit_rhs_logm's RELAXATION NOTE) to the real target (alpha=1), using each step's
-    converged (P_center, T_center) to warm-start the next.
+    T_CENTER_INITIAL is a prescribed hand-off value, not derived from a previous state, so
+    state_0 has no reason to already be a root of solve_timestep's real, time-differenced
+    equations. Standard "initial model relaxation" practice (MESA-style pre-main-sequence
+    relaxation; classical Henyey-code ZAMS construction): walk a continuous path of
+    increasingly real problems from alpha=0 (reproduces state_0's own construction exactly) to
+    alpha=1 (the real target), using each step's converged (P_center, T_center) to warm-start
+    the next.
 
-    CONVERGENCE CRITERIA (kept strict and explicit per request - no blind continuation):
-    - Each pseudo-step's fsolve call must report ier==1 (full convergence); a failed step
-      RAISES immediately (does not silently continue with an unreliable intermediate state,
-      unlike solve_timestep's real per-timestep calls, which only warn - here we control the
-      alpha step size, so a failure means the step should be made finer, not pushed through).
-    - After each step, the residual actually achieved [mass, thermal] is printed for a visible
-      audit trail (not just "ier==1", which only reflects fsolve's own internal criteria).
-    - The (P_center, T_center) jump between consecutive alpha steps is checked against a
-      smoothness guard (relative change < 50% per step) - fsolve reporting ier==1 does not by
-      itself rule out having converged to a DIFFERENT solution branch than the one being
-      continuously tracked; a large jump is flagged as a possible branch jump rather than
-      silently accepted.
+    Convergence criteria: each pseudo-step's fsolve call must report ier==1 or the function
+    raises immediately (a failed step means the alpha spacing should be made finer, not pushed
+    through); the achieved [mass, thermal] residual is printed each step for a visible audit
+    trail; a >50% (P_center, T_center) jump between consecutive steps is flagged as a possible
+    solution-branch jump.
     """
     n_ramp_steps = 11   # alpha = 0.0, 0.1, ..., 1.0 - deliberately simple/auditable fixed spacing
     dt_relax = 0.01 * config.T_KH_TIMESCALE_S   # pseudo-timestep; not real elapsed time (t is left unchanged below)
@@ -410,19 +363,17 @@ def relax_initial_state(state_0) -> state.SimulationState:
                 f"P_center={P_center:.6e}, T_center={T_center:.6e}"
             )
         m_event = np.exp(sol.t_events[0][0])
-        yb = sol.y_events[0][0]
-        res_full = boundary_conditions.boundary_conditions(np.zeros(4), yb)
+        yb = sol.y_events[0][0]   # (r, lnP, L, lnT) at the photosphere event
+        yb_physical = np.array([yb[0], np.exp(yb[1]), yb[2], np.exp(yb[3])])
+        res_full = boundary_conditions.boundary_conditions(np.zeros(4), yb_physical)
         mass_residual = (m_event - config.M_TOTAL) / config.M_TOTAL
         return [mass_residual, res_full[3] / L_scale]
 
-    # ASSUMPTION: seeded from state_0's own center values (exact at alpha=0 by construction),
-    # nudged by a tiny, physically negligible relative amount (1e-6, far above floating-point
-    # noise but far below any real physical scale) to avoid a catastrophic-cancellation
-    # artifact: AT the exact match point, T_trial and T_prev coincide almost to machine
-    # precision (both follow the same adiabat by construction at alpha=0), so
-    # dT_dt=(T-T_prev)/dt divides near-zero floating-point noise by a small dt, amplifying it
-    # into an overflow (confirmed: the exact point fails, every nearby perturbed point
-    # succeeds cleanly) - not a genuine solution-boundary failure.
+    # ASSUMPTION: seeded from state_0's own center values, nudged by a tiny (1e-6) relative
+    # amount to avoid catastrophic cancellation in dT_dt=(T-T_prev)/dt: at the exact match
+    # point (alpha=0), T_trial and T_prev coincide to near machine precision (both follow the
+    # same adiabat by construction), so the difference is floating-point noise, not a genuine
+    # solution-boundary failure.
     u = np.array([np.log(state_0.P[0]), np.log(state_0.T[0])]) * (1.0 + 1.0e-6)
     for alpha in np.linspace(0.0, 1.0, n_ramp_steps):
         u_prev = u.copy()
@@ -448,7 +399,8 @@ def relax_initial_state(state_0) -> state.SimulationState:
     m_surface = np.exp(sol.t_events[0][0])
 
     m = np.logspace(np.log10(m_min), np.log10(m_surface), config.N_GRID_POINTS)
-    r, P, L, T = sol.sol(np.log(m))
+    r, lnP, L, lnT = sol.sol(np.log(m))
+    P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
 
     print(f"bvp_solver: initial-state relaxation complete (alpha=1.0, genuine solution of the "
@@ -456,33 +408,27 @@ def relax_initial_state(state_0) -> state.SimulationState:
           f"m_surface/M_TOTAL={m_surface/config.M_TOTAL:.8f}")
 
     # t is left at state_0.t: this is a mathematical relaxation device (pseudo-steps at a fixed
-    # pseudo-dt, state_prev held fixed at state_0 throughout), not real elapsed physical time -
-    # same convention the earlier (now-removed) bootstrap kick used, for the same reason.
+    # pseudo-dt, state_prev held fixed at state_0 throughout), not real elapsed physical time.
     return state.SimulationState(m=m, r=r, P=P, L=L, T=T, rho=rho, t=state_0.t, prev=state_0)
 
 
 def solve_timestep(state_prev, dt) -> state.SimulationState:
     """Solve the envelope structure at t = state_prev.t + dt via the implicit shooting scheme.
-    Shoots on (ln P_center, ln T_center) - log-parametrized for guaranteed positivity through
-    fsolve's trial evaluations, the same pattern as solve_static_structure()'s brentq shoot - to
-    match two conditions at the photosphere event: enclosed mass = M_TOTAL (mechanical, replaces
-    a fixed-endpoint P=P_neb residual - module docstring explains why) and the net radiative
-    flux balance (thermal, boundary_conditions.py, evaluated at the event point). The center
-    residuals (r_a=0, L_a=0) are satisfied exactly by construction (integration starts at
-    r=r_start, L=0).
-
-    From t=0 onward directly - no separate bootstrap/kick step: state_prev already carries a
-    genuine, non-degenerate thermal state (module docstring above), so the first real call
-    (state_prev=solve_static_structure()'s output) is not a special case.
+    Shoots on (ln P_center, ln T_center) to match two conditions at the photosphere event:
+    enclosed mass = M_TOTAL (mechanical) and the net radiative flux balance (thermal,
+    boundary_conditions.py). The center residuals (r_a=0, L_a=0) are satisfied exactly by
+    construction (integration starts at r=r_start, L=0).
     """
     m_min = config.M_MIN_FRACTION * config.M_TOTAL
     x_span = (np.log(m_min), np.log(50.0 * config.M_TOTAL))
     r_start = state_prev.r[0]
 
-    # Seed fsolve from state_prev's own (P_center, T_center) - state_prev is an actual solved
-    # state, already a reasonable starting point for a sensibly-sized dt; no assumed rate law
-    # needed just to seed the search (contrast with the removed _homologous_initial_guess).
-    u0 = np.array([np.log(state_prev.P[0]), np.log(state_prev.T[0])])
+    # Seed fsolve from state_prev's own (P_center, T_center), nudged by a tiny (1e-6) relative
+    # amount - state_prev is itself a converged solution, so without the nudge the trial and
+    # state_prev coincide to near machine precision right at the seed, and dT_dt=(T-T_prev)/dt
+    # amplifies that floating-point noise into a spurious blow-up (same catastrophic-
+    # cancellation mechanism as relax_initial_state's identical seed nudge).
+    u0 = np.array([np.log(state_prev.P[0]), np.log(state_prev.T[0])]) * (1.0 + 1.0e-6)
 
     # Characteristic luminosity scale (Kelvin-Helmholtz estimate for this object) to
     # non-dimensionalize the radiative-flux residual, which is otherwise on a wildly different
@@ -498,8 +444,9 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
                 f"P_center={P_center:.6e}, T_center={T_center:.6e}"
             )
         m_event = np.exp(sol.t_events[0][0])
-        yb = sol.y_events[0][0]
-        res_full = boundary_conditions.boundary_conditions(np.zeros(4), yb)
+        yb = sol.y_events[0][0]   # (r, lnP, L, lnT) at the photosphere event
+        yb_physical = np.array([yb[0], np.exp(yb[1]), yb[2], np.exp(yb[3])])
+        res_full = boundary_conditions.boundary_conditions(np.zeros(4), yb_physical)
         mass_residual = (m_event - config.M_TOTAL) / config.M_TOTAL
         return [mass_residual, res_full[3] / L_scale]
 
@@ -514,7 +461,8 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
     m_surface = np.exp(sol.t_events[0][0])
 
     m = np.logspace(np.log10(m_min), np.log10(m_surface), config.N_GRID_POINTS)
-    r, P, L, T = sol.sol(np.log(m))
+    r, lnP, L, lnT = sol.sol(np.log(m))
+    P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
 
     res_mass, res_L = residual(u_sol)

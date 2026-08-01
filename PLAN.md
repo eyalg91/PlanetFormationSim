@@ -459,7 +459,7 @@ stands as complete.
 
 ---
 
-#### Sub-task 5 — `bvp_solver.py` ($t=0$ structure) — REVISED TWICE, **⏸ PAUSED mid-implementation (2026-07-27)**
+#### Sub-task 5 — `bvp_solver.py` ($t=0$ structure) — REVISED TWICE, **✅ DONE, verified end-to-end (2026-08-01)**
 
 This sub-task has gone through two major premise changes; PROGRESS.md has the full
 investigation behind each.
@@ -536,29 +536,56 @@ real 4-ODE equations (confirmed sharply: evaluating them at its own values diver
 $T\to3.4$ million K in one step) — standard "initial model relaxation" territory, not a bug.
 `bvp_solver.relax_initial_state(state_0)` implements this via homotopy on
 $\nabla_\text{eff}$ (blending the pure adiabat at $\alpha=0$, matching `state_0`'s own
-construction exactly, toward the real Schwarzschild-selected value at $\alpha=1$) — its
-first pseudo-step converges cleanly, validating the approach, but later steps hit a cascade
-of `scipy` stiff-solver numerical edge cases (floating-point cancellation, `eos.density`
-Newton non-convergence, negative-domain probing, clamp-induced overflow). **Two principled
-fixes proposed, neither implemented — evaluate next session before touching this code
-again:** (1) log-transformed state variables ($\ln P$, $\ln T$) for structural positivity;
-(2) graceful degradation inside `eos.density` (bounded penalty instead of a hard assertion
-on an unconvergeable probe). Full blow-by-blow, exact failure traces, and the rejected
-"scale dL/dm by alpha" trap (a real mathematical dead end, not just a bad idea — collapses
-to the original isothermal degeneracy) are in PROGRESS.md's 2026-07-27 entry — read it
-before resuming.
+construction exactly, toward the real Schwarzschild-selected value at $\alpha=1$).
 
-**Deliverables (remaining):** resolve the relaxation numerical issue (Path 1 or 2 above);
-confirm `relax_initial_state`'s output is genuinely self-consistent with `solve_timestep`'s
-equations; re-validate `solve_timestep` starting from that state.
+Its first pseudo-step originally hit a cascade of `scipy` stiff-solver numerical edge cases
+(floating-point cancellation, `eos.density` Newton non-convergence, negative-domain probing,
+clamp-induced overflow) — traced to the linear $(P,T)$ `solve_ivp` state representation
+letting Radau's internal Jacobian probing generate non-positive trial values. **Fixed
+(2026-08-01): both RHS functions in `bvp_solver.py` now integrate $(\ln P,\ln T)$ instead of
+$(P,T)$**, guaranteeing positivity by construction and removing the `1e-300` floor clamps
+entirely — the standard Henyey/MESA-style state representation. Verified: `alpha=0.000` now
+converges cleanly with no crash of any kind.
 
-**Exit criterion:** `relax_initial_state` completes all 11 pseudo-steps without numerical
-failure; the resulting state, fed to `solve_timestep(state, dt)` for a real `dt`, shows a
-small residual at a reasonable starting guess (not divergence).
+**Ramping $\alpha$ past 0 then exposed a second blocker**, unrelated to the state
+representation: blending in even a small amount of the real Schwarzschild-selected gradient
+caused the outward integration to catastrophically diverge near the pure-adiabat structure's
+own photosphere ($T$ jumped from ~700 K to ~$1.3\times10^5$ K, $L$ flipped sign) — traced to
+`gradients.grad_radiative`'s $\nabla_\text{rad}\propto\kappa LP/(mT^4)$ becoming extremely
+sensitive as $T^4\to0$ near the photosphere, so a small $L$-sign deviation flips
+$\nabla_\text{rad}$'s sign and the Schwarzschild selection feeds it straight into $dT/dm$
+with the wrong sign. **Fixed (2026-08-01): `gradients.grad_radiative` now floors $L$ at zero
+at its own point of use** (the outward-flux assumption its derivation requires), rather than
+patching the derived $\nabla_\text{eff}$ downstream. Confirmed the floor is a pure
+bootstrapping aid: it engages only for $\alpha\le0.7$ and is never active at the converged
+$\alpha=1$ solution.
+
+**A third blocker then appeared in `solve_timestep` itself**, once seeded from the now-valid
+relaxed state: a catastrophic-cancellation collapse right at the center, the same mechanism
+already fixed once this session for `relax_initial_state`'s $\alpha=0$ seed. **Fixed** with
+the identical tiny (`1e-6` relative) seed nudge.
+
+**All three fixes verified end-to-end**: `solve_static_structure()` → `relax_initial_state()`
+(all 11 $\alpha$ steps converge) → `solve_timestep()` (converges from the relaxed state,
+residuals $[2.4\times10^{-10}, 3.1\times10^{-8}]$, physically sensible first step). Full
+blow-by-blow traces for all three fixes, and the rejected "scale dL/dm by alpha" trap (a real
+mathematical dead end — collapses to the original isothermal degeneracy), are in
+PROGRESS.md's 2026-07-27 and 2026-08-01 entries.
+
+**Deliverables:** all met — `solve_static_structure`, `relax_initial_state`, and
+`solve_timestep` all converge cleanly in sequence.
+
+**Exit criterion: met.** `relax_initial_state` completes all 11 pseudo-steps without
+numerical failure; the resulting state, fed to `solve_timestep(state, dt)`, shows a small
+residual (not divergence).
+
+**Not yet done, deferred to Sub-task 6 or later:** `validation.py` Check 19 still references
+the pre-photospheric-BC residual formula; no new validation checks have been proposed for the
+photospheric condition, the relaxation homotopy, or the `L>=0` floor.
 
 ---
 
-#### Sub-task 6 — `diagnostics.py` — **BLOCKED, pending Sub-task 5's final structure**
+#### Sub-task 6 — `diagnostics.py` — **UNBLOCKED (Sub-task 5 done, 2026-08-01), not yet started**
 
 The existing checks (pressure-confined virial form, single-opacity-regime prediction) were
 written for Premise 1's isothermal, pressure-confined state and no longer apply once $t=0$
@@ -609,6 +636,15 @@ below since both land in the same pass.
 
 #### Sub-task 8 — Outer time loop `time_stepper.run()` — **BLOCKED, pending Sub-tasks 5–7**
 
+**Development approach (two-phase — see CLAUDE.md's Development Workflow):**
+- *Phase 1 (sterile):* build and test `run()`'s loop/logging/snapshot/halt-check control flow
+  against a mock `solve_timestep` (a cheap stand-in, or a short cached sequence of real
+  states via `dev_cache.py`) — no need to pay for a real Radau/fsolve solve on every step
+  just to validate the outer loop's own logic.
+- *Phase 2 (wet):* swap in the real `bvp_solver.solve_timestep`, seeded from a cached,
+  already-relaxed `SimulationState` rather than re-running `solve_static_structure` +
+  `relax_initial_state` for every test.
+
 **Deliverables (once unblocked):**
 - `run(n_steps, dt)`: `state_0 = bvp_solver.solve_static_structure()` → repeated
   `bvp_solver.solve_timestep(state_prev, dt)` calls — no bootstrap/kick step of any kind.
@@ -634,6 +670,11 @@ Additionally verify the dissociation halt with an artificially-lowered
 #### Sub-task 9 — Adaptive time-stepping
 
 **Goal:** Ensure numerical stability over long runs.
+
+**Development approach:** Phase 1 (sterile) — validate the thermal-timescale limiter's
+step-size selection formula against a mock/cached sequence of states, no real solve needed
+to test the formula itself; Phase 2 (wet) — test against the real solver once Sub-task 8's
+loop is validated on its own.
 
 **Deliverables:**
 - Thermal timescale limiter: $\Delta t_\text{new} = \alpha \cdot \min_i(T_i / |\dot{T}_i|)$ with safety factor $\alpha$ from `config.py`
