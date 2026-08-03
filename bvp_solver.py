@@ -105,6 +105,37 @@ def _adiabatic_center_guess():
 
 
 # ==========================================
+# SECTION: Composite Output Mass Grid
+# ==========================================
+
+def _build_output_grid(m_min, m_surface):
+    """Composite Lagrangian mass grid for sampling the dense solve_ivp solution: log-spaced
+    in the core (unchanged), and log-spaced in DISTANCE-TO-SURFACE over the outer
+    config.GRID_OUTER_MASS_FRACTION of the mass, so resolution increases smoothly toward the
+    photosphere instead of collapsing to ~1-2 points there.
+
+    ASSUMPTION: pure np.logspace(m_min, m_surface) puts the outer 10% of mass (where T, rho,
+    P actually change fastest, near the photosphere) into only ~0.05 of the grid's ~6 decades
+    in log-space - starving that region of points regardless of solve_ivp's own dense,
+    accurate interior interpolant. This produced a visibly jagged, under-resolved drop in
+    structure-profile plots even though the underlying physics is smooth (PROGRESS.md
+    2026-08-01 entry has the diagnosis).
+    """
+    n_outer = int(round(config.N_GRID_POINTS * config.GRID_OUTER_POINT_FRACTION))
+    n_core = config.N_GRID_POINTS - n_outer
+
+    m_transition = (1.0 - config.GRID_OUTER_MASS_FRACTION) * m_surface
+    core = np.logspace(np.log10(m_min), np.log10(m_transition), n_core, endpoint=False)
+
+    delta_max = m_surface - m_transition
+    delta_min = delta_max * config.GRID_OUTER_REFINEMENT
+    outer_deltas = np.logspace(np.log10(delta_max), np.log10(delta_min), n_outer - 1)
+    outer = m_surface - outer_deltas
+
+    return np.concatenate([core, outer, [m_surface]])
+
+
+# ==========================================
 # SECTION: Photosphere Event (tau=2/3 surface location)
 # ==========================================
 # Both shooting routines below terminate their outward integration at the photosphere
@@ -242,7 +273,7 @@ def solve_static_structure() -> state.SimulationState:
     m_surface = np.exp(sol.t_events[0][0])
     residual_norm = abs(m_surface - config.M_TOTAL) / config.M_TOTAL
 
-    m = np.logspace(np.log10(m_min), np.log10(m_surface), config.N_GRID_POINTS)
+    m = _build_output_grid(m_min, m_surface)
     r, lnP, lnT = sol.sol(np.log(m))
     P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
@@ -257,7 +288,7 @@ def solve_static_structure() -> state.SimulationState:
     L = gradients.marginal_convective_luminosity(m, P, T, kappa, grad_ad)
 
     print(f"bvp_solver: t=0 compact hot start converged, P_center={P_center:.6e} dyn/cm^2, "
-          f"T_center={config.T_CENTER_INITIAL:.1f} K, r_surface={r[-1]/6.9911e9:.3f} R_Jup, "
+          f"T_center={config.T_CENTER_INITIAL:.1f} K, r_surface={r[-1]/config.R_JUPITER_CM:.3f} R_Jup, "
           f"m_surface/M_TOTAL={m_surface/config.M_TOTAL:.8f}, mass relative residual={residual_norm:.3e}")
 
     return state.SimulationState(m=m, r=r, P=P, L=L, T=T, rho=rho, t=0.0, prev=None)
@@ -398,13 +429,13 @@ def relax_initial_state(state_0) -> state.SimulationState:
     sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_0, dt_relax, 1.0)
     m_surface = np.exp(sol.t_events[0][0])
 
-    m = np.logspace(np.log10(m_min), np.log10(m_surface), config.N_GRID_POINTS)
+    m = _build_output_grid(m_min, m_surface)
     r, lnP, L, lnT = sol.sol(np.log(m))
     P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
 
     print(f"bvp_solver: initial-state relaxation complete (alpha=1.0, genuine solution of the "
-          f"real 4-ODE system), T_center={T_center:.6e} K, r_surface={r[-1]/6.9911e9:.3f} R_Jup, "
+          f"real 4-ODE system), T_center={T_center:.6e} K, r_surface={r[-1]/config.R_JUPITER_CM:.3f} R_Jup, "
           f"m_surface/M_TOTAL={m_surface/config.M_TOTAL:.8f}")
 
     # t is left at state_0.t: this is a mathematical relaxation device (pseudo-steps at a fixed
@@ -460,7 +491,7 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
         raise RuntimeError("solve_timestep: converged (P_center, T_center) does not reach the photosphere - numerical precision limit near the root")
     m_surface = np.exp(sol.t_events[0][0])
 
-    m = np.logspace(np.log10(m_min), np.log10(m_surface), config.N_GRID_POINTS)
+    m = _build_output_grid(m_min, m_surface)
     r, lnP, L, lnT = sol.sol(np.log(m))
     P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)

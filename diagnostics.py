@@ -148,7 +148,7 @@ def plot_mass_radius(state, output_path=f"{PLOT_DIR}/mass_radius.png") -> None:
     """Enclosed mass vs radius - shows how mass concentrates toward the center for this
     degenerate-supported structure (most of M_TOTAL sits well inside the outer radius)."""
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(state.r / 6.9911e9, state.m / config.M_TOTAL)
+    ax.plot(state.r / config.R_JUPITER_CM, state.m / config.M_TOTAL)
     ax.set_xlabel("r [R_Jup]")
     ax.set_ylabel("m / M_TOTAL")
     ax.set_title(f"Mass-radius distribution at t={state.t:.3e} s")

@@ -51,21 +51,25 @@ MU_E = 1.17          # Mean molecular weight per electron, solar-like H/He compo
 # SECTION: Initial Condition — Compact Post-Collapse Protoplanet (t=0)
 # ==========================================
 
-# ASSUMPTION: t=0 is NOT a diffuse, pre-collapse GI clump in equilibrium with the ambient disk
-# (that construction was tried and found to be an exact, unbreakable fixed point under
-# hydrostatic physics - deeply Bonnor-Ebert subcritical, isothermal, L=0; PROGRESS.md Sub-task 5
-# pivot). Initial GI collapse is inertia-dominated hydrodynamic free-fall, structurally outside
-# what a quasi-static/hydrostatic solver can represent - the same reason T_DISSOCIATION_LIMIT
-# below halts the code at the far end of validity. Standard practice (PMS Henyey tracks;
-# Bodenheimer & Pollack 1986; Marley et al. 2007 "hot start" gas-giant models) is to hand off
-# from an assumed compact, high-entropy post-collapse state and evolve forward quasi-statically
-# from there. T_CENTER_INITIAL is therefore a CHOSEN "hot start" parameter, not derived - real
-# formation entropy is genuinely uncertain; GI/disk-instability formation (this project's
-# premise) generally predicts higher initial entropy than core-accretion "warm starts",
-# motivating the upper-middle of a plausible 1000-1500 K range rather than the low end. Kept
-# safely below T_DISSOCIATION_LIMIT (2000 K): a just-collapsed "second core" that has not yet
-# reached H2 dissociation.
-T_CENTER_INITIAL = 1200.0   # Prescribed central temperature of the t=0 compact protoplanet [K]
+# ASSUMPTION: t=0 represents Stage 3 of the three-stage GI-formation picture (PLAN.md
+# "Formation Scenario and Scope"): the compact, hot "second core" that forms once the
+# dynamical second collapse (triggered by H2 dissociation at T~2000K, Stage 1->2) halts due
+# to ionization and electron degeneracy pressure re-stiffening the EOS - NOT the diffuse
+# pre-collapse cloud (an exact, unbreakable fixed point under hydrostatic physics,
+# PROGRESS.md Sub-task 5 pivot), and NOT Stage 1's first core either. T_CENTER_INITIAL is a
+# CHOSEN "hot start" parameter, not derived - real formation entropy is genuinely uncertain.
+#
+# STILL UNDER ACTIVE RECONSIDERATION (2026-08-01, PROGRESS.md has the full numerical trail):
+# literature (present-day Jupiter's own modeled central temperature, ~2.2-2.5e4 K) motivates
+# a value in the 2e4-5e4 K range, but this codebase's simplified EOS (fixed-mu ideal gas, no
+# ionization physics) does NOT reproduce a compact R~2-4 R_Jup structure there - direct
+# marching of T_CENTER_INITIAL against solve_static_structure() shows R already exceeds 4
+# R_Jup by T~1.7e4 K and keeps climbing. R=2-4 R_Jup is achieved for T_CENTER_INITIAL
+# somewhere between ~1200 K and ~1.3e4 K under THIS model's actual physics. Value below is a
+# placeholder (the pre-reframing 1200 K) pending a decision between prioritizing the
+# geometric target (R) or the literature-motivated temperature target (T) for this specific,
+# non-ionized EOS - see PROGRESS.md before changing this number.
+T_CENTER_INITIAL = 1200.0   # Prescribed central temperature of the t=0 compact protoplanet [K] - PLACEHOLDER, see ASSUMPTION above
 
 # ==========================================
 # SECTION: Grid & Solver Parameters
@@ -78,6 +82,15 @@ N_GRID_POINTS = 200   # Number of nodes on the Lagrangian mass grid m in [0, M_T
 # practice for Lagrangian stellar-structure BVPs (Kippenhahn & Weigert); the innermost shell's
 # mass is negligible, so the center BCs (r=0, L=0) still hold to excellent approximation there.
 M_MIN_FRACTION = 1.0e-6   # Fractional mass of the innermost grid point, m_min/M_TOTAL [dimensionless]
+
+# ASSUMPTION: a single np.logspace(m_min, m_surface) puts the outer 10% of mass (where T, rho,
+# P actually change fastest, near the photosphere) into only ~0.05 of the grid's ~6 decades in
+# log-space, under-resolving that region regardless of solve_ivp's own accurate dense
+# interpolant (PROGRESS.md 2026-08-01 entry). bvp_solver._build_output_grid instead composites
+# a log-spaced core with a log-spaced-in-distance-to-surface outer region.
+GRID_OUTER_MASS_FRACTION = 0.1     # Fraction of M_TOTAL (nearest the surface) sampled by the denser outer grid [dimensionless]
+GRID_OUTER_POINT_FRACTION = 0.3    # Fraction of N_GRID_POINTS allocated to that outer region [dimensionless]
+GRID_OUTER_REFINEMENT = 1.0e-4     # Finest outer sampling, as a fraction of the outer region's own mass span [dimensionless]
 
 # Representative density for bvp_solver.py's shooting-method radius/pressure scale only, NOT
 # used in the physics equations. t=0 is a compact, post-dynamical-collapse protoplanet (a few
@@ -110,12 +123,23 @@ T_KH_TIMESCALE_S = 1.0e6 * 3.156e7   # Characteristic Kelvin-Helmholtz contracti
 OPACITY_SMOOTH_TRANSITIONS = False  # Bell & Lin (1994) regime switch: False = physically correct hard switch, True = logistic-blended kappa(T) near transitions
 
 # ==========================================
-# SECTION: Physical Validity Limits
+# SECTION: Reference Length Scale
 # ==========================================
 
-# ASSUMPTION: quasi-static hydrostatic equilibrium holds only while hydrogen
-# remains molecular. Near T ~ 2000 K, H2 dissociation (~4.5 eV/molecule) drives
-# gamma_eff below 4/3, violating hydrostatic stability and triggering dynamical
-# free-fall collapse on timescales far shorter than the Kelvin-Helmholtz
-# timescale this quasi-static solver assumes.
-T_DISSOCIATION_LIMIT = 2000.0   # Core temperature ceiling above which H2 dissociation invalidates the quasi-static assumption [K]
+R_JUPITER_CM = 6.9911e9   # Jupiter's present-day equatorial radius, used as a reporting/reference unit [cm]
+
+# ==========================================
+# SECTION: Simulation Halt Condition
+# ==========================================
+
+# ASSUMPTION: t=0 (Stage 3 of PLAN.md's "Formation Scenario and Scope") already starts PAST
+# H2 dissociation - the dynamical second collapse that crosses that threshold (Stage 1->2)
+# is out of scope, not modeled here. The former T_DISSOCIATION_LIMIT halt (checked for
+# T_center rising toward 2000 K, as in a non-degenerate pre-main-sequence contraction) does
+# not apply to this project's forward evolution, which instead COOLS from a hot, compact
+# start (a degenerate-pressure-supported contraction, not a virial-theorem-driven heating
+# one - PROGRESS.md 2026-08-01 entry). Replaced with a radius halt: contraction toward
+# today's Jupiter is the physically meaningful endpoint of the modeled Kelvin-Helmholtz
+# track. It will need reinstating (with its original 2000 K value) if Stage 1 (the first
+# core, PLAN.md "Phase 3 - Extensions") is ever modeled separately.
+R_HALT = 1.0 * R_JUPITER_CM   # Surface radius at which time_stepper.run() halts (Sub-task 8) [cm]

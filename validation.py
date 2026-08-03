@@ -1241,8 +1241,11 @@ def print_all_constants() -> None:
     print(f"N_GRID_POINTS = {config.N_GRID_POINTS}")
     print(f"OPACITY_SMOOTH_TRANSITIONS = {config.OPACITY_SMOOTH_TRANSITIONS}")
 
-    print("=== Physical Validity Limits ===")
-    print(f"T_DISSOCIATION_LIMIT = {config.T_DISSOCIATION_LIMIT:.6e} K")
+    print("=== Reference Length Scale ===")
+    print(f"R_JUPITER_CM = {config.R_JUPITER_CM:.6e} cm")
+
+    print("=== Simulation Halt Condition ===")
+    print(f"R_HALT = {config.R_HALT:.6e} cm ({config.R_HALT / config.R_JUPITER_CM:.3f} R_Jup)")
 
 
 # ==========================================

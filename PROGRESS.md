@@ -11,6 +11,30 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**⚠ `config.T_CENTER_INITIAL` is a PLACEHOLDER (still 1200 K) pending a decision — read
+this before changing it.** The formation-scenario reframing (three stages: first
+hydrostatic core → dynamical second collapse → post-second-collapse hot start, §5's dated
+entries have the full picture) correctly resolved *why* $T_\text{CENTER\_INITIAL}=1200$K was
+wrong, but literature-checking the *replacement* value surfaced a real, unresolved tension —
+see §5's "Literature check" entry below before picking a number:
+
+- Present-day Jupiter's own modeled central temperature is $\sim2.2$-$2.5\times10^4$K
+  (multiple independent sources), which — since the object can only cool from its formation
+  value — implies the true post-second-collapse $T_\text{center}$ should be *above* that,
+  motivating the originally-discussed $2\times10^4$-$5\times10^4$K range.
+- **But directly marching `T_CENTER_INITIAL` through `solve_static_structure()`
+  (warm-started, not a blind sweep) shows $R$ already exceeds $4\,R_\text{Jup}$ by
+  $T\sim1.7\times10^4$K and keeps climbing steeply** — this codebase's simplified EOS (fixed
+  neutral-gas $\mu$, no ionization physics) does not reproduce a compact
+  $R\sim2$-$4\,R_\text{Jup}$ structure anywhere near the literature-motivated temperature.
+  $R=2$-$4\,R_\text{Jup}$ is achieved for $T_\text{CENTER\_INITIAL}$ somewhere between
+  $\sim1200$K and $\sim1.3\times10^4$K under this model's *actual* physics.
+
+**Composite outer-mass grid, `T_DISSOCIATION_LIMIT`→`R_HALT` config swap, `R_JUPITER_CM`,
+and the hardcoded-literal cleanup are all DONE** (§5's "Step 3 execution" entry). Only
+`T_CENTER_INITIAL`'s final numeric value is still open — see PLAN.md's Sub-task 8 for the
+revised goal/halt condition and §Phase-3-Extensions for the deferred first-core modeling.
+
 **✅ Sub-task 5 is DONE and verified end-to-end (2026-08-01 session).** Three blockers were
 found and fixed in sequence this session, each traced to its root cause before being patched
 (no ad hoc clamp-tuning):
@@ -645,6 +669,164 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-01 — Literature check on $T_\text{center}$ surfaces a real EOS-specific tension; Step 3 (grid, config) implemented, $T_\text{CENTER\_INITIAL}$ left open
+
+**Literature check (web search, not memory alone)**: confirmed a $20{,}000$K number is a
+*central*, not surface, temperature — a 20,000K blackbody surface for a 1$M_\text{Jup}$
+object is unphysical (checked directly: matching a realistic hot-start luminosity,
+$\sim10^{-4}\,L_\odot$, to $R\approx3\,R_\text{Jup}$ via $L=4\pi R^2\sigma T_\text{eff}^4$
+gives $T_\text{eff}\approx1000$K, not 20,000K). Also found: present-day Jupiter's own
+modeled central temperature is robustly $\sim2.2$-$2.5\times10^4$K (multiple independent
+sources: EBSCO astronomy reference, Physics LibreTexts planetary astronomy text, general
+references converge on this range). Since the object only cools from formation onward, this
+means the *true* post-second-collapse $T_\text{center}$ should sit *above* $2.5\times10^4$K,
+not at the low end of the originally-discussed $2\times10^4$-$5\times10^4$K range.
+
+**But this doesn't hold under our own EOS.** Rather than trust either the literature number
+or guess, `T_CENTER_INITIAL` was marched from 1200K to 50,000K directly against
+`solve_static_structure()` (warm-started geometric bracket search, seeded from each
+previous step's converged $P_\text{center}$ — the blind attempt at 20,000K, seeded from the
+$T=0$ degenerate-limit guess alone, failed to bracket at all, exactly the kind of seed
+mismatch flagged as a risk two sessions ago):
+
+| $T_\text{center}$ (K) | $R$ ($R_\text{Jup}$) |
+|---|---|
+| 1,200 | 3.17 |
+| 5,574 | 3.43 |
+| 8,644 | 3.67 |
+| 10,765 | 3.88 |
+| 13,405 | 4.22 |
+| 16,694 | 4.89 |
+| ~20,789 | *(bracket search failed — R climbing too fast to track)* |
+
+$R=2$-$4\,R_\text{Jup}$ is achieved between $\sim1200$K and $\sim1.3\times10^4$K under this
+model's actual physics — nowhere near $2\times10^4$-$5\times10^4$K. Most likely explanation:
+this codebase's EOS has no ionization physics (the ideal-gas term uses a fixed, neutral-gas
+$\mu=2.34$ at every temperature); a real, substantially-ionized $2\times10^4$-$5\times10^4$K
+plasma would have a much lower effective $\mu$ (more free particles from ionization), hence
+*more* thermal pressure support at the same $(\rho,T)$ than this simplified model computes —
+meaning the true, fully-physical object would be *even more* extended at that temperature,
+not less. The literature-motivated $T$ describes the real object; this simplified 4-ODE,
+non-ionized-EOS code does not reproduce that same $(T,R)$ pair self-consistently.
+
+**Decision required, not made unilaterally**: prioritize the geometric target ($R\sim2$-$4$,
+pick $T_\text{CENTER\_INITIAL}$ from the range this model actually produces it in) vs. the
+literature-motivated temperature target (accept $R$ will exceed 4, likely substantially, and
+find out how much by continuing past where the bracket search failed). Recommended:
+geometric target — $R$ is what the outer-BC/grid/halt-condition work all depends on and is
+directly checkable, whereas $T$ is a much softer target given the known missing-ionization
+gap in this specific EOS. `config.py`'s `T_CENTER_INITIAL` ASSUMPTION comment documents this
+in full; the value itself is left at the pre-reframing 1200K as an explicit placeholder
+(flagged in-line: "PLACEHOLDER, see ASSUMPTION above") rather than guessed.
+
+**Step 3 execution (everything not gated on the $T_\text{center}$ decision) — done:**
+- **Composite outer-mass grid** (`bvp_solver._build_output_grid`): log-spaced core + a
+  log-spaced-in-distance-to-surface outer `config.GRID_OUTER_MASS_FRACTION` (0.1) of the
+  mass, taking `config.GRID_OUTER_POINT_FRACTION` (0.3) of the point budget. Fixes the
+  diagnosed cause of the jagged outer-profile artifact: pure `np.logspace` across the full
+  $\sim6$-decade mass range put the outer 10% of mass (where $T,\rho,P$ actually change
+  fastest) into only $\sim0.05$ of the grid's decades — 1-2 points total. Now: 59 of 200.
+  Verified bit-identical physics before/after (same $P_\text{center}$, $R$, residual at
+  $T_\text{center}=1200$K — output-sampling-only change, confirmed via `structure_profile.png`
+  regeneration: the drop is now smooth). Replaces the single duplicated `np.logspace` call in
+  all three of `solve_static_structure`, `relax_initial_state`, `solve_timestep`.
+- **`config.py`**: `T_DISSOCIATION_LIMIT` removed (Stage 3 starts already past H2
+  dissociation — doesn't apply to this project's forward evolution, which cools rather than
+  heats, §1); `R_HALT`=1.0$R_\text{Jup}$ added (Sub-task 8's new halt condition, not yet
+  wired up since `time_stepper.run()` doesn't exist yet); new `R_JUPITER_CM` constant, and
+  the three pre-existing hardcoded `6.9911e9` literals (`bvp_solver.py` ×2, `diagnostics.py`
+  ×1 — a real, pre-existing CLAUDE.md violation) replaced with it.
+- **`validation.py`**: `print_all_constants()`'s live reference to the now-removed
+  `config.T_DISSOCIATION_LIMIT` fixed (would have raised `AttributeError`) — updated to
+  print `R_JUPITER_CM`/`R_HALT` instead.
+- **`try`/`except` audit**: confirmed clean two sessions ago (only two exist, both
+  legitimate `AssertionError`-is-raised tests in `validation.py` Check 16) — reconfirmed no
+  new ones introduced.
+- **Verified**: full compile check clean; `solve_static_structure()` still converges
+  cleanly against the fully-updated config (placeholder $T_\text{center}$), no exceptions,
+  no try/except involved — real failures would propagate with a full traceback.
+
+### 2026-08-01 — Formation scenario reframed into three stages; resolves the $T_\text{center}$/$R$ tension without a parameter sweep
+
+**Context.** Sub-task 6's plots prompted a supervisor review, which flagged that
+$T_\text{CENTER\_INITIAL}=1200$K ($R\approx3.17\,R_\text{Jup}$) is too "late" — the intended
+$t=0$ hand-off point should be closer to $R\sim20$-$30\,R_\text{Jup}$. A parameter sweep to
+find the $T_\text{center}$ giving that radius was planned (previous session) but paused: a
+rough virial estimate suggested reaching $R\sim25\,R_\text{Jup}$ thermally would need
+$T_\text{center}\sim2\times10^4$K, in direct conflict with `T_DISSOCIATION_LIMIT`=2000K.
+
+**Resolution.** The tension was a category error, not a numerical one: it conflated two
+distinct evolutionary stages from the standard (Larson 1969-style) two-step protostellar
+collapse picture, now applied explicitly to this GI-formed-giant-planet context:
+
+1. **First hydrostatic core** — the initially diffuse clump settles into a large
+   ($10^2$-$10^3\,R_\text{Jup}$), ideal-gas-supported, quasi-static object. $R\sim20$-$30\,
+   R_\text{Jup}$ is a point *within* this stage's own contraction, not a target radius for
+   our hot-start hand-off. This stage ends at $T_\text{center}\sim2000$K, where H2
+   dissociation (endothermic, drops $\Gamma_1$ below the stability threshold) triggers a
+   second, dynamical collapse.
+2. **Second (dynamical) collapse** — fast free-fall, out of scope (same reasoning as the
+   original Sub-task 5 pivot).
+3. **Post-second-collapse hot start** — the collapse halts once dissociation completes and
+   ionization + electron degeneracy pressure re-stiffen the EOS at much higher density,
+   producing a compact ($\sim2$-$4\,R_\text{Jup}$), very hot
+   ($T_\text{center}\sim2\times10^4$-$5\times10^4$K) "second core." **This is what
+   `bvp_solver.py`'s $t=0$ construction is actually meant to represent** — $t=0$ starts
+   *already past* H2 dissociation (the collapse that crossed it isn't modeled), not
+   approaching it from below. `T_CENTER_INITIAL=1200$K was too *cool* for this stage, not
+   too compact — the earlier sweep-planning session's virial estimate wasn't wrong, it was
+   answering a question about the wrong stage (stage 1's geometry at stage-1 temperatures).
+
+**Numerical self-consistency check** (order-of-magnitude, not a full solve): using the
+existing degenerate/ideal-gas crossover-density scaling ($\rho_\text{crossover}(T)\propto
+T^{3/2}$; PROGRESS.md's Sub-task 2f entry already established $\rho_\text{center}$ at
+$T=1200$K is $\sim600\times$ the crossover density there) — at the current $t=0$'s actual
+$\rho_\text{center}\approx0.25\,\text{g/cm}^3$, degeneracy remains dominant
+($\rho_\text{center}/\rho_\text{crossover}\sim9\times$) up to $T\sim2\times10^4$K, but the
+margin shrinks substantially by $T\sim5\times10^4$K ($\sim2\times$) — so the *lower* end of
+the requested range is more comfortably self-consistent with landing near
+$R\sim2$-$4\,R_\text{Jup}$; the upper end may land measurably larger. **This needs a single
+confirmatory `solve_static_structure()` run once `T_CENTER_INITIAL` is set — not a sweep,
+but not assumed either.**
+
+**A real, accepted approximation, not silently glossed over**: at $T_\text{center}\sim2
+\times10^4$-$5\times10^4$K, hydrogen is substantially-to-fully ionized. `eos.py`'s
+degenerate term already assumes full ionization ($\mu_e=1.17$, existing `config.py`
+comment), but the *ideal-gas* term still uses a fixed, neutral-gas $\mu=2.34$ — not
+self-consistent with an ionized thermal component. Since degeneracy pressure dominates the
+mechanical structure in this regime (previous paragraph), this is judged a second-order
+approximation, not a blocker — but it should be flagged with an `# ASSUMPTION:` comment
+when `T_CENTER_INITIAL` is updated, not left implicit. Non-relativistic electron degeneracy
+remains valid (Jupiter-mass densities are nowhere near where relativistic corrections
+matter).
+
+**Cooling direction, corrected**: Sub-task 8's exit criterion previously expected
+$T_\text{center}$ *increasing* over the simulated evolution. For a degenerate-pressure-
+supported contraction (this project's actual regime, unlike a non-degenerate pre-main-
+sequence star, where the virial theorem's negative specific heat *does* drive $T_\text{center}$
+up as the star contracts), the standard picture is white-dwarf-like cooling: $T_\text{center}$
+*decreases* as the object contracts and radiates away its formation heat, consistent with
+this project's own established narrative ("slowly radiates away its formation heat and
+contracts," §1) and with `config.R_HALT`=1$R_\text{Jup}$ being the natural endpoint of a
+cooling, not heating, track. Corrected in PLAN.md's Sub-task 8.
+
+**Terminology note**: the three stages above are called "Stage 1/2/3" in PLAN.md, not
+"Phase 1/2/3" — PLAN.md already uses "Phase 1/2/3" for its own top-level project-milestone
+structure (Initial Setup / Dynamic Time Evolution / Extensions), and reusing the same
+numerals for the astrophysical formation stages would collide with that.
+
+**Decided, not yet implemented** (pending go-ahead): composite outer-mass grid in
+`bvp_solver.py` (fixes the separately-diagnosed outer-5%-of-mass resolution artifact,
+unrelated to this reframing but bundled into the same implementation pass); `config.py`:
+remove `T_DISSOCIATION_LIMIT`, add `R_HALT` (1.0 $R_\text{Jup}$) and a proper
+`R_JUPITER_CM` constant (currently `6.9911e9` is a hardcoded literal in three places —
+`bvp_solver.py` x2, `diagnostics.py` x1 — a pre-existing CLAUDE.md violation, fixed while
+`R_HALT` is added); set `T_CENTER_INITIAL` to a value in the $2\times10^4$-$5\times10^4$K
+range (exact number pending one confirmatory run, not a sweep). Codebase audited for blind
+`try`/`except`: only two exist (`validation.py` Check 16), both legitimate
+"confirm this raises `AssertionError`" tests, not error-swallowing — no changes needed
+there.
 
 ### 2026-08-01 — Sub-task 6 completed: virial theorem rewritten (unconfined), opacity regime check updated
 

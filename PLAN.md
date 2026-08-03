@@ -29,31 +29,52 @@ closure — only time-evolution of structural (stellar-interior-type) equations.
 
 The envelope is assumed to have formed via gravitational instability (GI) / disk
 fragmentation in the outer regions (~50 AU) of a protoplanetary disk. That physical picture
-splits into two phases with very different character, and this project only models one of
-them:
+splits into three stages, separated by a dynamical collapse (the same two-step
+first-core/second-collapse/second-core picture established for protostellar collapse,
+Larson 1969, applied here to a GI-formed giant planet); this project models only the last
+one. **Revised 2026-08-01** to resolve an earlier conflation of the first and third stages
+— see PROGRESS.md for the full reasoning. (Named "Stage 1/2/3" here, not "Phase 1/2/3", to
+avoid confusion with this document's own Phase 1/2/3 *project-milestone* structure below.)
 
-1. **Initial collapse (out of scope).** A locally dense, gravitationally unstable region
-   of the disk undergoes fast, inertia-dominated, hydrodynamic free-fall collapse into a
-   bound clump. A quasi-static/hydrostatic-equilibrium solver is structurally incapable of
-   representing this — force balance is assumed at every instant, which is the opposite of
-   free-fall. This is the same reason `T_DISSOCIATION_LIMIT` (§4.6) halts the code at the
-   *far* end of validity, once H2 dissociation triggers a second dynamical collapse.
-   Standard practice in the literature (pre-main-sequence Henyey-track modeling;
-   Bodenheimer & Pollack 1986; Marley et al. 2007 "hot start" gas-giant models) is to never
-   simulate this phase directly — hand off from an assumed or externally-computed
-   post-collapse state instead.
-2. **Kelvin-Helmholtz contraction (this project's actual scope).** The already-collapsed,
-   compact, high-entropy object slowly radiates away its formation heat and contracts over
-   a ~Myr timescale, remaining close to hydrostatic equilibrium throughout. This is what
-   the 4-ODE system below models.
+1. **First hydrostatic core (out of scope; a future extension, see "Phase 3 —
+   Extensions").** The initially diffuse, collapsing clump becomes optically thick and
+   settles into a large ($10^2$-$10^3\,R_\text{Jup}$), quasi-static, ideal-gas-supported
+   "first core." This stage ends once $T_\text{center}$ reaches ~2000 K and H2 dissociation
+   (an endothermic sink that drops the effective adiabatic index below the stability
+   threshold) triggers a second, dynamical collapse.
+2. **Second (dynamical) collapse (out of scope).** Fast, inertia-dominated free-fall — a
+   quasi-static/hydrostatic-equilibrium solver is structurally incapable of representing
+   this (force balance is assumed at every instant, the opposite of free-fall).
+3. **Post-second-collapse "hot start" (this project's actual scope).** The collapse halts
+   once H2 dissociation completes and (partial) ionization plus electron degeneracy
+   pressure re-stiffen the equation of state at much higher density, producing a compact
+   ($\sim2$-$4\,R_\text{Jup}$) "second core." The literature-motivated central temperature
+   for this state ($T_\text{center}\sim2\times10^4$-$5\times10^4$ K, anchored to present-day
+   Jupiter's own modeled interior) does **not** reproduce that radius under this codebase's
+   simplified (non-ionized) EOS — see PROGRESS.md's 2026-08-01 "Literature check" entry;
+   `config.T_CENTER_INITIAL`'s exact value is still an open decision, not yet finalized.
+   From here the object slowly radiates away its formation heat and
+   contracts over a ~Myr Kelvin-Helmholtz timescale, remaining close to hydrostatic
+   equilibrium throughout. This is what the 4-ODE system below models — `t=0` starts
+   **already past** H2 dissociation, not approaching it from below. `T_DISSOCIATION_LIMIT`
+   (§4.6) governed stage 1→2's transition, not this stage's forward evolution — removed
+   from the active halt condition accordingly (Sub-task 8).
 
-Consequently, `t=0` in this simulation is **not** a diffuse pre-collapse cloud — it is a
-compact, hot, high-entropy "just-collapsed" protoplanet (Sub-task 5). An earlier version of
-this project instead started from a diffuse, disk-pressure-confined cloud and tried to
-evolve it forward quasi-statically; that premise turned out to be a genuine mathematical
-dead end (proven, not a numerical artifact — a diffuse cloud already in stable equilibrium
-with fixed ambient conditions has no reason to evolve) and was abandoned. See PROGRESS.md
-for the full investigation behind this change.
+Standard practice in the literature (pre-main-sequence Henyey-track modeling; Bodenheimer &
+Pollack 1986; Marley et al. 2007 "hot start" gas-giant models) is to never simulate stages 1
+and 2 directly — hand off from an assumed or externally-computed post-collapse state
+instead, which is exactly what this project does for stage 3.
+
+Consequently, `t=0` in this simulation is **not** a diffuse pre-collapse cloud, and **not**
+the first core either — it is the compact, very hot, high-entropy post-second-collapse
+protoplanet (Sub-task 5). Two earlier premises were tried and superseded: a diffuse,
+disk-pressure-confined cloud evolved forward quasi-statically (a genuine mathematical dead
+end, proven not a numerical artifact — a diffuse cloud already in stable equilibrium with
+fixed ambient conditions has no reason to evolve); and a compact hot start with
+$T_\text{center}\sim1200\,$K, which conflated stage 1's temperature *ceiling* (2000 K,
+where dissociation *triggers* the second collapse) with stage 3's starting *geometry* (a
+compact radius only reached *after* that collapse) — corrected 2026-08-01. See PROGRESS.md
+for both investigations.
 
 ### Grid
 - **Coordinate:** Lagrangian mass coordinate $m$ (mass enclosed within radius $r$)
@@ -653,34 +674,48 @@ below since both land in the same pass.
 
 ---
 
-#### Sub-task 8 — Outer time loop `time_stepper.run()` — **BLOCKED, pending Sub-tasks 5–7**
+#### Sub-task 8 — Outer time loop `time_stepper.run()` for the Stage-3 hot start — **UNBLOCKED (Sub-tasks 5–6 done); goal revised 2026-08-01**
 
-**Development approach (two-phase — see CLAUDE.md's Development Workflow):**
-- *Phase 1 (sterile):* build and test `run()`'s loop/logging/snapshot/halt-check control flow
+**Goal (revised):** run the KH-contraction time loop starting from the Stage-3
+post-second-collapse hot start (§1 "Formation Scenario and Scope") — $R\approx2$-$4\,
+R_\text{Jup}$ at $t=0$ — through to a genuinely cool, compact, present-day-like state
+($R\to1\,R_\text{Jup}$, the halt condition below). Stage 1 (the first core) is explicitly
+**not** in scope here — deferred to "Phase 3 — Extensions." **`config.T_CENTER_INITIAL`'s
+exact value is still open (PROGRESS.md 2026-08-01 "Literature check" entry) — the
+$2\times10^4$-$5\times10^4$K range motivated by present-day Jupiter's central temperature
+does *not* reproduce $R\approx2$-$4\,R_\text{Jup}$ under this codebase's actual (non-ionized)
+EOS; direct marching shows that radius range is achieved for
+$T_\text{CENTER\_INITIAL}\sim1200$-$1.3\times10^4$K instead. Do not assume the
+$2\times10^4$-$5\times10^4$K figure without re-reading that entry.**
+
+**Development approach (see CLAUDE.md's Development Workflow):**
+- *Sterile pass:* build and test `run()`'s loop/logging/snapshot/halt-check control flow
   against a mock `solve_timestep` (a cheap stand-in, or a short cached sequence of real
   states via `dev_cache.py`) — no need to pay for a real Radau/fsolve solve on every step
   just to validate the outer loop's own logic.
-- *Phase 2 (wet):* swap in the real `bvp_solver.solve_timestep`, seeded from a cached,
+- *Wet pass:* swap in the real `bvp_solver.solve_timestep`, seeded from a cached,
   already-relaxed `SimulationState` rather than re-running `solve_static_structure` +
   `relax_initial_state` for every test.
 
-**Deliverables (once unblocked):**
+**Deliverables:**
 - `run(n_steps, dt)`: `state_0 = bvp_solver.solve_static_structure()` → repeated
   `bvp_solver.solve_timestep(state_prev, dt)` calls — no bootstrap/kick step of any kind.
 - Energy equation stays in its pure implicit form (§4.8) — no added forcing term.
 - Log convergence status at each step; warn (do not raise) on soft convergence failures.
 - Store snapshots at configurable intervals.
-- **Dissociation halt check** (unchanged from the original design): after each solve,
-  compare `state.T[0]` against `config.T_DISSOCIATION_LIMIT`; if reached, save a final
-  snapshot, log step/time/$T_\text{center}$, and exit cleanly.
+- **Radius halt check** (replaces the dissociation halt — Stage 3 starts already past H2
+  dissociation, §1, so that boundary no longer applies to this loop's forward evolution):
+  after each solve, compare `state.r[-1]` against `config.R_HALT` (1.0 $R_\text{Jup}$); if
+  reached, save a final snapshot, log step/time/$r_\text{surface}$, and exit cleanly.
 - Remove `time_stepper.py`'s bootstrap dispatch (Sub-task 7).
 
-**Exit criterion (revised):** a clear, sustained, monotonic trend ($r_\text{surface}$
+**Exit criterion (revised):** a clear, sustained, monotonic trend — $r_\text{surface}$
 decreasing, $L_\text{surface}$ staying nonzero and not decaying back toward zero,
-$T_\text{center}$ increasing) over enough steps to be clearly above numerical noise — exact
-step count/$dt$ to be determined empirically once Sub-task 5 is unblocked and validated.
-Additionally verify the dissociation halt with an artificially-lowered
-`T_DISSOCIATION_LIMIT`.
+$T_\text{center}$ **decreasing** (Stage 3 is a cooling, degenerate-pressure-supported
+contraction track, not a non-degenerate pre-main-sequence one where central $T$ would rise
+as the star contracts — see PROGRESS.md for the virial-theorem argument) — over enough
+steps to be clearly above numerical noise; exact step count/$dt$ to be determined
+empirically. Additionally verify the radius halt with an artificially-raised `R_HALT`.
 
 **Not yet started in code** — `time_stepper.py` is unchanged from Sub-task 7's original implementation as of this writing.
 
@@ -690,9 +725,9 @@ Additionally verify the dissociation halt with an artificially-lowered
 
 **Goal:** Ensure numerical stability over long runs.
 
-**Development approach:** Phase 1 (sterile) — validate the thermal-timescale limiter's
+**Development approach:** sterile pass — validate the thermal-timescale limiter's
 step-size selection formula against a mock/cached sequence of states, no real solve needed
-to test the formula itself; Phase 2 (wet) — test against the real solver once Sub-task 8's
+to test the formula itself; wet pass — test against the real solver once Sub-task 8's
 loop is validated on its own.
 
 **Deliverables:**
@@ -729,6 +764,7 @@ loop is validated on its own.
 | 12 | Solid core inner BC: $m = M_\text{core} > 0$, $r = R_\text{core}$ fixed | `boundary_conditions.py` |
 | 13 | Accretion luminosity surface term | `boundary_conditions.py` + `time_stepper.py` |
 | 14 | Full non-ideal EOS (tabulated, e.g. SCvH-style) if Sub-task 2f's minimal degeneracy term proves insufficient | `eos.py` |
+| 15 | Model formation Stage 1 (the first hydrostatic core, ideal-gas-supported, $T_\text{center}<2000\,$K, $R\sim10^2$-$10^3\,R_\text{Jup}$) as a separate quasi-static contraction; combine with this project's Stage 3 track into one unified $R(t)$/$T_\text{center}(t)$ plot with a "black box" jump across Stage 2 (the dynamical collapse, not modeled) | New module (TBD) + `output.py` |
 
 ---
 
