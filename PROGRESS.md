@@ -57,7 +57,7 @@ remains the place for numerical trails and debugging history).
 | 3 | `gradients.py` (Schwarzschild criterion) | Done (includes the `L>=0` floor in `grad_radiative`, 2026-08-01) |
 | 4 | `odes.py` + `boundary_conditions.py` | Done (surface conditions revised, §5) |
 | 5 | `bvp_solver.py` ($t=0$ structure + relaxation to self-consistency) | **Done, verified end-to-end (2026-08-01)** — `solve_static_structure`, `relax_initial_state`, and `solve_timestep` all converge cleanly in sequence |
-| 6 | `diagnostics.py` | Ready to start — checks need rewriting for the compact/degenerate structure (§5 history), not yet begun |
+| 6 | `diagnostics.py` | **Done (2026-08-01)** — visual plots + virial theorem/opacity regime checks rewritten for the compact structure, all pass |
 | 7 | `time_stepper.py` time derivatives | Original bootstrap now obsolete; code not yet updated |
 | 8–10 | Outer time loop, adaptive dt, output | Not started — blocked on 5–7 |
 
@@ -182,6 +182,9 @@ directly re-derived or tested inside this codebase:**
   residuals $\lesssim10^{-8}$, producing a physically sensible first step.
 - `dev_cache.py` — pickle save/load for a `SimulationState`, for cheap iterative debugging
   of downstream logic without re-running the full solve chain.
+- `diagnostics.py` — visual plots (`plot_structure_profile`, `plot_mass_radius`,
+  `plot_convective_zones`) and the print report (`run_diagnostics`, virial balance now in
+  the correct unconfined form) all run cleanly against the real converged structure.
 
 ### What's blocked / not working
 
@@ -523,10 +526,16 @@ evaluated on the genuinely-relaxed state, that the fully-convective assumption
 `_adiabatic_rhs_logm` forces for the $t=0$ construction is physically justified for this
 object, not just a simplifying assumption.
 
-**Still unchanged/pending**: `virial_balance`'s pressure-confined form (written for Premise
-1's isothermal state) still needs rewriting to the standard unconfined form; the opacity
-regime census hasn't been re-checked against the new compact structure. See PLAN.md's
-Sub-task 6 entry.
+**Sub-task 6 now fully done (2026-08-01):** `virial_balance` rewritten to the standard
+unconfined form ($E_\text{grav}+3(\gamma-1)E_\text{therm}\approx0$, dropping the now
+~15-orders-of-magnitude-irrelevant `P_NEB` surface term entirely); `run_diagnostics`'s
+imbalance normalization updated to match (normalized against the terms actually being
+balanced, not the vanished surface term). Confirmed via the real `solve_static_structure()`
+output: $E_\text{grav}=-9.244\times10^{42}$, $3(\gamma-1)E_\text{therm}=+9.241\times10^{42}$
+erg, relative imbalance $3.6\times10^{-4}$. Opacity regime census re-checked against the real
+compact structure (no code change needed — `opacity_regime_distribution` was already
+regime-agnostic): center sits in "Metal grains" (T=1200K), surface in "Ice grains" (T=7.5K),
+confirming the expected multi-regime spread.
 
 ### `time_stepper.py` — time-derivative bridge between timesteps
 
@@ -535,20 +544,27 @@ Sub-task 6 entry.
 This is now understood to be **obsolete** (the bootstrap it computes is no longer needed —
 §1, PLAN.md's Sub-task 7 entry) but has not yet been edited; flagged here so the gap
 between "what the code does" and "what we now believe is correct" is explicit rather than
-silently inconsistent.
+silently inconsistent. **Confirmed broken as of 2026-08-01** (not just obsolete):
+`_bootstrap_time_derivatives` references `config.T_KH_BOOTSTRAP_S`, which no longer exists
+(renamed to `config.T_KH_TIMESCALE_S` earlier this session) — `validation.py`'s Check 30
+(the only caller) now raises `AttributeError` if run. Confirms this is genuinely Sub-task 7's
+job, not a documentation nicety.
 
 ### `validation.py` — sanity checks, unit consistency, and diagnostic plots
 
 See §4 below. **Not fully passing as of this writing** — several checks written for
 Premise 1's isothermal $t=0$ state are now stale relative to `bvp_solver.py`'s rewritten
 `solve_static_structure()`. **New this session:** Checks 33-36 (Sub-task 2f's EOS/degeneracy
-checks — reference point, asymptotic limits, round-trip inversion, visible $P(\rho)$ plot)
-were proposed, approved, implemented, and pass cleanly. **Still pending, not yet done:**
-Check 19 (`check_boundary_conditions_residuals`) still tests the *old*
-`P_b-P_\text{neb}$ mechanical residual formula — needs revision for the new photospheric one
-before it will even run without erroring against the current `boundary_conditions.py`; no
-new checks have been proposed yet for the photospheric condition or the (still-blocked)
-relaxation homotopy.
+checks) were implemented and pass cleanly (2026-07-27); Check 26 (renamed
+`check_virial_balance_unconfined`) and Check 27 (opacity regime distribution) were rewritten
+for the compact structure and now pass cleanly (2026-08-01, see the `diagnostics.py` entry
+above for the physical detail). **Still pending, not yet done:** Check 19
+(`check_boundary_conditions_residuals`) still tests the *old* `P_b-P_\text{neb}$ mechanical
+residual formula — needs revision for the new photospheric one before it will even run
+without erroring against the current `boundary_conditions.py`; Check 30
+(`check_bootstrap_time_derivatives_are_physical`) is confirmed broken (see `time_stepper.py`
+entry above) pending Sub-task 7's bootstrap removal; no new checks have been proposed for
+the photospheric condition or the relaxation homotopy.
 
 ### `main.py`, `ReadMe.txt`
 
@@ -629,6 +645,46 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-01 — Sub-task 6 completed: virial theorem rewritten (unconfined), opacity regime check updated
+
+Closes out the two remaining pieces of Sub-task 6 flagged when the visual plots were added
+earlier today. Planned and confirmed with real numbers before implementing (per request).
+
+**Virial theorem → standard unconfined form.** `diagnostics.virial_balance` dropped the
+`3*P_neb*V` surface-confinement term entirely (not just simplified — confirmed physically
+irrelevant: $3P_\text{neb}V\approx1.37\times10^{28}$ erg vs. $E_\text{grav}\approx
+-9.24\times10^{42}$ erg, a ~15-order-of-magnitude gap) and now reports
+$(E_\text{grav},E_\text{therm})$ for the standard zero-surface-pressure balance
+$E_\text{grav}+3(\gamma-1)E_\text{therm}\approx0$. `run_diagnostics` and `validation.py`'s
+Check 26 (renamed `check_virial_balance_unconfined`) both normalize the imbalance against
+the terms actually being balanced ($\max(|E_\text{grav}|,|3(\gamma-1)E_\text{therm}|)$)
+rather than the now-vanished surface term, which would have made the reported number
+physically meaningless. Measured on the real converged structure:
+$E_\text{grav}=-9.244\times10^{42}$, $3(\gamma-1)E_\text{therm}=+9.241\times10^{42}$ erg,
+relative imbalance $3.6\times10^{-4}$ — asserted `<1e-2` (~28x margin). Also replaced the
+old "commensurate with the surface term" sanity asserts with one checking $E_\text{grav}$
+and the thermal term are commensurate *with each other* (ratio $\approx1.0004$, confirming
+the near-cancellation is a genuine balance, not one term trivially dominating).
+
+**Opacity regime check → multi-regime, index-robust.** `diagnostics.opacity_regime_distribution`
+needed no code change (already regime-agnostic). `validation.py`'s Check 27 rewritten:
+rather than hardcoding today's exact regime indices (brittle against future
+`T_CENTER_INITIAL`/grid changes), asserts the physically-required *ordering* — center in a
+strictly hotter regime than the surface — and that more than one regime is populated.
+Measured: center (T=1200K) sits in "Metal grains," surface (T=7.5K) in "Ice grains," 99.5%/
+0.5% split.
+
+**Found and fixed in passing**: `validation.py`'s Check 30
+(`check_bootstrap_time_derivatives_are_physical`, testing the separately-obsolete bootstrap
+mechanism, Sub-task 7) also unpacked `virial_balance`'s old 3-tuple — updated the unpacking
+arity only (minimal, mechanical fix) so it doesn't crash on the new signature. Running it
+surfaced a genuinely separate, pre-existing bug: `time_stepper.py`'s bootstrap code still
+references `config.T_KH_BOOTSTRAP_S`, which was renamed to `T_KH_TIMESCALE_S` earlier this
+session — `time_stepper.py` was never updated. Confirmed via `grep`, not fixed (Sub-task 7's
+job, not in scope here) — see `time_stepper.py`'s module reference entry above.
+
+**Sub-task 6 is now done.** Both rewritten checks (26, 27) verified passing directly.
 
 ### 2026-08-01 — Sub-task 6 started: visual diagnostic plots for the relaxed $t=0$ structure
 

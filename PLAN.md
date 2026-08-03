@@ -585,28 +585,31 @@ photospheric condition, the relaxation homotopy, or the `L>=0` floor.
 
 ---
 
-#### Sub-task 6 — `diagnostics.py` — **UNBLOCKED (Sub-task 5 done, 2026-08-01), not yet started**
+#### Sub-task 6 — `diagnostics.py` — **✅ DONE (2026-08-01)**
 
 The existing checks (pressure-confined virial form, single-opacity-regime prediction) were
-written for Premise 1's isothermal, pressure-confined state and no longer apply once $t=0$
-is a compact, self-gravitating, differentiated structure:
+written for Premise 1's isothermal, pressure-confined state and no longer applied once $t=0$
+became a compact, self-gravitating, differentiated structure:
 
-- **Virial theorem → standard (unconfined) form expected.** A self-gravitating object with
-  negligible surface pressure (compact radius, $P_\text{neb}$ many orders of magnitude
-  below $P_\text{center}$) should satisfy the textbook
-  $E_\text{grav}+3(\gamma-1)E_\text{therm}\approx0$, not the pressure-confined form Premise
-  1 needed.
-- **Opacity regime distribution → multi-regime expected.** A hot center cooling to a
-  cold surface should span several Bell & Lin regimes, not sit entirely in "Ice grains."
+- **Virial theorem → standard (unconfined) form. Done.** `diagnostics.virial_balance`
+  rewritten: the `3*P_neb*V` surface term is dropped entirely (confirmed physically
+  irrelevant — ~15 orders of magnitude below the interior energy scale), reporting
+  $(E_\text{grav},E_\text{therm})$ for $E_\text{grav}+3(\gamma-1)E_\text{therm}\approx0$
+  instead. Measured on the real structure: relative imbalance $3.6\times10^{-4}$
+  (`validation.py` Check 26, renamed `check_virial_balance_unconfined`, asserts `<1e-2`).
+- **Opacity regime distribution → multi-regime. Done.** `validation.py` Check 27 rewritten
+  to assert the physically-required ordering (center strictly hotter regime than the
+  surface) and `>1` regime populated, rather than hardcoding today's exact indices.
+  Measured: center in "Metal grains" (T=1200K), surface in "Ice grains" (T=7.5K).
 - **Mass reconstruction check** (continuity-equation self-consistency, `diagnostics.
-  mass_reconstruction`) is regime-independent and should transfer directly once Sub-task 5
-  has a final structure to check.
+  mass_reconstruction`) is regime-independent and transferred directly — unchanged, no
+  revision needed.
 
-Revision deferred until Sub-task 5 produces a final, validated structure — Sub-task 5 is now
-done (above), so this revision is unblocked.
+Full numerical detail and the physical reasoning behind each fix: PROGRESS.md's 2026-08-01
+"Sub-task 6 completed" entry.
 
-**Visual diagnostic plots (added to scope 2026-08-01, per CLAUDE.md's stated preference for
-a visible check over a print-only one):** `run_diagnostics`'s existing report is print-only;
+**Visual diagnostic plots. Done (2026-08-01), per CLAUDE.md's stated preference for a
+visible check over a print-only one.** `run_diagnostics`'s report is print-only;
 for a converged structure this compact and differentiated, seeing the profiles is more
 informative than scalar summaries alone. Three plots, each taking a `SimulationState` and an
 `output_path`, matching `validation.py`'s existing `plt.subplots`/`savefig` house style:
@@ -742,9 +745,9 @@ loop is validated on its own.
 | 2f | `eos.py` non-ideal EOS (electron degeneracy) | 2a | Analytic/semi-analytic check: compact radius at reasonable $T_\text{center}$ | Done (2026-07-27) |
 | 3 | `gradients.py` | 2c | Schwarzschild switch correct over full T range | Done |
 | 4 | `odes.py`, `boundary_conditions.py` | 1–3 | Dimensional consistency check | Done |
-| **5a** | **`bvp_solver.py` outer BC redesign (photospheric, replaces $P=P_\text{neb}$)** | **2f, 4** | **Compact structure reaches a physically-motivated surface condition, not a $\sim10^7$ relative residual** | **Next milestone — design under review** |
-| 5 | `bvp_solver.py` ($t=0$, compact hot start) | 4, 2f, **5a** | Compact, self-consistent $t=0$ structure | Blocked on 5a |
-| 6 | `diagnostics.py` | 5 | Standard (unconfined) virial theorem; multi-regime opacity | Blocked on 5 |
-| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Blocked on 5–6 |
-| 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation | Blocked on 7–8 |
-| 10 | `output.py` | all | Reproducible plots from `.npz` | Blocked on 7–8 |
+| **5a** | **`bvp_solver.py` outer BC redesign (photospheric, replaces $P=P_\text{neb}$)** | **2f, 4** | **Compact structure reaches a physically-motivated surface condition, not a $\sim10^7$ relative residual** | **Done (2026-07-27)** |
+| 5 | `bvp_solver.py` ($t=0$, compact hot start + relaxation to self-consistency) | 4, 2f, 5a | Compact, self-consistent $t=0$ structure; `solve_timestep` converges from it with a small residual | **Done, verified end-to-end (2026-08-01)** |
+| 6 | `diagnostics.py` | 5 | Standard (unconfined) virial theorem; multi-regime opacity; visual profile plots | **Done (2026-08-01)** |
+| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Not started — blocked on 6 (unblocked now; confirmed broken pending removal, see PROGRESS.md) |
+| 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation | Not started — blocked on 7–8 |
+| 10 | `output.py` | all | Reproducible plots from `.npz` | Not started — blocked on 7–8 |

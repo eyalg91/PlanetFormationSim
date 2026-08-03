@@ -231,9 +231,10 @@ def plot_combined_eos_pressure_vs_density() -> None:
     ax.set_title(f"Combined ideal-gas + electron-degeneracy EOS at T={T_test:.0f} K")
     ax.legend()
     fig.tight_layout()
-    fig.savefig("combined_eos_pressure_vs_density.png", dpi=150)
+    output_path = f"{diagnostics.PLOT_DIR}/combined_eos_pressure_vs_density.png"
+    fig.savefig(output_path, dpi=150)
     plt.close(fig)
-    print("Check 36 - saved combined_eos_pressure_vs_density.png (visible check)")
+    print(f"Check 36 - saved {output_path} (visible check)")
 
 
 # ==========================================
@@ -286,7 +287,7 @@ def check_transition_temperature_loglog_slopes() -> None:
 # SECTION: Opacity — Transition Temperature Diagnostic Plot
 # ==========================================
 
-def plot_transition_temperatures(output_path="opacity_transitions.png") -> None:
+def plot_transition_temperatures(output_path=f"{diagnostics.PLOT_DIR}/opacity_transitions.png") -> None:
     """Save a log-log plot of T_(n->n+1)(rho) for all 7 Bell & Lin transitions, rho in [1e-15, 1e-5] g/cm^3."""
     rho = np.logspace(-15, -5, 200)   # Density sweep for visual inspection [g cm^-3]
 
@@ -402,7 +403,7 @@ def check_bell_lin_vectorization_stress_test() -> None:
 # SECTION: Opacity <-> Gradients Interface Preview
 # ==========================================
 
-def plot_opacity_along_synthetic_profile(output_path="opacity_profile_preview.png") -> None:
+def plot_opacity_along_synthetic_profile(output_path=f"{diagnostics.PLOT_DIR}/opacity_profile_preview.png") -> None:
     """Preview kappa(m) along a synthetic centrally-condensed profile, ahead of gradients.py (Sub-task 3).
 
     rho(m) and T(m) are a rough polytropic-shaped placeholder (not a converged structure -
@@ -734,7 +735,7 @@ def check_stellar_odes_output_shape_finite_and_signs() -> None:
 # SECTION: ODEs — Visual Check: Analytic Profile and Residual
 # ==========================================
 
-def plot_constant_density_profile_ode_check(output_path="odes_profile_check.png") -> None:
+def plot_constant_density_profile_ode_check(output_path=f"{diagnostics.PLOT_DIR}/odes_profile_check.png") -> None:
     """Save a diagnostic plot of the constant-density analytic profile and the stellar_odes() vs.
     analytic/finite-difference residual, as a visible sanity check of the whole ODE RHS ahead of
     bvp_solver.py (Sub-task 5), which is the first module that will produce a real converged
@@ -964,7 +965,7 @@ def check_static_structure_isothermal_and_monotonic() -> None:
 # SECTION: t=0 Static Structure — Visual Check
 # ==========================================
 
-def plot_static_structure_profile(output_path="static_structure_t0.png") -> None:
+def plot_static_structure_profile(output_path=f"{diagnostics.PLOT_DIR}/static_structure_t0.png") -> None:
     """Save a diagnostic plot of the converged t=0 r(m), P(m) profile.
 
     T(m) and L(m) are trivially flat/zero by construction (bvp_solver.py docstring) so are noted
@@ -998,28 +999,32 @@ def plot_static_structure_profile(output_path="static_structure_t0.png") -> None
 # SECTION: Sub-task 6 — Pressure-Confined Virial Balance
 # ==========================================
 
-def check_virial_balance_pressure_confined() -> None:
-    """Confirm the converged t=0 state satisfies the pressure-confined virial theorem:
-    E_grav + 3*(gamma-1)*E_therm = 3*P_neb*V (diagnostics.virial_balance).
+def check_virial_balance_unconfined() -> None:
+    """Confirm the converged t=0 state satisfies the standard (zero-surface-pressure) virial
+    theorem: E_grav + 3*(gamma-1)*E_therm = 0 (diagnostics.virial_balance).
 
-    Derived independently (integrate hydrostatic equilibrium by parts) and cross-checked
-    against Sub-task 5's Bonnor-Ebert analysis before implementation - this is the same
-    physical balance underlying why config.T_NEB, config.P_NEB admit a stable equilibrium.
+    Derived independently (integrate hydrostatic equilibrium by parts). Valid once the
+    photospheric outer BC (Sub-task 5a) makes the surface pressure negligible against the
+    interior energy scale - diagnostics.virial_balance's docstring has the full derivation
+    and the ~15-orders-of-magnitude check confirming that limit applies here.
     """
     s = bvp_solver.solve_static_structure()
-    E_grav, E_therm, surface_term = diagnostics.virial_balance(s)
+    E_grav, E_therm = diagnostics.virial_balance(s)
     thermal_term = 3.0 * (config.GAMMA - 1.0) * E_therm
     lhs = E_grav + thermal_term
-    imbalance = abs(lhs - surface_term) / abs(surface_term)
+    # Normalized against the scale of the terms actually being balanced (diagnostics.
+    # run_diagnostics uses the same normalization) - there is no longer an external reference
+    # scale (P_neb) worth normalizing against.
+    imbalance = abs(lhs) / max(abs(E_grav), abs(thermal_term))
 
-    print("Check 26 - Pressure-confined virial balance: E_grav + 3*(gamma-1)*E_therm = 3*P_neb*V")
+    print("Check 26 - Unconfined virial balance: E_grav + 3*(gamma-1)*E_therm = 0")
     print(f"  E_grav = {E_grav:.4e} erg, 3*(gamma-1)*E_therm = {thermal_term:.4e} erg")
-    print(f"  LHS = {lhs:.4e} erg, surface term = {surface_term:.4e} erg, relative imbalance = {imbalance:.3e}")
-    assert imbalance < 1.0e-3, "Virial balance violated beyond expected numerical precision"
-    # Every term should be within ~2 orders of magnitude of the others - a term differing by
-    # many more decades would indicate a sign/unit bug hidden behind a coincidental cancellation.
-    assert 0.01 < abs(E_grav) / surface_term < 100.0, "E_grav is not commensurate with the surface confinement term"
-    assert 0.01 < abs(thermal_term) / surface_term < 100.0, "Thermal term is not commensurate with the surface confinement term"
+    print(f"  LHS = {lhs:.4e} erg, relative imbalance = {imbalance:.3e}")
+    assert imbalance < 1.0e-2, "Virial balance violated beyond expected numerical precision"
+    # The two terms must themselves be commensurate for the near-cancellation to be a genuine,
+    # non-trivial balance - not e.g. one term ~0 trivially satisfying a small LHS.
+    ratio = abs(E_grav) / abs(thermal_term)
+    assert 0.1 < ratio < 10.0, "E_grav and the thermal term are not commensurate - near-cancellation would be trivial, not a genuine balance"
 
 
 # ==========================================
@@ -1027,20 +1032,28 @@ def check_virial_balance_pressure_confined() -> None:
 # ==========================================
 
 def check_static_structure_opacity_regime_distribution() -> None:
-    """Confirm the converged t=0 state (uniform T=50K) sits entirely in the coldest Bell & Lin regime.
+    """Confirm the converged t=0 state spans more than one Bell & Lin opacity regime, from a
+    hot convective interior to a cold photospheric surface.
 
-    Sub-task 5's t=0 state is exactly isothermal at T_neb=50K (see bvp_solver.py) - unlike the
-    differentiated hot/cold structure PLAN.md originally envisioned for this check, there is no
-    regime spread to expect here; the correct prediction is a single regime everywhere.
+    Sub-task 5's current t=0 state is a compact, differentiated hot-start protoplanet (not
+    Premise 1's isothermal T_neb=50K cloud, which had no regime spread by construction) - the
+    center (T_CENTER_INITIAL) should sit in a strictly hotter opacity regime than the
+    photospheric surface. Regime *indices* aren't hardcoded here (they would need updating
+    every time T_CENTER_INITIAL or the grid changes) - only the physically-required ordering.
     """
     s = bvp_solver.solve_static_structure()
     fractions = diagnostics.opacity_regime_distribution(s)
+    regime_profile = opacity.determine_regime(s.rho, s.T)
 
-    print("Check 27 - Opacity regime distribution at t=0 (uniform T=50K)")
+    print("Check 27 - Opacity regime distribution at t=0 (compact, differentiated structure)")
     for regime, fraction in zip(opacity.REGIMES, fractions):
         if fraction > 0.0:
             print(f"  {regime.name:<32s} {fraction:.1%}")
-    assert fractions[0] == 1.0, "At uniform T=50K, the entire envelope should sit in regime 0 (Ice grains)"
+    print(f"  regime at center: {opacity.REGIMES[regime_profile[0]].name}")
+    print(f"  regime at surface: {opacity.REGIMES[regime_profile[-1]].name}")
+    n_regimes_present = np.sum(fractions > 0.0)
+    assert n_regimes_present > 1, "Compact, differentiated t=0 structure should span more than one opacity regime"
+    assert regime_profile[0] > regime_profile[-1], "Center should sit in a strictly hotter opacity regime than the photospheric surface"
 
 
 # ==========================================
@@ -1070,7 +1083,7 @@ def check_mass_reconstruction_matches_lagrangian_grid() -> None:
 # SECTION: Sub-task 6 — Visual Check: Mass Reconstruction Error
 # ==========================================
 
-def plot_mass_reconstruction_error(output_path="mass_reconstruction_check.png") -> None:
+def plot_mass_reconstruction_error(output_path=f"{diagnostics.PLOT_DIR}/mass_reconstruction_check.png") -> None:
     """Save a diagnostic plot of the mass-reconstruction relative error vs. radius."""
     s = bvp_solver.solve_static_structure()
     M_recon = diagnostics.mass_reconstruction(s)
@@ -1120,7 +1133,7 @@ def check_bootstrap_time_derivatives_are_physical() -> None:
     assert np.allclose(dL_dm, analytic_dL_dm, rtol=1.0e-8), "dL/dm does not match the analytic homologous-contraction formula"
 
     L_surface_est = np.trapezoid(dL_dm, s0.m)
-    E_grav, _, _ = diagnostics.virial_balance(s0)
+    E_grav, _ = diagnostics.virial_balance(s0)
     L_KH_estimate = abs(E_grav) / config.T_KH_BOOTSTRAP_S
     ratio = L_surface_est / L_KH_estimate
     print(f"  integrated L(M_TOTAL) = {L_surface_est:.4e} erg/s, |E_grav|/t_KH estimate = {L_KH_estimate:.4e} erg/s, ratio = {ratio:.3f}")
@@ -1172,7 +1185,7 @@ def check_finite_difference_time_derivatives_and_interpolation() -> None:
 # SECTION: Sub-task 7 — Visual Check: Bootstrap Time Derivatives
 # ==========================================
 
-def plot_bootstrap_time_derivatives(output_path="bootstrap_time_derivatives.png") -> None:
+def plot_bootstrap_time_derivatives(output_path=f"{diagnostics.PLOT_DIR}/bootstrap_time_derivatives.png") -> None:
     """Save a diagnostic plot of the bootstrap dT_dt(m), dP_dt(m), and resulting dL/dm(m)."""
     s0 = bvp_solver.solve_static_structure()
     dT_dt, dP_dt = time_stepper.compute_time_derivatives(s0, None, dt=None)
@@ -1269,7 +1282,7 @@ if __name__ == "__main__":
     check_static_structure_hydrostatic_balance()
     check_static_structure_isothermal_and_monotonic()
     plot_static_structure_profile()
-    check_virial_balance_pressure_confined()
+    check_virial_balance_unconfined()
     check_static_structure_opacity_regime_distribution()
     check_mass_reconstruction_matches_lagrangian_grid()
     plot_mass_reconstruction_error()

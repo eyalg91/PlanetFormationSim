@@ -14,24 +14,27 @@ import eos
 import gradients
 import opacity
 
+PLOT_DIR = "diagnostic_plots"   # all diagnostic PNGs save here by default, not the project root
+
 # ==========================================
-# SECTION: Generalized Virial Balance (Pressure-Confined)
+# SECTION: Generalized Virial Balance (Unconfined)
 # ==========================================
 
 def virial_balance(state):
-    """(E_grav, E_therm, surface_term) [erg] for a pressure-confined ideal-gas envelope.
+    """(E_grav, E_therm) [erg] for a self-gravitating ideal-gas envelope with negligible
+    surface pressure.
 
-    The standard zero-surface-pressure virial theorem (2*E_therm + E_grav = 0 for a monatomic
-    gas) does not apply here: P_neb is not negligible - it is the entire reason the envelope
-    has its size and structure (Bonnor-Ebert confinement, PLAN.md Sec 4.6). Integrating
-    hydrostatic equilibrium dP/dr = -G*m*rho/r^2 by parts over the envelope instead gives the
-    pressure-confined form (derivation: multiply by 4*pi*r^3, integrate 0 to R, integrate the
-    dP/dr term by parts):
-    E_grav + 3*(gamma-1)*E_therm = 3*P_neb*V   [erg]
-    which is exactly the Bonnor-Ebert virial balance already used to validate Sub-task 5's
-    T_NEB/P_NEB (PROGRESS.md); this function reports its three terms rather than asserting
-    the balance itself (see run_diagnostics), since the point is to see which physical term
-    dominates, not to chase numerical precision for its own sake.
+    Integrating hydrostatic equilibrium dP/dr = -G*m*rho/r^2 by parts over the envelope
+    (multiply by 4*pi*r^3, integrate 0 to R, integrate the dP/dr term by parts) gives
+    E_grav + 3*(gamma-1)*E_therm = 4*pi*R^3*P_surface. Under Sub-task 5's photospheric outer
+    BC, P_surface (~1e4 dyn/cm^2) is ~15 orders of magnitude below the interior energy scale
+    (E_grav, E_therm ~1e42-1e43 erg for this structure), so the standard zero-surface-pressure
+    limit applies:
+    E_grav + 3*(gamma-1)*E_therm = 0   [erg]
+    (reduces to the familiar 2*E_therm + E_grav = 0 only for a monatomic gas, gamma=5/3; kept
+    general in gamma here since config.GAMMA=1.4). This function reports the two terms rather
+    than asserting the balance itself (see run_diagnostics), since the point is to see the
+    terms are commensurate and nearly cancel, not to chase numerical precision for its own sake.
     """
     # Gravitational self-energy, built up shell by shell: E_grav = -integral G*m/r dm   [erg]
     E_grav = -np.trapezoid(config.G * state.m / state.r, state.m)
@@ -40,12 +43,7 @@ def virial_balance(state):
     # = 1/(gamma-1) * integral (P/rho) dm   [erg]
     E_therm = np.trapezoid(state.P / state.rho, state.m) / (config.GAMMA - 1.0)
 
-    # Surface confinement term: 3*P_neb*V, V = (4/3)*pi*R_surface^3   [erg]
-    R_surface = state.r[-1]
-    V = (4.0 / 3.0) * np.pi * R_surface**3
-    surface_term = 3.0 * config.P_NEB * V
-
-    return E_grav, E_therm, surface_term
+    return E_grav, E_therm
 
 
 # ==========================================
@@ -84,16 +82,19 @@ def mass_reconstruction(state):
 
 def run_diagnostics(state) -> None:
     """Print a physical diagnostic report for a converged SimulationState."""
-    E_grav, E_therm, surface_term = virial_balance(state)
-    lhs = E_grav + 3.0 * (config.GAMMA - 1.0) * E_therm
-    imbalance = abs(lhs - surface_term) / abs(surface_term)
+    E_grav, E_therm = virial_balance(state)
+    thermal_term = 3.0 * (config.GAMMA - 1.0) * E_therm
+    lhs = E_grav + thermal_term
+    # Normalized against the scale of the terms actually being balanced, not an external
+    # reference - P_neb is now ~15 orders of magnitude below the interior energy scale
+    # (diagnostics.virial_balance docstring), so normalizing against it would be meaningless.
+    imbalance = abs(lhs) / max(abs(E_grav), abs(thermal_term))
 
     print(f"diagnostics: t = {state.t:.4e} s")
-    print("  Virial balance: E_grav + 3*(gamma-1)*E_therm = 3*P_neb*V")
+    print("  Virial balance (unconfined): E_grav + 3*(gamma-1)*E_therm = 0")
     print(f"    E_grav               = {E_grav:.4e} erg")
-    print(f"    3*(gamma-1)*E_therm  = {3.0 * (config.GAMMA - 1.0) * E_therm:.4e} erg")
+    print(f"    3*(gamma-1)*E_therm  = {thermal_term:.4e} erg")
     print(f"    LHS total            = {lhs:.4e} erg")
-    print(f"    3*P_neb*V (surface)  = {surface_term:.4e} erg")
     print(f"    relative imbalance   = {imbalance:.3e}")
 
     regime_fractions = opacity_regime_distribution(state)
@@ -116,7 +117,7 @@ def run_diagnostics(state) -> None:
 # themselves are more informative. Each function takes a SimulationState and an output_path,
 # matching validation.py's existing plt.subplots/savefig house style.
 
-def plot_structure_profile(state, output_path="structure_profile.png") -> None:
+def plot_structure_profile(state, output_path=f"{PLOT_DIR}/structure_profile.png") -> None:
     """Temperature, density, and pressure vs Lagrangian mass coordinate - the primary visual
     sanity check on a converged structure."""
     x = state.m / config.M_TOTAL
@@ -143,7 +144,7 @@ def plot_structure_profile(state, output_path="structure_profile.png") -> None:
     print(f"Saved structure profile plot to {output_path}")
 
 
-def plot_mass_radius(state, output_path="mass_radius.png") -> None:
+def plot_mass_radius(state, output_path=f"{PLOT_DIR}/mass_radius.png") -> None:
     """Enclosed mass vs radius - shows how mass concentrates toward the center for this
     degenerate-supported structure (most of M_TOTAL sits well inside the outer radius)."""
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -159,7 +160,7 @@ def plot_mass_radius(state, output_path="mass_radius.png") -> None:
     print(f"Saved mass-radius plot to {output_path}")
 
 
-def plot_convective_zones(state, output_path="convective_zones.png") -> None:
+def plot_convective_zones(state, output_path=f"{PLOT_DIR}/convective_zones.png") -> None:
     """nabla_rad(m) vs nabla_ad (Schwarzschild criterion, gradients.effective_gradient), with
     convective zones shaded - visually confirms which layers are convective vs radiative.
 
@@ -191,7 +192,7 @@ def plot_convective_zones(state, output_path="convective_zones.png") -> None:
     print(f"Saved convective/radiative zone plot to {output_path}")
 
 
-def plot_diagnostics(state, output_dir=".") -> None:
+def plot_diagnostics(state, output_dir=PLOT_DIR) -> None:
     """Generate all three visual diagnostic plots for a converged SimulationState."""
     plot_structure_profile(state, f"{output_dir}/structure_profile.png")
     plot_mass_radius(state, f"{output_dir}/mass_radius.png")
