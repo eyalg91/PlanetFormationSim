@@ -31,7 +31,7 @@ import warnings
 
 import numpy as np
 from scipy.integrate import solve_ivp
-from scipy.optimize import brentq, fsolve
+from scipy.optimize import brentq, root
 
 import boundary_conditions
 import config
@@ -272,6 +272,14 @@ def solve_static_structure() -> state.SimulationState:
 
     m_surface = np.exp(sol.t_events[0][0])
     residual_norm = abs(m_surface - config.M_TOTAL) / config.M_TOTAL
+    # brentq is bracket-based (the true root stays trapped between P_low, P_high throughout,
+    # unlike fsolve's step-size-only ier==1 - PROGRESS.md 2026-08-01), so this is a lower-risk
+    # case, but the same "verify, don't just trust the root-finder's own report" discipline
+    # applies - a cheap, direct check on the residual itself.
+    assert residual_norm <= config.STATIC_STRUCTURE_RESIDUAL_TOL, (
+        f"solve_static_structure: brentq converged but mass residual {residual_norm:.3e} "
+        f"exceeds config.STATIC_STRUCTURE_RESIDUAL_TOL={config.STATIC_STRUCTURE_RESIDUAL_TOL:.1e}"
+    )
 
     m = _build_output_grid(m_min, m_surface)
     r, lnP, lnT = sol.sol(np.log(m))
@@ -371,18 +379,54 @@ def relax_initial_state(state_0) -> state.SimulationState:
     alpha=1 (the real target), using each step's converged (P_center, T_center) to warm-start
     the next.
 
-    Convergence criteria: each pseudo-step's fsolve call must report ier==1 or the function
-    raises immediately (a failed step means the alpha spacing should be made finer, not pushed
-    through); the achieved [mass, thermal] residual is printed each step for a visible audit
-    trail; a >50% (P_center, T_center) jump between consecutive steps is flagged as a possible
+    Convergence criteria: each pseudo-step's root-find (scipy.optimize.root, method="lm" -
+    see ASSUMPTION below for why not fsolve's default hybrd) must report success AND an
+    independently-verified residual below config.RESIDUAL_TOL, or the step is rejected and
+    retried at a smaller alpha step (see ADAPTIVE STEPPING below) - a failed step no longer
+    raises immediately unless even the minimum step size fails. The achieved [mass, thermal]
+    residual is printed for every attempt (successful or not) for a visible audit trail; a
+    >50% (P_center, T_center) jump between consecutive steps is flagged as a possible
     solution-branch jump.
+
+    ADAPTIVE STEPPING (2026-08-01, PROGRESS.md has the full motivating trail): replaces the
+    original fixed 11-step grid. Two independent root-find algorithms (hybrd and LM)
+    converged to the identical non-zero residual attempting the alpha=0.0->0.1 jump directly
+    - evidence that a fixed step of 0.1 is genuinely too large for a local Newton/Gauss-
+    Newton-type step to bridge at this T_CENTER_INITIAL, not a solver-choice problem.
+    Standard numerical-continuation practice (parameter-continuation software; MESA/Henyey-
+    code relaxation) for a homotopy whose local difficulty varies along the path: try a
+    target step, halve and retry from the last genuinely-converged state on failure, grow
+    back toward the target after success so easy stretches aren't crawled through
+    unnecessarily. A minimum step floor raises loudly rather than halving forever.
     """
-    n_ramp_steps = 11   # alpha = 0.0, 0.1, ..., 1.0 - deliberately simple/auditable fixed spacing
+    alpha_step_target = 0.1   # nominal/target step - also the ceiling step recovery grows back toward
+    # ASSUMPTION: 1e-4 (used until 2026-08-06) was an arbitrary safety floor, not derived from
+    # any genuine numerical limit. After fixing the L>=0 floor's kink (gradients.py, see
+    # config.GRAD_RAD_L_FLOOR_EPSILON), a separate, much narrower difficult patch was found
+    # near alpha~0.0508: the adaptive stepper hit this floor and raised, but a direct probe
+    # past it (PROGRESS.md 2026-08-06 has the full trace) showed the residual continuing to
+    # shrink smoothly and monotonically well below 1e-4 step sizes (converging cleanly by
+    # step~1e-5) - the textbook signature of a well-conditioned root that just needed a finer
+    # step, NOT a plateau (contrast with the genuine kink's signature: residual frozen at a
+    # fixed value regardless of step size, PROGRESS.md 2026-08-01/2026-08-06). Tightened based
+    # on that direct evidence, not assumed; kept well above machine precision so a genuine
+    # unreachable root still raises rather than looping toward xtol-level step sizes.
+    alpha_step_min = 1.0e-6   # safety floor - below this, raise rather than halve indefinitely
     dt_relax = 0.01 * config.T_KH_TIMESCALE_S   # pseudo-timestep; not real elapsed time (t is left unchanged below)
 
     m_min = config.M_MIN_FRACTION * config.M_TOTAL
     x_span = (np.log(m_min), np.log(50.0 * config.M_TOTAL))
     r_start = state_0.r[0]
+    # ASSUMPTION: a fixed Kelvin-Helmholtz-timescale luminosity estimate, NOT the trial's own
+    # photospheric L - tried self-scaling by the trial's own L instead (2026-08-01) and it
+    # made things WORSE, not better: at T_CENTER_INITIAL=13000K this fixed estimate
+    # (~2.6e29 erg/s) is actually ~78x LARGER than the genuine converged L (~3.4e27 erg/s),
+    # so switching to the trial's own L as the denominator shrinks it, not grows it -
+    # backwards from the intended fix, and it also introduced a new near-zero-denominator
+    # risk during fsolve's own internal probing. The real conditioning problem (PROGRESS.md
+    # 2026-08-01) is that the RAW thermal-residual/T_center sensitivity is enormous in this
+    # regime, independent of which constant divides it - a normalization choice can't fix
+    # that; see the residual-magnitude safety-net check below instead.
     L_scale = config.G * config.M_TOTAL**2 / (state_0.r[-1] * config.T_KH_TIMESCALE_S)
 
     def residual(u, alpha):
@@ -406,24 +450,85 @@ def relax_initial_state(state_0) -> state.SimulationState:
     # same adiabat by construction), so the difference is floating-point noise, not a genuine
     # solution-boundary failure.
     u = np.array([np.log(state_0.P[0]), np.log(state_0.T[0])]) * (1.0 + 1.0e-6)
-    for alpha in np.linspace(0.0, 1.0, n_ramp_steps):
-        u_prev = u.copy()
-        u, _info, ier, msg = fsolve(lambda u_trial: residual(u_trial, alpha), u, xtol=config.BVP_TOL, full_output=True)
-        if ier != 1:
-            raise RuntimeError(f"relax_initial_state: pseudo-step alpha={alpha:.3f} failed to converge (ier={ier}): {msg}")
 
-        jump = np.max(np.abs(u - u_prev))   # ln-space, so this is a relative-change measure
-        if alpha > 0.0 and jump > np.log(1.5):
-            warnings.warn(
-                f"relax_initial_state: (P_center, T_center) jumped >50% between alpha steps "
-                f"(alpha={alpha:.3f}) - possible solution-branch jump, not just smooth "
-                f"continuation; inspect before trusting this relaxation run", RuntimeWarning
+    # ASSUMPTION: Levenberg-Marquardt (MINPACK lmdif/lmder), not fsolve's default hybrd -
+    # hybrd's ONLY convergence criterion is xtol (relative step size between iterates); it
+    # has no ftol option at all, and reported ier==1 (2026-08-01, PROGRESS.md) even while the
+    # residual stayed frozen at ~1.3e-2, three orders above tolerance. LM's ftol (relative
+    # reduction in the sum of squares - a genuine, tunable criterion on the residual itself,
+    # not just the parameters) and its adaptively-damped Gauss-Newton/gradient-descent steps
+    # are the standard, textbook choice for a badly row-scaled Jacobian. ftol is a RELATIVE-
+    # progress criterion, not a literal "stop when |residual|<ftol" guarantee, so the
+    # explicit RESIDUAL_TOL check below remains the real, uncompromisable backstop regardless
+    # of which criterion LM itself stops on - confirmed necessary in practice, not
+    # theoretical: switching to LM alone did NOT resolve the alpha=0.0->0.1 stall (PROGRESS.md
+    # 2026-08-01), which is what motivated the adaptive stepping below.
+    alpha = 0.0
+    step = alpha_step_target
+    n_attempts = 0
+    max_attempts = 1000   # hard backstop against an unforeseen infinite loop - the step-floor
+                           # check below is the primary, expected termination guarantee; this
+                           # is only extra defense-in-depth, not expected to bind
+    while alpha < 1.0:
+        n_attempts += 1
+        if n_attempts > max_attempts:
+            raise RuntimeError(
+                f"relax_initial_state: exceeded {max_attempts} adaptive-step attempts without "
+                f"reaching alpha=1.0 (stuck at alpha={alpha:.6f}) - should be structurally "
+                f"impossible given the step floor; investigate rather than raise this cap"
             )
 
-        res_mass, res_L = residual(u, alpha)
-        print(f"bvp_solver: relaxation pseudo-step alpha={alpha:.3f} converged, "
-              f"P_center={np.exp(u[0]):.6e}, T_center={np.exp(u[1]):.6e} K, "
-              f"residuals=[{res_mass:.3e}, {res_L:.3e}]")
+        alpha_trial = min(alpha + step, 1.0)
+        u_prev = u.copy()
+        try:
+            opt_result = root(lambda u_trial: residual(u_trial, alpha_trial), u, method="lm",
+                               options={"xtol": config.BVP_TOL, "ftol": config.RESIDUAL_TOL})
+            res_mass, res_L = opt_result.fun
+            max_residual = max(abs(res_mass), abs(res_L))
+            step_ok = opt_result.success and max_residual <= config.RESIDUAL_TOL
+        except RuntimeError as e:
+            # ASSUMPTION: NOT a blind catch-all - residual() raises RuntimeError for exactly
+            # one well-understood, anticipated case (the trial integration doesn't reach the
+            # photosphere at all, a real possibility when LM's own internal probing tries an
+            # aggressive step). A legitimate "this attempt failed, retry smaller" signal for
+            # the adaptive stepper, not a hidden failure - if step-halving can't recover
+            # either, the loop still raises loudly via the step-floor check below.
+            step_ok = False
+            res_mass = res_L = None
+            print(f"bvp_solver: relaxation step alpha={alpha:.4f}->{alpha_trial:.4f} "
+                  f"(step={step:.2e}) raised during root-find: {e}")
+
+        if step_ok:
+            u = opt_result.x
+            jump = np.max(np.abs(u - u_prev))   # ln-space, so this is a relative-change measure
+            if alpha_trial > 0.0 and jump > np.log(1.5):
+                warnings.warn(
+                    f"relax_initial_state: (P_center, T_center) jumped >50% between alpha "
+                    f"steps (alpha={alpha_trial:.4f}) - possible solution-branch jump, not "
+                    f"just smooth continuation; inspect before trusting this relaxation run",
+                    RuntimeWarning
+                )
+            print(f"bvp_solver: relaxation pseudo-step alpha={alpha_trial:.4f} converged "
+                  f"(step={step:.4f}), P_center={np.exp(u[0]):.6e}, T_center={np.exp(u[1]):.6e} K, "
+                  f"residuals=[{res_mass:.3e}, {res_L:.3e}]")
+            alpha = alpha_trial
+            step = min(step * 2.0, alpha_step_target)   # step recovery, capped at the nominal target
+        else:
+            step /= 2.0
+            if step < alpha_step_min:
+                raise RuntimeError(
+                    f"relax_initial_state: adaptive alpha-step fell below the minimum floor "
+                    f"({alpha_step_min:.1e}) trying to advance past alpha={alpha:.6f} - could "
+                    f"not find a convergent step even at minimum resolution; the true root may "
+                    f"be genuinely unreachable via local continuation from this point"
+                )
+            if res_mass is not None:
+                print(f"bvp_solver: relaxation step alpha={alpha:.4f}->{alpha_trial:.4f} FAILED "
+                      f"(residual [{res_mass:.3e}, {res_L:.3e}] exceeds "
+                      f"config.RESIDUAL_TOL={config.RESIDUAL_TOL:.1e}), halving step to {step:.2e}")
+            else:
+                print(f"bvp_solver: relaxation step alpha={alpha:.4f}->{alpha_trial:.4f} FAILED "
+                      f"(see error above), halving step to {step:.2e}")
 
     P_center, T_center = np.exp(u)
     sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_0, dt_relax, 1.0)
@@ -454,16 +559,21 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
     x_span = (np.log(m_min), np.log(50.0 * config.M_TOTAL))
     r_start = state_prev.r[0]
 
-    # Seed fsolve from state_prev's own (P_center, T_center), nudged by a tiny (1e-6) relative
+    # Seed the root-find from state_prev's own (P_center, T_center), nudged by a tiny (1e-6) relative
     # amount - state_prev is itself a converged solution, so without the nudge the trial and
     # state_prev coincide to near machine precision right at the seed, and dT_dt=(T-T_prev)/dt
     # amplifies that floating-point noise into a spurious blow-up (same catastrophic-
     # cancellation mechanism as relax_initial_state's identical seed nudge).
     u0 = np.array([np.log(state_prev.P[0]), np.log(state_prev.T[0])]) * (1.0 + 1.0e-6)
 
-    # Characteristic luminosity scale (Kelvin-Helmholtz estimate for this object) to
-    # non-dimensionalize the radiative-flux residual, which is otherwise on a wildly different
-    # absolute scale (~1e25+ erg/s) than the O(1) mass residual.
+    # ASSUMPTION: fixed Kelvin-Helmholtz-timescale estimate, not the trial's own photospheric
+    # L - see relax_initial_state's matching note (PROGRESS.md 2026-08-01): self-scaling by
+    # the trial's own L was tried and made things worse (the fixed estimate is actually
+    # *larger* than genuine converged L at hot starting points, so switching denominators
+    # shrinks rather than grows the normalized residual - backwards from intended). The raw
+    # thermal-residual/T_center sensitivity is enormous in this regime regardless of the
+    # normalization constant; the residual-magnitude safety-net check below is the real
+    # defense, not this choice of scale.
     L_scale = config.G * config.M_TOTAL**2 / (state_prev.r[-1] * config.T_KH_TIMESCALE_S)
 
     def residual(u):
@@ -481,9 +591,28 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
         mass_residual = (m_event - config.M_TOTAL) / config.M_TOTAL
         return [mass_residual, res_full[3] / L_scale]
 
-    u_sol, _info, ier, msg = fsolve(residual, u0, xtol=config.BVP_TOL, full_output=True)
-    if ier != 1:
-        warnings.warn(f"solve_timestep: fsolve did not fully converge (ier={ier}): {msg}", RuntimeWarning)
+    # ASSUMPTION: Levenberg-Marquardt, not fsolve's default hybrd - see relax_initial_state's
+    # matching note (PROGRESS.md 2026-08-01) for why: hybrd has no ftol option at all (only
+    # xtol, a step-size criterion), and reported false convergence at this exact class of
+    # badly-scaled thermal-residual problem. ftol is a relative-progress criterion, not a
+    # literal residual-size guarantee, so the explicit RESIDUAL_TOL check below remains the
+    # real backstop regardless of which criterion LM stops on.
+    opt_result = root(residual, u0, method="lm", options={"xtol": config.BVP_TOL, "ftol": config.RESIDUAL_TOL})
+    if not opt_result.success:
+        warnings.warn(f"solve_timestep: LM did not fully converge: {opt_result.message}", RuntimeWarning)
+
+    # ASSUMPTION: independently verify the residual rather than trusting opt_result.success
+    # alone - silently accepting a bad state here would corrupt every subsequent timestep in
+    # the loop. opt_result.fun avoids a redundant re-solve.
+    u_sol = opt_result.x
+    res_mass, res_L = opt_result.fun
+    max_residual = max(abs(res_mass), abs(res_L))
+    if max_residual > config.RESIDUAL_TOL:
+        raise RuntimeError(
+            f"solve_timestep: LM reports success={opt_result.success} but residual "
+            f"[{res_mass:.3e}, {res_L:.3e}] exceeds config.RESIDUAL_TOL={config.RESIDUAL_TOL:.1e} "
+            f"- not a genuine root"
+        )
 
     P_center, T_center = np.exp(u_sol)
     sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_prev, dt)
@@ -496,7 +625,6 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
     P, T = np.exp(lnP), np.exp(lnT)
     rho = eos.density(P, T, config.MU, config.MU_E)
 
-    res_mass, res_L = residual(u_sol)
     print(f"bvp_solver: timestep converged, t={state_prev.t + dt:.4e} s, P_center={P_center:.6e}, "
           f"T_center={T_center:.6e} K, m_surface/M_TOTAL={m_surface/config.M_TOTAL:.8f}, "
           f"residuals=[{res_mass:.3e}, {res_L:.3e}]")

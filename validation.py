@@ -521,7 +521,13 @@ def check_radiative_limit_grad_eff_equals_grad_rad() -> None:
     print(f"  L = 1e-3*L_crit -> nabla_rad = {grad_rad_test:.6e}, nabla_ad = {grad_ad_test:.6f}, "
           f"is_convective = {is_convective_test}")
     assert not is_convective_test, "Deep radiative regime should not be flagged convective"
-    assert grad_eff_test == grad_rad_test, "grad_eff should equal grad_rad exactly in the radiative limit"
+    # ASSUMPTION: exact equality (used until 2026-08-06) no longer holds - effective_gradient's
+    # min(grad_rad,grad_ad) switch is now a smooth hyperbolic approximation (config.
+    # GRAD_EFF_SWITCH_EPSILON), which is never bit-exact anywhere by construction. Here
+    # nabla_rad is ~1e-3*nabla_ad, i.e. |nabla_rad-nabla_ad| >> epsilon, so the smoothing
+    # distortion is of order epsilon^2/(2*|nabla_rad-nabla_ad|) ~ 1e-7 - orders of magnitude
+    # below this 1e-4 tolerance, which still tightly catches a genuinely broken formula.
+    assert abs(grad_eff_test - grad_rad_test) < 1.0e-4, "grad_eff should be indistinguishable from grad_rad in the radiative limit"
 
 
 # ==========================================
@@ -548,7 +554,9 @@ def check_convective_limit_grad_eff_equals_grad_ad() -> None:
     print(f"  L = 1e3*L_crit -> nabla_rad = {grad_rad_test:.6e}, nabla_ad = {grad_ad_test:.6f}, "
           f"is_convective = {is_convective_test}")
     assert is_convective_test, "Steep radiative gradient should be flagged convective"
-    assert grad_eff_test == grad_ad_test, "grad_eff should equal grad_ad exactly in the convective limit"
+    # ASSUMPTION: see Check 13's comment - exact equality no longer holds under the smoothed
+    # switch; nabla_rad here is ~1e3*nabla_ad, so the same tiny, tolerance-swamped distortion applies.
+    assert abs(grad_eff_test - grad_ad_test) < 1.0e-4, "grad_eff should be indistinguishable from grad_ad in the convective limit"
 
 
 # ==========================================
@@ -1103,44 +1111,6 @@ def plot_mass_reconstruction_error(output_path=f"{diagnostics.PLOT_DIR}/mass_rec
 
 
 # ==========================================
-# SECTION: Sub-task 7 — Bootstrap Time Derivatives
-# ==========================================
-
-def check_bootstrap_time_derivatives_are_physical() -> None:
-    """Confirm the homologous-contraction bootstrap gives positive dT_dt, dP_dt, exactly
-    matches the analytic dL/dm formula, and integrates to an L(M_TOTAL) consistent with the
-    independent |E_grav|/t_KH Kelvin-Helmholtz estimate (diagnostics.virial_balance).
-    """
-    s0 = bvp_solver.solve_static_structure()
-    dT_dt, dP_dt = time_stepper.compute_time_derivatives(s0, None, dt=None)
-
-    print("Check 30 - Bootstrap time derivatives: homologous contraction ansatz")
-    print(f"  dT_dt range: {dT_dt.min():.4e} to {dT_dt.max():.4e} K/s")
-    print(f"  dP_dt range: {dP_dt.min():.4e} to {dP_dt.max():.4e} dyn/cm^2/s")
-    assert dT_dt.shape == s0.m.shape and dP_dt.shape == s0.m.shape, "Derivative arrays must match the mass grid shape"
-    assert np.all(dT_dt > 0.0), "dT_dt should be positive everywhere (contraction heats the envelope)"
-    assert np.all(dP_dt > 0.0), "dP_dt should be positive everywhere (contraction raises pressure)"
-
-    y0 = np.vstack([s0.r, s0.P, s0.L, s0.T])
-    _, _, dL_dm, _ = odes.stellar_odes(s0.m, y0, dT_dt, dP_dt)
-
-    # Analytic homologous-contraction formula (config.py's ASSUMPTION comment / bootstrap docstring):
-    # dL/dm = (3*gamma-4)/(gamma-1) * k_B*T / (mu*m_H*T_KH_BOOTSTRAP_S)   [erg s^-1 g^-1]
-    analytic_dL_dm = ((3.0 * config.GAMMA - 4.0) / (config.GAMMA - 1.0)
-                       * config.K_B * s0.T / (config.MU * config.M_H * config.T_KH_BOOTSTRAP_S))
-    max_rel_err = np.max(np.abs((dL_dm - analytic_dL_dm) / analytic_dL_dm))
-    print(f"  dL/dm vs analytic homologous formula: max relative error = {max_rel_err:.3e}")
-    assert np.allclose(dL_dm, analytic_dL_dm, rtol=1.0e-8), "dL/dm does not match the analytic homologous-contraction formula"
-
-    L_surface_est = np.trapezoid(dL_dm, s0.m)
-    E_grav, _ = diagnostics.virial_balance(s0)
-    L_KH_estimate = abs(E_grav) / config.T_KH_BOOTSTRAP_S
-    ratio = L_surface_est / L_KH_estimate
-    print(f"  integrated L(M_TOTAL) = {L_surface_est:.4e} erg/s, |E_grav|/t_KH estimate = {L_KH_estimate:.4e} erg/s, ratio = {ratio:.3f}")
-    assert 0.1 < ratio < 10.0, "Integrated bootstrap luminosity is not within an order of magnitude of the independent E_grav/t_KH estimate"
-
-
-# ==========================================
 # SECTION: Sub-task 7 — Finite-Difference Time Derivatives
 # ==========================================
 
@@ -1179,39 +1149,6 @@ def check_finite_difference_time_derivatives_and_interpolation() -> None:
     print(f"  dP_dt range: {dP_dt.min():.4e} to {dP_dt.max():.4e} dyn/cm^2/s")
     assert np.allclose(dT_dt, dT_dt_expected), "dT_dt does not match hand-computed finite difference with interpolation"
     assert np.allclose(dP_dt, dP_dt_expected), "dP_dt does not match hand-computed finite difference with interpolation"
-
-
-# ==========================================
-# SECTION: Sub-task 7 — Visual Check: Bootstrap Time Derivatives
-# ==========================================
-
-def plot_bootstrap_time_derivatives(output_path=f"{diagnostics.PLOT_DIR}/bootstrap_time_derivatives.png") -> None:
-    """Save a diagnostic plot of the bootstrap dT_dt(m), dP_dt(m), and resulting dL/dm(m)."""
-    s0 = bvp_solver.solve_static_structure()
-    dT_dt, dP_dt = time_stepper.compute_time_derivatives(s0, None, dt=None)
-    y0 = np.vstack([s0.r, s0.P, s0.L, s0.T])
-    _, _, dL_dm, _ = odes.stellar_odes(s0.m, y0, dT_dt, dP_dt)
-
-    x = s0.m / config.M_TOTAL
-    fig, axes = plt.subplots(3, 1, figsize=(7, 9), sharex=True)
-
-    axes[0].plot(x, dT_dt)
-    axes[0].set_ylabel("dT/dt [K s^-1]")
-    axes[0].set_title("Bootstrap time derivatives (homologous contraction ansatz)")
-
-    axes[1].plot(x, dP_dt)
-    axes[1].set_yscale("log")
-    axes[1].set_ylabel("dP/dt [dyn cm^-2 s^-1]")
-
-    axes[2].plot(x, dL_dm)
-    axes[2].set_xlabel("m / M_TOTAL")
-    axes[2].set_ylabel("dL/dm [erg s^-1 g^-1]")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
-
-    print(f"Saved bootstrap time derivatives plot to {output_path}")
 
 
 # ==========================================
@@ -1289,7 +1226,5 @@ if __name__ == "__main__":
     check_static_structure_opacity_regime_distribution()
     check_mass_reconstruction_matches_lagrangian_grid()
     plot_mass_reconstruction_error()
-    check_bootstrap_time_derivatives_are_physical()
     check_finite_difference_time_derivatives_and_interpolation()
-    plot_bootstrap_time_derivatives()
     print("\nAll CGS unit-consistency and Sub-task 1, 2a-2e, 3, 4, 5, 6, 7 checks passed.")

@@ -11,29 +11,68 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
-**⚠ `config.T_CENTER_INITIAL` is a PLACEHOLDER (still 1200 K) pending a decision — read
-this before changing it.** The formation-scenario reframing (three stages: first
-hydrostatic core → dynamical second collapse → post-second-collapse hot start, §5's dated
-entries have the full picture) correctly resolved *why* $T_\text{CENTER\_INITIAL}=1200$K was
-wrong, but literature-checking the *replacement* value surfaced a real, unresolved tension —
-see §5's "Literature check" entry below before picking a number:
+**✅ `config.T_CENTER_INITIAL=13000`K decided ("Geometric Target" approach, 2026-08-01) —
+gives $R=4.15\,R_\text{Jup}$, not $\sim3$ as expected; flagged, not silently accepted.** The
+formation-scenario reframing (three stages: first hydrostatic core → dynamical second
+collapse → post-second-collapse hot start) correctly resolved *why*
+$T_\text{CENTER\_INITIAL}=1200$K was wrong; the literature check then surfaced a real
+tension between the literature-motivated temperature ($2\times10^4$-$5\times10^4$K, anchored
+to present-day Jupiter's own modeled central temperature) and this codebase's actual
+$R(T_\text{center})$ behavior (no ionization physics — $R$ already exceeds $4\,R_\text{Jup}$
+by $T\sim1.7\times10^4$K). **Decision**: prioritize the geometric target, isolate Sub-task
+8's time-stepper work from the EOS gap, close that gap later in a new mandatory Sub-task 8a
+(PLAN.md) before Stage 1 modeling. Picked $T_\text{CENTER\_INITIAL}=13000$K — but the
+precise converged value is $R=4.1544\,R_\text{Jup}$ (`solve_static_structure()`, confirmed
+directly), not the $\sim3\,R_\text{Jup}$ expected when this number was chosen (nearby
+marching points don't support $\sim3$ either — see §5's dated entry). Outside the stated
+2-4 range, not by a lot, but not silently rounded down to "close enough."
 
-- Present-day Jupiter's own modeled central temperature is $\sim2.2$-$2.5\times10^4$K
-  (multiple independent sources), which — since the object can only cool from its formation
-  value — implies the true post-second-collapse $T_\text{center}$ should be *above* that,
-  motivating the originally-discussed $2\times10^4$-$5\times10^4$K range.
-- **But directly marching `T_CENTER_INITIAL` through `solve_static_structure()`
-  (warm-started, not a blind sweep) shows $R$ already exceeds $4\,R_\text{Jup}$ by
-  $T\sim1.7\times10^4$K and keeps climbing steeply** — this codebase's simplified EOS (fixed
-  neutral-gas $\mu$, no ionization physics) does not reproduce a compact
-  $R\sim2$-$4\,R_\text{Jup}$ structure anywhere near the literature-motivated temperature.
-  $R=2$-$4\,R_\text{Jup}$ is achieved for $T_\text{CENTER\_INITIAL}$ somewhere between
-  $\sim1200$K and $\sim1.3\times10^4$K under this model's *actual* physics.
+**⏸ Sub-task 8 dry run still BLOCKED. Safety net PROVEN WORKING. Two fix attempts tried and
+ruled out (self-scaling normalization; switching `fsolve`→Levenberg-Marquardt) — the
+evidence now points away from "solver/scaling choice" and toward "the true root is
+genuinely far from the $\alpha=0$ solution at $\Delta\alpha=0.1$." Read the three dated
+entries below (oldest first) before touching `relax_initial_state`/`solve_timestep` again.**
+Switching the inner root-find from `scipy.optimize.fsolve` (MINPACK `hybrd`, step-size-only
+convergence) to `scipy.optimize.root(method="lm")` (genuine Levenberg-Marquardt, with a real
+`ftol` residual-progress criterion) was well-motivated but **did not fix it**: LM converges
+to `residual=[-7.657e-05, 8.016e-03]` at $\alpha=0.1$ — nearly identical to `hybrd`'s
+`[-7.208e-05, 8.204e-03]` from the same seed. Two independently-implemented algorithms
+landing on almost the same non-zero residual is strong evidence this is a genuine local
+minimum of the residual near $\alpha=0.1$, not an algorithm-specific convergence-reporting
+artifact — meaning the $\Delta\alpha=0.1$ step is likely too large for *any* local
+Newton/Gauss-Newton-type method to bridge from the $\alpha=0$ seed, not a solver-choice
+problem. Points toward finer/adaptive $\alpha$-stepping as the more promising next avenue.
 
-**Composite outer-mass grid, `T_DISSOCIATION_LIMIT`→`R_HALT` config swap, `R_JUPITER_CM`,
-and the hardcoded-literal cleanup are all DONE** (§5's "Step 3 execution" entry). Only
-`T_CENTER_INITIAL`'s final numeric value is still open — see PLAN.md's Sub-task 8 for the
-revised goal/halt condition and §Phase-3-Extensions for the deferred first-core modeling.
+Root cause (unchanged from before): `fsolve`'s `ier=1` reflects its *step-size* tolerance
+(`xtol`), not the residual/function value — at $T_\text{CENTER\_INITIAL}=13000$K, this lets
+spurious "convergence" through. **Now caught immediately and correctly**: with the new
+residual-magnitude safety-net check in place, the $\alpha$-ramp raises
+`RuntimeError` at $\alpha=0.1$ (residual `[-7.2e-5, 8.2e-3]`, exceeding
+`config.RESIDUAL_TOL`) — earlier than first estimated ($\alpha=0.0$ is the *only* genuinely
+well-converged step here, not through $\alpha\approx0.2$ as initially thought. $\alpha=0.1$
+was already spurious, just not yet visibly "frozen."
+
+**The scaling-fix attempt (self-normalizing the thermal residual by the trial's own
+photospheric $L$ instead of a fixed estimate) was tried, caused a regression, and has been
+reverted.** It broke $\alpha=0.0$, which previously converged essentially perfectly.
+Direct calculation explains why: the fixed KH-timescale $L$ estimate
+($\approx2.6\times10^{29}$erg/s) is actually **~78x *larger*** than the genuine converged
+$L$ at $T=13000$K ($\approx3.4\times10^{27}$erg/s) — so switching the denominator to the
+trial's own $L$ *shrinks* it, growing the normalized residual and its sensitivity, backwards
+from the intended fix. It also introduced a new risk: dividing by a trial's own $L$ during
+`fsolve`'s internal probing can approach zero, which is far more dangerous than a fixed,
+always-reasonable constant. **Deeper conclusion**: the raw (un-normalized) thermal-residual
+sensitivity to $T_\text{center}$ is enormous in this regime
+($\sim10^{32}$erg/s per unit $\ln T_\text{center}$) — no single-constant rescaling, fixed or
+self-adapting, changes that; the conditioning problem is more fundamental than a
+normalization choice. See the dated entry for what's proposed next (not yet
+implemented — pending direction).
+
+**Sub-task 8's own code (`time_stepper.run()`) is implemented and NOT in question** — the
+warm-start loop mechanism works exactly as designed; the failure is two layers down, in
+`relax_initial_state`'s convergence *verification*, not its physics. Composite outer-mass
+grid, `T_DISSOCIATION_LIMIT`→`R_HALT` config swap, `R_JUPITER_CM`, and the hardcoded-literal
+cleanup are all done (§5's "Step 3 execution" entry, 2026-08-01).
 
 **✅ Sub-task 5 is DONE and verified end-to-end (2026-08-01 session).** Three blockers were
 found and fixed in sequence this session, each traced to its root cause before being patched
@@ -669,6 +708,390 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-01 — Solver algorithm evaluated and switched (fsolve→LM); does not fix the stall, but is a genuine improvement kept regardless
+
+**Before implementing, evaluated four candidate fixes** (user request): (1) switch the inner
+solver to `scipy.optimize.root(method="lm")`; (2) normalize the thermal residual by a fixed
+astrophysical constant ($L_\odot$) instead of the KH-timescale estimate; (3) adaptive
+$\alpha$-step halving on failure; (4) a larger fixed $\alpha$-step count (e.g. 50-100).
+Recommended (1) first, in isolation, before (3): checked scipy's actual parameter set
+(not just general reputation) and found a concrete, structural reason to prefer LM -
+`fsolve`/`hybrd` exposes only `xtol` (no `ftol` option exists for that method at all), while
+`method="lm"` exposes a genuine `ftol` (relative reduction in the sum of squares) alongside
+`xtol` - a real, tunable, residual-adjacent stopping criterion `hybrd` structurally lacks.
+Recommended against (2): mathematically equivalent in kind to the already-reverted
+self-scaling attempt (just another single fixed constant), and against (4): the user's own
+instinct that brute-force step count doesn't address *why* the Jacobian is steep.
+
+**Implemented (1)**: both `relax_initial_state` and `solve_timestep` switched from `fsolve`
+to `scipy.optimize.root(method="lm")`, with `options={"xtol": config.BVP_TOL, "ftol":
+config.RESIDUAL_TOL}`. `solve_timestep`'s soft `warnings.warn`-on-failure path is retained
+(some tolerance for a marginally-non-ideal step there, per the original design intent), but
+now backed by the same hard `RESIDUAL_TOL` check as `relax_initial_state`, applied
+unconditionally regardless of `opt_result.success`. Also a minor efficiency/cleanliness
+win: `scipy.optimize.root`'s result object exposes `.fun` (the residual at the returned
+point) directly, removing the need to call `residual()` a second time the old `fsolve` path
+required.
+
+**Result: LM does NOT fix the stall.** Cleared the cache, re-ran the $\alpha$-ramp (11-step
+grid unchanged, per instruction). $\alpha=0.0$ still converges genuinely (residual
+`[-1.3e-14, 1.8e-9]`, consistent with every prior run). $\alpha=0.1$ still fails the
+`RESIDUAL_TOL` check - and critically, **the residual LM converges to is nearly identical to
+what `hybrd` converged to from the identical seed**: `[-7.657e-05, 8.016e-03]` (LM) vs.
+`[-7.208e-05, 8.204e-03]` (`hybrd`, previous entry) - agreeing to within a few percent,
+despite being two structurally different algorithms (trust-region hybrid vs. damped
+Gauss-Newton) with different internal step-taking strategies.
+
+**Interpretation**: two independent algorithms landing on almost the same non-zero residual
+from the same starting point is meaningful evidence *against* "the convergence-reporting
+was buggy" (which was the mechanism originally diagnosed for `hybrd` specifically) and
+*for* "this point is a genuine local minimum of the residual's sum of squares, and the true
+root is simply too far away for a local Newton/Gauss-Newton-type step to reach from here in
+one jump" - i.e., $\Delta\alpha=0.1$ itself may be too large a step at this $T_\text{center}$,
+regardless of which local solver drives it. This shifts weight toward Alternative 3
+(adaptive $\alpha$-step halving) as the more likely fix, not primarily a solver-choice
+problem.
+
+**Keeping the LM switch regardless of what happens next** - it's a genuine improvement
+(real `ftol` criterion `hybrd` lacks entirely) even though it didn't resolve this specific
+issue alone, and costs nothing to retain.
+
+**Not yet done**: testing adaptive $\alpha$-stepping (Alternative 3), now the leading
+hypothesis given this result.
+
+### 2026-08-01 — Safety net implemented and confirmed working; scaling fix attempted, reverted, needs a different approach
+
+**Part 1 (safety net) — done, proven, both `relax_initial_state` and `solve_timestep`.**
+Added `config.RESIDUAL_TOL=1e-4` and, after `fsolve` reports `ier==1`, an explicit check
+`max(|residuals|) <= RESIDUAL_TOL`, raising a descriptive `RuntimeError` naming the exact
+mechanism (fsolve's `ier` reflects step size, not residual) if it fails.
+`solve_timestep`'s old soft `warnings.warn`-only path on `ier!=1` is now *also* backed by
+this hard check, regardless of `ier` — a silently-accepted bad state there would corrupt
+every subsequent timestep in the loop, so this one always raises. Also added an equivalent
+check to `solve_static_structure` (`brentq`-based, not vulnerable to the same `fsolve`
+mechanism, but "verify, don't just trust" applies generally) — **caught its own bug on
+first use**: reused `RESIDUAL_TOL` there too, and it immediately failed on `brentq`'s
+completely normal, always-accepted $\sim10^{-3}$ mass residual (confirmed: this exact
+residual, $8.780\times10^{-4}$, was already the accepted, working result before any of
+today's changes). Added a separate `config.STATIC_STRUCTURE_RESIDUAL_TOL=1e-2`, matched to
+`brentq`'s own established precision, instead of reusing the `fsolve`-specific threshold —
+a reminder that "verify the residual" still needs a *method-appropriate* threshold, not one
+borrowed wholesale from a different solver's diagnosed failure mode.
+
+**Verified the safety net catches the real problem immediately**: re-ran the $\alpha$-ramp
+with it in place (still using the original, proven fixed `L_scale` at this point) —
+$\alpha=0.0$ converges genuinely (residual `[-2.8e-14, 2.3e-10]`, unchanged from every prior
+run), and $\alpha=0.1$ now correctly raises: `residual [-7.208e-05, 8.204e-03] exceeds
+config.RESIDUAL_TOL=1.0e-04`. This is *earlier* than the previous entry's estimate
+($\alpha\approx0.2$-$0.3$) — with hard verification in place rather than eyeballing printed
+residuals, it's now clear $\alpha=0.1$ was already spurious, just not yet frozen solid.
+
+**Part 2 (scaling fix) — first attempt WRONG, reverted; deeper analysis included.**
+Tried self-normalizing the thermal residual by the trial's own photospheric $L$
+(`max(abs(L_b), 1.0)`) instead of the fixed KH-timescale-based estimate, reasoning that a
+fixed scale computed once (from the very different $T=1200$K-era assumptions) might be
+badly mismatched once $T_\text{center}$ runs hot. **This made things worse, not better**:
+
+- Broke $\alpha=0.0$, which had converged essentially perfectly in *every* prior run
+  (including with this exact fixed `L_scale`) — `fsolve`'s own internal Jacobian-probing
+  now wandered to $P_\text{center}=2.1\times10^{13}$, $T_\text{center}=1.66\times10^6$K, a
+  wildly unphysical point, and raised `RuntimeError` immediately.
+- **Root of the regression, confirmed by direct calculation, not assumed**: the fixed
+  `L_scale` at this geometry is $2.62\times10^{29}$erg/s — **~78x *larger*** than the
+  genuine converged $L$ at $T=13000$K ($\approx3.39\times10^{27}$erg/s, from the earlier
+  successful relaxation before the safety net existed). Switching the denominator to the
+  trial's own $L$ therefore *shrinks* it relative to the fixed estimate, which *grows* the
+  normalized residual and its sensitivity — the opposite of the intended fix. It also
+  introduces a new hazard the fixed constant never had: dividing by a quantity
+  (`L_b`) that can approach zero during `fsolve`'s own exploratory probing, especially near
+  the center's own $L=0$ boundary condition.
+- **Reverted cleanly** to the original fixed `L_scale` in both functions, keeping only the
+  proven safety-net check. Re-verified: $\alpha=0.0$ converges genuinely again, $\alpha=0.1$
+  is caught by the safety net exactly as it should be (same numbers as above).
+
+**Deeper conclusion, not yet acted on**: the raw (un-normalized) sensitivity of the thermal
+residual to $\ln T_\text{center}$ is enormous in this regime — even divided by the
+*larger* fixed scale, the normalized sensitivity was already $\sim-870$ to $-1200$
+(previous entry), meaning the raw sensitivity is of order $10^{32}$erg/s per unit
+$\ln T_\text{center}$. No single-constant rescaling of the *residual* (fixed or
+self-adapting) changes that — it's a property of how steeply the whole structure's surface
+flux responds to the deep central temperature in this compact, degenerate, hot regime, not
+a normalization artifact. **Proposed next steps, not yet implemented — pending direction:**
+1. **Finer $\alpha$-ramp granularity** (more, smaller pseudo-steps than the current fixed
+   11) — lower-risk, directly tests whether the problem is "too large a jump into a steep
+   region" rather than "wrong overall scale." Cheap to try.
+2. **`fsolve`'s `diag` parameter** (`mode=2`) — explicit column (parameter) scaling, telling
+   the solver to take smaller steps specifically in the $T_\text{center}$ direction. The
+   diagnosed Jacobian imbalance is mostly row-dominant (thermal residual row ~100-1000x more
+   sensitive across *both* columns), so this may be a secondary effect at best, but worth
+   testing given the user's original suggestion.
+3. A genuinely different shooting-variable reparametrization, if (1) and (2) don't resolve
+   it - not yet designed.
+
+### 2026-08-01 — Root cause found: `fsolve`'s `ier=1` is a step-size false positive, not genuine convergence
+
+**Tested Hypothesis 1 (`dt` too large) first, per instruction — ruled out cleanly.** Reran
+the 5-step dry run with `dt` reduced $1000\times$ ($10^4\to10$ yr). Failed identically:
+`RuntimeError: solve_ivp did not reach the photosphere`, same seed point. Traced the full
+trajectory at the reduced `dt` and compared directly against the original: **qualitatively
+identical** — $T$ pins flat at exactly 13000K starting right after the center
+($m/M_\text{total}\sim0.0002$), $L$ flips deeply negative at the same mass fraction, $r$
+explodes the same way. Only $L$'s absolute magnitude changed, scaling $\propto1/dt$ exactly
+as $dL/dm=-c_p\,dT/dt+dP/dt/\rho$ predicts. A 1000x change in `dt` producing only a linear
+rescaling of one term, with the qualitative failure completely unchanged, is strong evidence
+`dt` magnitude is not the driver.
+
+**Pivoted to Hypothesis 2 (per instruction, "only if Hypothesis 1 fails") — confirmed, with
+a precise mechanism.** Reproduced `relax_initial_state`'s $\alpha$-ramp with extra
+instrumentation (`fsolve`'s `nfev`, the residual evaluated at the warm-started seed *before*
+`fsolve` moves it, and a finite-difference Jacobian at each step from $\alpha=0.3$ onward):
+
+| $\alpha$ | `nfev` | jump from seed | residual (mass, thermal) |
+|---|---|---|---|
+| 0.0 | 13 | $2.19\times10^{-3}$ | $[-2.8\times10^{-14},\ 2.3\times10^{-10}]$ — genuine, tight convergence |
+| 0.1 | 30 | $5.40\times10^{-4}$ | $[-7.2\times10^{-5},\ 8.2\times10^{-3}]$ |
+| 0.2 | 22 | $1.44\times10^{-5}$ | $[-8.6\times10^{-5},\ 9.5\times10^{-3}]$ |
+| 0.3 | 22 | $2.27\times10^{-6}$ | $[-1.17\times10^{-4},\ 1.29\times10^{-2}]$ |
+| 0.4 | 13 | **$0.0$ exactly** | $[-1.17\times10^{-4},\ 1.29\times10^{-2}]$ — **identical to $\alpha=0.3$**, `fsolve` made *no* change at all |
+
+`ier=1` ("converged") is reported at every single step. But `scipy.optimize.fsolve`'s
+`ier=1` reflects its `xtol` criterion — the *relative change between consecutive iterates*
+— **not** the residual/function value. From $\alpha\approx0.2$ onward, the step size
+collapses toward zero while the thermal residual stays frozen around
+$1.3\times10^{-2}$ — three orders of magnitude looser than `config.BVP_TOL`$=10^{-8}$, the
+tolerance actually being *requested*. This is a spurious, false-positive convergence report,
+not a genuine root.
+
+**Why the step collapses**: the finite-difference Jacobian at $\alpha=0.3$,
+$\begin{pmatrix}0.19&7.99\\39.8&-871.2\end{pmatrix}$ (growing to
+$\begin{pmatrix}0.19&10.96\\39.8&-1204.2\end{pmatrix}$ by $\alpha=0.4$), is **not singular**
+(determinant $\approx-483$, well away from zero) but is severely **badly scaled**: the
+thermal-residual-vs-$\ln T_\text{center}$ sensitivity is 2-3 orders of magnitude larger than
+the other three entries. A Newton-type step computed from a matrix this poorly scaled maps
+even a genuinely large residual to a tiny parameter correction — exactly the observed
+"step $\to0$ while residual stays large" pattern. This is a different failure class from
+Sub-task 5's near-singular-Jacobian concerns (checked and ruled out there too) — it's a
+scaling/conditioning pathology specific to how sensitive the thermal residual has become to
+$T_\text{center}$ at this hotter starting point, not a rank-deficiency.
+
+**The gap that let this through silently**: `relax_initial_state`'s own convergence check
+is `if ier != 1: raise RuntimeError(...)` — it trusts `fsolve`'s own success flag and never
+independently verifies the residual magnitude is actually small. The pseudo-step's own
+printed residuals (`[-1.171e-04, 1.295e-02]`) were visible in the original relaxation run's
+output and *did* look distinguishably worse than $\alpha=0$'s, but nothing flagged them as
+disqualifying — the existing smoothness-jump guard (checks $>50\%$ swings in
+$(P_\text{center},T_\text{center})$ between steps) doesn't catch this either, since the
+values stopped changing at all, which reads as *stability*, not failure.
+
+**This fully explains the dry-run failure**: the cached `relaxed_state_13000K.pkl` is not a
+genuine solution of the real ($\alpha=1$) 4-ODE system — it's effectively still carrying
+much of $\alpha\approx0.2$-$0.3$'s character. `solve_timestep`, using the real, unblended
+Schwarzschild-selected gradient and differencing against this not-actually-self-consistent
+state, diverges from it almost immediately rather than staying close, exactly the pattern
+traced in the previous entry.
+
+**Proposed fixes, not yet implemented — pending approval:**
+1. **Minimum safety net (should happen regardless of anything else)**: `relax_initial_state`
+   should independently assert the residual magnitude is small (e.g. both components below
+   some explicit tolerance) after `fsolve` reports `ier==1`, and raise if not — closing the
+   exact gap that let this propagate silently. Cheap, mechanical, directly addresses "trust
+   but verify."
+2. **Fix the underlying scaling pathology**: the thermal residual is already
+   non-dimensionalized by `L_scale`, but that scaling is evidently insufficient once the
+   *sensitivity* to $T_\text{center}$ itself grows this large at higher starting
+   temperatures. Options to evaluate: rescale the shooting parameters themselves (e.g. shoot
+   in a variable better matched to the residual's actual sensitivity, not raw $\ln
+   T_\text{center}$), or pass `fsolve` an explicit `diag`/scaling hint so its internal step
+   calculation isn't misled by the raw Jacobian's disparate entry sizes.
+3. Re-run the full $\alpha$-ramp once (1) and/or (2) land, and confirm genuine (not
+   spurious) convergence all the way to $\alpha=1$ before trusting the cached state again.
+
+### 2026-08-01 — Sub-task 8 dry run: genuine convergence failure at step 1, not the earlier cancellation bug
+
+**⏸ Stopped here to report rather than keep guessing nudge/dt values — read in full before
+resuming.**
+
+Resumed the paused dry run (previous entry). `time_stepper.run()`'s very first
+`solve_timestep(relaxed, dt)` call (`dt=0.01\times T_\text{KH\_TIMESCALE\_S}=10^4$ yr, the
+same value already validated for the $T=1200$K case) raised, loudly and with a full
+traceback (exactly per standing instruction — no blind `try`/`except` anywhere in the loop):
+`RuntimeError: solve_ivp did not reach the photosphere during timestep shooting`.
+
+**Traced, not guessed, and this is a genuinely different failure than the earlier one:**
+
+1. **Unnudged seed**: reproduces the *exact same* catastrophic-cancellation collapse
+   diagnosed and fixed earlier this session for the $T=1200$K case ($T$ underflowing to 0
+   within the first fraction of a percent of the mass, $r$ exploding). Confirms the existing
+   `1e-6` nudge mechanism is still doing its job for *that* specific failure mode.
+2. **But the existing `1e-6` nudge, which fully fixed this at $T=1200$K, does not fix it
+   here.** Traced the trajectory directly: with the `1e-6` nudge, the integration no longer
+   collapses, but $T$ gets pinned exactly flat (not decreasing, not inverting - just frozen)
+   from $m/M_\text{total}\sim0.0002$ all the way to $m/M_\text{total}\sim0.9$, while $L$
+   flips deeply negative ($-9.5\times10^{30}$ by the end) and $r$ explodes to $\sim1.5\times
+   10^{12}$cm - no photosphere ever reached. A `1e-4` nudge does better (genuine cooling for
+   the first $\sim9\%$ of the mass) before hitting the same flat-$T$/negative-$L$ pattern
+   further out. Only a `1e-2` nudge, evaluated as a single trial point, actually reaches a
+   photosphere.
+3. **But `1e-2` is not a genuine fix either - checked properly, not just "an event fired":**
+   running the *full* `fsolve` search (not just evaluating the seed once) at nudges
+   `1e-6`/`1e-4`/`1e-3`/`1e-2` shows **none of them converge**: `1e-6` fails immediately
+   (same as the unnudged case, just slower to trigger); `1e-4` gives `fsolve` `ier=5` ("not
+   making good progress"); `1e-3` and `1e-2` both raise `RuntimeError`s **mid-search, at
+   points different from the seed** - `fsolve`'s own Jacobian-estimation/Newton-step probing
+   wanders into (P_center, T_center) territory where no photosphere is reached at all, not
+   just the exact seed point.
+4. **Checked whether this is a near-singular Jacobian (it is not).** Finite-difference
+   Jacobian of the 2D residual map at a `1e-2`-nudged point:
+   $\begin{pmatrix}0.21&0.30\\33.3&-17.7\end{pmatrix}$, determinant $\approx-13.5$,
+   condition number $\approx105$ - a perfectly reasonable, well-conditioned matrix, nowhere
+   near singular. Rules out "near-degenerate root-finding problem" as the cause.
+5. **But the residual AT that well-conditioned point is large**: mass residual $\approx8\%$,
+   thermal residual $\approx8$ (dimensionless, should be $\ll1$ near a root) - meaning the
+   true self-consistent $(P_\text{center},T_\text{center})$ is genuinely far from the
+   relaxed state's own center values here, unlike at $T=1200$K, where the bare relaxed state
+   itself already gave tiny residuals. A well-conditioned Jacobian pointed at a large
+   residual is exactly what makes `fsolve` take a large corrective step - which is
+   apparently landing in territory where the shooting integration itself fails outright.
+
+**Two live hypotheses for *why* the true root is so far away, neither confirmed:**
+
+- **`dt` may be disproportionately large for this hotter starting point.** Compared the
+  *local* KH timescale each relaxed state's own luminosity implies
+  ($t_\text{KH,local}=GM^2/(RL_\text{surface})$) against the fixed `dt`: at $T=13000$K,
+  $L_\text{surface}=3.39\times10^{27}$erg/s gives $t_\text{KH,local}=7.73\times10^7$yr; at
+  $T=1200$K, $L_\text{surface}=6.69\times10^{24}$erg/s gives $t_\text{KH,local}=5.11\times
+  10^{10}$yr - a $\sim660\times$ shorter local timescale at the hotter start (physically
+  sensible: far more luminous, so draining its thermal reservoir far faster). $dt/t_
+  \text{KH,local}$ grew from $2.0\times10^{-7}$ to $1.3\times10^{-4}$ - still small in
+  absolute terms, so this may not be the whole story, but it's a real, quantified shift in
+  the right direction and worth testing directly (a substantially smaller `dt` for this
+  starting point) before assuming it's not the cause.
+- **`relax_initial_state`'s own $T=13000$K convergence may not have produced as genuinely
+  self-consistent a state as the $T=1200$K case did.** Already flagged in the previous
+  entry, not yet investigated: the converged $(P_\text{center},T_\text{center})$ and
+  residuals were bit-for-bit identical across $\alpha=0.3$ through $\alpha=1.0$, with a
+  thermal residual $\sim500\times$ looser than the $T=1200$K case's $\alpha=1$ step. If
+  `relax_initial_state`'s `fsolve` calls were themselves struggling with the same
+  root-far-from-seed geometry (just less severely, since they difference against `state_0`
+  rather than the relaxed state's own values), the cached "relaxed" state might be a less
+  reliable genuine solution than assumed, independent of `dt`.
+
+**Not yet done**: testing either hypothesis directly (a smaller `dt`; re-scrutinizing
+`relax_initial_state`'s $T=13000$K convergence path in detail, e.g. checking its own
+residual/Jacobian behavior the same way). Deliberately stopped here to report rather than
+try a third guessed nudge value or `dt` - matches the standing "trace to root cause before
+patching" discipline that already paid off earlier this session (the $L\geq0$ floor, the
+original cancellation nudge). No code changed in this entry - only diagnostic scripts run
+(scratchpad, not committed).
+
+### 2026-08-01 — Sub-task 8 dry-run PREPARED, not run: session paused before execution
+
+**⏸ Read this in full before running anything in `time_stepper.py` — nothing below has
+actually been executed yet.**
+
+Following up on the previous entry (Sub-task 8 implementation): the user asked for a
+strict, guardrailed first test rather than jumping straight to a long run — specifically:
+(1) a hard `MAX_TEST_STEPS=5` cap, (2) confirmation that each step warm-starts from the
+previous step's own converged solution, (3) verbose per-step output in human-readable units
+(time and $dt$ in years, $r_\text{surface}$ in $R_\text{Jup}$, $T_\text{center}$ in K,
+$L_\text{surface}$ in $L_\odot$) so the trend (contracting, cooling, stable) could be
+visually confirmed before a long run.
+
+**Done:**
+- **Warm-start confirmed already correct, no code change needed**: `bvp_solver.
+  solve_timestep`'s `u0` seed is built directly from `state_prev.P[0]`/`state_prev.T[0]`
+  (line ~462, the `1e-6`-nudged seed from the catastrophic-cancellation fix), and `time_
+  stepper.run`'s loop reassigns `state` each iteration, so every step's `state_prev`
+  argument is genuinely the previous step's own converged output — this was already exactly
+  the requested behavior, verified by reading the code, not assumed.
+- **`config.py`**: added `SECONDS_PER_YEAR` (refactored `T_KH_TIMESCALE_S` to use it
+  instead of an inline `3.156e7` literal) and `L_SUN_ERG_S` (IAU nominal solar luminosity).
+- **`time_stepper.run`'s per-step print** upgraded to report $t$, $dt$ in years,
+  $r_\text{surface}$ in $R_\text{Jup}$, $T_\text{center}$ in K, $L_\text{surface}$ in
+  $L_\odot$ — a permanent improvement to the loop's own logging (not a separate,
+  dry-run-only format), since human-readable units are what any future run (short or long)
+  should report.
+- **Relaxed $T_\text{center}=13000$K state cached**: `solve_static_structure()` →
+  `relax_initial_state()` re-run at the new `T_CENTER_INITIAL` and cached
+  (`state_0_13000K.pkl`, `relaxed_state_13000K.pkl`) — this is the expensive (~15-20 min)
+  step that should never need re-running just to test `time_stepper.run()`. All 11 $\alpha$
+  steps converged; final relaxed state: $T_\text{center}=1.301427\times10^4$K,
+  $r_\text{surface}=4.153\,R_\text{Jup}$ (consistent with `solve_static_structure`'s own
+  $4.154\,R_\text{Jup}$ — the relaxation barely moved the structure, as expected given how
+  degeneracy-dominated it is). **Observation, not yet investigated**: the converged
+  $(P_\text{center},T_\text{center})$ and residuals are bit-for-bit *identical* across
+  $\alpha=0.3$ through $\alpha=1.0$ (thermal residual $\approx1.3\times10^{-2}$, versus
+  $\approx2.6\times10^{-5}$ for the earlier $T=1200$K relaxation's $\alpha=1$ step — about
+  500x looser, though still small in absolute terms and `ier==1` was achieved at every
+  step, no smoothness-guard warning fired). Most likely just a flatter response surface at
+  this hotter, still strongly degenerate-dominated starting point (the same weak
+  $\alpha$-dependence, only more pronounced, was already seen at $T=1200$K). Not a blocker,
+  but worth a closer look if `solve_timestep` behaves unexpectedly in the dry run.
+- **Dry-run test script written** (`dry_run_5_steps.py`, scratchpad — not a permanent
+  project file): loads the cached relaxed state, calls
+  `time_stepper.run(relaxed, n_steps=MAX_TEST_STEPS=5, dt=0.01*config.T_KH_TIMESCALE_S)`.
+
+**NOT done — paused here, explicitly, before execution**: the dry run itself was never
+launched. **To resume**: re-run (or re-derive) the dry-run script above against the cached
+`relaxed_state_13000K.pkl` and inspect the 5-step output for: $r_\text{surface}$ strictly
+decreasing, $T_\text{center}$ decreasing (cooling — PLAN.md Sub-task 8's exit criterion, not
+increasing, since this is a degenerate-pressure-supported track), and no solver failures.
+Only after that passes should a long run (toward `config.R_HALT`=1.0$R_\text{Jup}$) be
+attempted.
+
+### 2026-08-01 — $T_\text{CENTER\_INITIAL}$ finalized (13000K, geometric target); Sub-task 8 (`time_stepper.run()`) implemented
+
+**Decision**: "Geometric Target" approach — prioritize $R$ over the literature-motivated
+$T$, isolating the time-stepper work from the EOS ionization gap (previous entry). Set
+`config.T_CENTER_INITIAL=13000.0`, with the ASSUMPTION comment recording the full
+reasoning and forward-referencing the new mandatory Sub-task 8a.
+
+**Flagging a real discrepancy, not smoothing over it**: `solve_static_structure()` at
+exactly $T_\text{center}=13000$K converges to $R=4.1544\,R_\text{Jup}$ (confirmed directly,
+not interpolated) — noticeably above the $\sim3\,R_\text{Jup}$ expected when 13000K was
+picked, and technically outside the stated $2$-$4\,R_\text{Jup}$ target (the nearest
+marched points, 10,765K→3.88 and 13,405K→4.22, don't support a $\sim3\,R_\text{Jup}$
+reading near 13000K either — the earlier marching table was already the right data to check
+against). Reported clearly rather than rounded down to "close enough" or silently adjusted;
+proceeding with $T_\text{CENTER\_INITIAL}=13000$K per explicit instruction, since it's
+comfortably post-dissociation and within an order-of-magnitude-reasonable range, but this is
+worth revisiting if $R\approx4.15$ (vs. $\sim3$) turns out to matter for later comparisons
+(e.g. against literature hot-start tracks).
+
+**PLAN.md**: new mandatory Sub-task 8a ("EOS Ionization Upgrade — Saha Equation") added,
+positioned after Sub-task 8, before Stage 1 modeling — not deferred to the Extensions list.
+Includes an explicit numerical warning (requested): Saha ionization will introduce sharp
+$\mu(\rho,T)$ gradients coupled directly into the hydrostatic-equilibrium ODE (unlike the
+existing Bell & Lin opacity transitions, which only affect the radiative term) — expect the
+same class of `solve_ivp` stiffness failures already diagnosed this session, requiring
+reduced `dt` near transitions (likely pulling Sub-task 9's adaptive stepping forward) and
+localized `atol`/`rtol` retuning, not a global one. The former Extensions-table item 14
+("full non-ideal EOS if Sub-task 2f's degeneracy term proves insufficient") is absorbed
+into this new sub-task and removed from Extensions (renumbered: former item 15, the Stage-1
+modeling + unified plot, is now item 14).
+
+**Sub-task 8 implemented**: `time_stepper.py` rewritten — the obsolete homologous
+bootstrap (`_bootstrap_time_derivatives`, `compute_time_derivatives`'s `state_prev=None`
+branch) removed entirely (already flagged as scheduled for removal, not a fix, since the
+last correctness pass; `config.T_KH_BOOTSTRAP_S` no longer exists under that name).
+`compute_time_derivatives` retained as the finite-difference-only diagnostic utility it
+already was (`bvp_solver._implicit_rhs_logm` does its own inline differencing; unaffected).
+New `run(state_prev, n_steps, dt, snapshot_interval=1)`: takes an already-relaxed starting
+state as a parameter (not constructed internally) — keeps `run()` a focused loop mechanism,
+supports the sterile-pass/wet-pass development split (a mock or `dev_cache`-loaded state
+can be fed in directly), and makes no bootstrap/kick special-case for the first call, exactly
+per PLAN.md's Sub-task 8 deliverables. Halts when `state.r[-1] <= config.R_HALT`; logs every
+step (`t`, $T_\text{center}$, $r_\text{surface}$, $L_\text{surface}$) — no blind
+`try`/`except` anywhere in the loop, a genuine failure in `solve_timestep` propagates with
+its full traceback, per standing instruction.
+
+**`validation.py` cleanup** (already flagged as needed, not new scope): removed Check 30
+(`check_bootstrap_time_derivatives_are_physical`) and Check 32
+(`plot_bootstrap_time_derivatives`) — both tested the now-deleted bootstrap mechanism
+specifically, not something to fix, only to remove. Check 31 (finite-difference derivatives,
+the retained non-bootstrap branch) is untouched. Deleted the now-doubly-stale
+`bootstrap_time_derivatives.png`.
 
 ### 2026-08-01 — Literature check on $T_\text{center}$ surfaces a real EOS-specific tension; Step 3 (grid, config) implemented, $T_\text{CENTER\_INITIAL}$ left open
 

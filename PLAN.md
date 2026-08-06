@@ -717,7 +717,65 @@ as the star contracts — see PROGRESS.md for the virial-theorem argument) — o
 steps to be clearly above numerical noise; exact step count/$dt$ to be determined
 empirically. Additionally verify the radius halt with an artificially-raised `R_HALT`.
 
-**Not yet started in code** — `time_stepper.py` is unchanged from Sub-task 7's original implementation as of this writing.
+**Status: implemented, NOT yet validated (2026-08-01)** — code written and compiles, the
+relaxed $T_\text{center}=13000$K starting state is cached, and a strictly-capped 5-step
+"dry run" script is prepared, but has not been executed — session paused before running it
+(user request). See PROGRESS.md's "Sub-task 8 dry-run PREPARED, not run" entry for exact
+resume steps. Do not mark this done until the dry run's output has actually been inspected.
+
+---
+
+#### Sub-task 8a — EOS Ionization Upgrade (Saha Equation) — **MANDATORY, scheduled after Sub-task 8, before Stage 1 (first-core) modeling**
+
+**Why this is mandatory, not deferred to Extensions.** `config.T_CENTER_INITIAL=13000`K
+(chosen 2026-08-01 via the "Geometric Target" approach — PROGRESS.md has the full
+reasoning) sits well inside the hydrogen-ionization regime, but `eos.py`'s ideal-gas term
+still uses a fixed, neutral-molecular-gas mean molecular weight (`config.MU=2.34`) at every
+temperature. Accepted as a second-order approximation for Sub-task 8 (degeneracy pressure
+dominates the mechanical structure at $T_\text{center}=13000$K, PROGRESS.md's marching
+data), but NOT acceptable once the simulation cools toward lower-density outer layers, and
+certainly not for Stage 1 (first-core) modeling, which spans the full molecular-to-ionized
+range including H2 dissociation itself. A proper ionization-dependent $\mu(\rho,T)$ (Saha
+equation, at minimum for H and He) must close this gap before results are trusted
+quantitatively or Stage 1 work begins.
+
+**⚠ Numerical warning — read before implementing.** Saha-equation ionization will introduce
+SEVERE non-linearities and stiffness at the ionization transition zones: sharp
+$\mu(\rho,T)$ gradients over a narrow temperature range, coupled directly into the
+pressure/EOS term the hydrostatic-equilibrium ODE depends on at *every* step - a harder
+problem than the existing Bell & Lin opacity regime transitions, which only affect the
+radiative-diffusion term. Expect this to break `solve_timestep`'s current `Radau`/`fsolve`
+configuration in the same class of ways already diagnosed this session (the clamp cascade,
+the $\nabla_\text{rad}$ blow-up - PROGRESS.md 2026-08-01 entries). Do **not** assume the
+current fixed `config.BVP_TOL`/fixed-`dt` scheme carries over unchanged. Budget for:
+- Significantly reduced `dt` around ionization transitions - likely motivating pulling
+  Sub-task 9's adaptive time-stepping *forward*, ahead of this sub-task, rather than after.
+- Aggressive, *localized* re-tuning of `solve_ivp`'s `atol`/`rtol` in the ionization-active
+  mass range specifically, not just a global retune.
+- The same "trace to root cause before patching" discipline already established — do not
+  clamp or dampen a stiffness failure here without first identifying which specific
+  term/derivative is actually blowing up and why.
+
+**Deliverables (design, not yet started):**
+- Saha ionization fraction $x(\rho,T)$ for H (and He if needed), giving $\mu(\rho,T)$ to
+  replace the fixed `config.MU` in `eos.py`'s ideal-gas term. `eos.degenerate_pressure`'s
+  $\mu_e$ is unaffected (already assumes full ionization).
+- Propose (for approval, CLAUDE.md Testing & Validation Protocol) a visible check
+  confirming $\mu(\rho,T)$ against known limits (neutral molecular at low $T$, fully
+  ionized at high $T$) before wiring it into the live EOS.
+- Re-validate `solve_static_structure`/`relax_initial_state`/`solve_timestep` against the
+  new EOS — expect PROGRESS.md's $T_\text{CENTER\_INITIAL}$-vs-$R$ marching table to shift
+  once ionization's extra pressure support is included; may require revisiting Sub-task 8's
+  `T_CENTER_INITIAL` choice.
+- If Saha alone proves insufficient (e.g. pressure ionization at high density, not just
+  thermal ionization), escalate to a full tabulated non-ideal EOS (SCvH-style) — absorbs
+  the former Extensions-table placeholder for this.
+
+**Exit criterion:** `solve_timestep` converges through at least one full ionization
+transition (tracked via $x(\rho,T)$ crossing 0.5) without numerical failure, using an
+honestly-tuned `dt`/`atol`/`rtol` — not a workaround that masks non-convergence.
+
+**Status: Not started — scheduled after Sub-task 8.**
 
 ---
 
@@ -763,8 +821,11 @@ loop is validated on its own.
 | 11 | Replace Bell & Lin with OPAL tabulated opacity (bilinear interpolation) | `opacity.py` Layer 3 API unchanged |
 | 12 | Solid core inner BC: $m = M_\text{core} > 0$, $r = R_\text{core}$ fixed | `boundary_conditions.py` |
 | 13 | Accretion luminosity surface term | `boundary_conditions.py` + `time_stepper.py` |
-| 14 | Full non-ideal EOS (tabulated, e.g. SCvH-style) if Sub-task 2f's minimal degeneracy term proves insufficient | `eos.py` |
-| 15 | Model formation Stage 1 (the first hydrostatic core, ideal-gas-supported, $T_\text{center}<2000\,$K, $R\sim10^2$-$10^3\,R_\text{Jup}$) as a separate quasi-static contraction; combine with this project's Stage 3 track into one unified $R(t)$/$T_\text{center}(t)$ plot with a "black box" jump across Stage 2 (the dynamical collapse, not modeled) | New module (TBD) + `output.py` |
+| 14 | Model formation Stage 1 (the first hydrostatic core, ideal-gas-supported, $T_\text{center}<2000\,$K, $R\sim10^2$-$10^3\,R_\text{Jup}$) as a separate quasi-static contraction; combine with this project's Stage 3 track into one unified $R(t)$/$T_\text{center}(t)$ plot with a "black box" jump across Stage 2 (the dynamical collapse, not modeled) | New module (TBD) + `output.py`, and **Sub-task 8a done first** |
+
+(The former item 14, "full non-ideal EOS if Sub-task 2f's degeneracy term proves
+insufficient," is no longer here — promoted out of Extensions to the mandatory Sub-task 8a,
+2026-08-01, since today's session found the gap is real, not hypothetical.)
 
 ---
 
@@ -784,6 +845,7 @@ loop is validated on its own.
 | **5a** | **`bvp_solver.py` outer BC redesign (photospheric, replaces $P=P_\text{neb}$)** | **2f, 4** | **Compact structure reaches a physically-motivated surface condition, not a $\sim10^7$ relative residual** | **Done (2026-07-27)** |
 | 5 | `bvp_solver.py` ($t=0$, compact hot start + relaxation to self-consistency) | 4, 2f, 5a | Compact, self-consistent $t=0$ structure; `solve_timestep` converges from it with a small residual | **Done, verified end-to-end (2026-08-01)** |
 | 6 | `diagnostics.py` | 5 | Standard (unconfined) virial theorem; multi-regime opacity; visual profile plots | **Done (2026-08-01)** |
-| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Not started — blocked on 6 (unblocked now; confirmed broken pending removal, see PROGRESS.md) |
+| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Implemented, not yet validated — dry run prepared but not executed (2026-08-01) |
+| **8a** | **EOS ionization upgrade (Saha equation)** | **8** | **`solve_timestep` converges through a full ionization transition with honestly-tuned tolerances** | **Not started — mandatory, scheduled after 8** |
 | 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation | Not started — blocked on 7–8 |
 | 10 | `output.py` | all | Reproducible plots from `.npz` | Not started — blocked on 7–8 |
