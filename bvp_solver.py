@@ -249,15 +249,26 @@ def solve_static_structure() -> state.SimulationState:
         # degenerate term dominates (the mass-radius relation inverts, R~M^-1/3, for degenerate
         # objects). Expand in both directions simultaneously, taking whichever finds a sign
         # change first, rather than assuming a fixed direction.
+        # ASSUMPTION: widened 2026-08-07 (PLAN_BVP.md Milestone 5/PROGRESS.md) - the seed
+        # (_adiabatic_center_guess) is a fixed T=0-degenerate-limit estimate, independent of
+        # config.MU/GAMMA and config.T_CENTER_INITIAL; the true root's distance from that
+        # fixed point grows as thermal (ideal-gas) support becomes more significant relative
+        # to degeneracy - already flagged as a genuine gap at high T_center (Milestone 5), and
+        # confirmed 2026-08-07 to also bind at T_CENTER_INITIAL=13000K once MU dropped from
+        # the molecular (2.34) to the atomic (1.278) value: P_ideal~1/mu at fixed rho,T, so a
+        # smaller mu increases the ideal-gas contribution and shifts the required P_center
+        # enough to exceed the previous ~7.3x (1.01^200) window. 1.03^300~7100x is generous
+        # without materially slowing a successful search (brentq's own bisection, not this
+        # loop, still does the real root-polishing once any valid bracket is found).
         P_up = P_down = P_center_guess
         P_low = P_high = None
-        for _ in range(200):
-            P_up *= 1.01
+        for _ in range(300):
+            P_up *= 1.03
             e_up = mass_error(P_up)
             if (e_up < 0.0) != (e_seed < 0.0):
                 P_low, P_high = (P_center_guess, P_up) if e_seed > 0.0 else (P_up, P_center_guess)
                 break
-            P_down /= 1.01
+            P_down /= 1.03
             e_down = mass_error(P_down)
             if (e_down < 0.0) != (e_seed < 0.0):
                 P_low, P_high = (P_down, P_center_guess) if e_seed > 0.0 else (P_center_guess, P_down)

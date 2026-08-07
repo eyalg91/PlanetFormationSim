@@ -38,10 +38,16 @@ def stellar_odes(m, y, dT_dt, dP_dt):
     # Hydrostatic equilibrium: dP/dm = -G*m/(4*pi*r^4)   [dyn cm^-2 g^-1]
     dP_dm = -config.G * m / (4.0 * np.pi * r**4)
 
-    # Energy equation (Kelvin-Helmholtz contraction source):
-    # dL/dm = -c_p*(dT/dt) + (1/rho)*(dP/dt)   [erg s^-1 g^-1]
+    # Energy equation (Kelvin-Helmholtz contraction source, Kippenhahn & Weigert eq. 4.26):
+    # dL/dm = -c_p*(dT/dt) + (delta/rho)*(dP/dt)   [erg s^-1 g^-1]
+    # CORRECTED 2026-08-07 (eos.thermodynamic_delta's own comment has the full derivation):
+    # delta = -(d ln rho/d ln T)_P was previously hardcoded to 1 (exact only for a pure ideal
+    # gas) - this project's combined ideal+degenerate EOS needs the genuine, EOS-dependent
+    # value (->0 as degeneracy dominates), not the ideal-gas special case, wherever
+    # degeneracy contributes non-negligibly to the mechanical structure.
     c_p = eos.specific_heat_cp(config.GAMMA, config.MU)   # [erg g^-1 K^-1]
-    dL_dm = -c_p * dT_dt + dP_dt / rho
+    delta = eos.thermodynamic_delta(rho, T, config.MU, config.MU_E)   # [dimensionless]
+    dL_dm = -c_p * dT_dt + delta * dP_dt / rho
 
     # Temperature structure (Schwarzschild criterion): dT/dm = (T/P)*nabla_eff*(dP/dm)   [K g^-1]
     dT_dm = (T / P) * grad_eff * dP_dm

@@ -11,6 +11,55 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**🔴 2026-08-06 — ARCHITECTURAL PIVOT: shooting is abandoned. `scipy.integrate.solve_bvp`
+(global relaxation/collocation) is now the project's target solver.** Everything below this
+note describing `relax_initial_state`/the shooting $\alpha$-homotopy is historical —
+accurate as a record of what was tried and why it was eventually abandoned, not current
+guidance. Reason: three independent non-differentiable "kinks" ($L\ge0$ floor, Schwarzschild
+switch, and a suspected-but-unconfirmed Bell & Lin opacity switch) were found in sequence,
+each appearing immediately after the previous one was fixed, all clustering in the same
+narrow region of the homotopy path and the same physical region of the star
+(near-photosphere) — the diagnostic signature of a method (shooting) that cannot contain
+local non-smoothness across a single long integration. The active roadmap is `PLAN_BVP.md`;
+the active solver code is `bvp_experiment.py`.
+
+**★ 2026-08-07 — `solve_bvp` CONVERGES (`status=0`, machine-precision residuals) at
+`T_CENTER_INITIAL=11500`K — the pivot's first genuine success.** State-vector
+nondimensionalization ($\hat r$, $\operatorname{arcsinh}$-scaled $\hat L$) + analytic
+Jacobians + corrected EOS thermodynamics ($\gamma\to5/3$, $\mu\to1.278$, a previously
+hardcoded energy-equation $\delta$ coefficient fixed) + a continuation endpoint just short
+of literal $\alpha=1.0$ (`ALPHA_MAX=1-10^{-5}$`, an empirically-required regularization, not
+yet fully explained) together produced the first fully-converged solution this
+architecture has ever reached. `T_CENTER_INITIAL` moved from 13000K to 11500K as a *direct,
+measured* consequence of the EOS correction (13000K became genuinely infeasible under the
+corrected physics - PLAN_BVP.md §3.6 has the full derivation). Two real bugs were caught by
+the mandatory FD-Jacobian cross-check before this was trusted. Open items remain (a
+slightly negative `L_surface`; the un-derived $\alpha=1.0$ instability mechanism; only one
+temperature tested so far) - see §5's 2026-08-07 Milestone 6 entry and `PLAN_BVP.md` §3.6
+for the complete, unabridged trail. The $T_\text{CENTER\_INITIAL}$ decision and the
+physical/formation-scenario reasoning below are otherwise unaffected by this pivot — it
+remains, in spirit, a numerical rather than physical change, with the EOS correction being
+the one deliberate exception (a genuine physics fix, not a numerics experiment).
+
+**★ 2026-08-07 — Second-temperature confirmation: T=12000K ALSO converges cleanly
+(`status=0`, residual $8.88\times10^{-16}$ — tighter than 11500K), closing the "only one
+temperature tested" open item above for the atomic/post-dissociation regime.** A T=2000K
+attempt was tried first and rejected as an invalid test point, not a fix failure: that
+temperature sits outside the composition regime `config.MU=1.278`/`GAMMA=5/3` (atomic,
+post-dissociation) actually describes, since real H at 2000K is molecular and `MU`/`GAMMA`
+are global, not temperature-dependent constants. The negative `L_surface` finding is now
+**reproduced** at 12000K (same sign, same order of magnitude, $T_\text{surf}$ again
+landing $<1.3\%$ below $T_\text{NEB}=50$K) — confirmed a real, reproducible feature of this
+converged solution family rather than one-run noise, though still not explained; see
+`PLAN_BVP.md` §3.6.4 for the full trail. Recommended next diagnostic for the negative-`L`
+question: `time_stepper`'s first real-$dt$ step, not further isolated investigation.
+
+**⚠ `config.T_CENTER_INITIAL` is now 11500K, not 13000K** (changed 2026-08-07 - see the
+★ note above and §5's Milestone 6 entry) - 13000K became genuinely infeasible once the
+EOS's $\gamma$/$\mu$ were corrected to their physically-appropriate atomic values. The
+"Geometric Target" reasoning below explains why 13000K was chosen in the first place and
+remains accurate history; only the specific numeric value has since moved.
+
 **✅ `config.T_CENTER_INITIAL=13000`K decided ("Geometric Target" approach, 2026-08-01) —
 gives $R=4.15\,R_\text{Jup}$, not $\sim3$ as expected; flagged, not silently accepted.** The
 formation-scenario reframing (three stages: first hydrostatic core → dynamical second
@@ -117,12 +166,13 @@ remains the place for numerical trails and debugging history).
 | 1 | `config.py` + `state.py` | Done |
 | 2a–2e | `eos.py` (ideal-gas part) + `opacity.py` + validation | Done |
 | 2f | `eos.py` — non-ideal EOS, electron degeneracy pressure | Done, validated (2026-07-27) |
-| 3 | `gradients.py` (Schwarzschild criterion) | Done (includes the `L>=0` floor in `grad_radiative`, 2026-08-01) |
-| 4 | `odes.py` + `boundary_conditions.py` | Done (surface conditions revised, §5) |
-| 5 | `bvp_solver.py` ($t=0$ structure + relaxation to self-consistency) | **Done, verified end-to-end (2026-08-01)** — `solve_static_structure`, `relax_initial_state`, and `solve_timestep` all converge cleanly in sequence |
+| 3 | `gradients.py` (Schwarzschild criterion) | Done — `L>=0` floor and Schwarzschild `min()` switch both smoothed 2026-08-06 (were hard, now differentiable; §5) |
+| 4 | `odes.py` + `boundary_conditions.py` | Done (surface conditions revised, §5); reused unmodified by `bvp_experiment.py` |
+| 5 | `bvp_solver.py` ($t=0$ structure + relaxation to self-consistency) | `solve_static_structure` still in active use ($t=0$ seed, reused by `bvp_experiment.py`). **`relax_initial_state`/shooting machinery ARCHITECTURALLY ABANDONED 2026-08-06 — see §1's pivot note and `PLAN_BVP.md`.** |
+| — | `bvp_experiment.py` (new, `solve_bvp` — the active target architecture) | **★ CONVERGES (status=0, machine-precision residuals) at T=11500K AND T=12000K as of 2026-08-07** — state-vector scaling + analytic Jacobians + corrected EOS thermodynamics; see §5's Milestone 6 entry and `PLAN_BVP.md` §3.6/§3.6.4. Negative `L_surface` confirmed reproducible across both temperatures (not resolved, but no longer single-point); T=2000K confirmed out of scope for the atomic EOS, not re-attempted. Remaining item before promotion to production: full validation-suite pass. |
 | 6 | `diagnostics.py` | **Done (2026-08-01)** — visual plots + virial theorem/opacity regime checks rewritten for the compact structure, all pass |
-| 7 | `time_stepper.py` time derivatives | Original bootstrap now obsolete; code not yet updated |
-| 8–10 | Outer time loop, adaptive dt, output | Not started — blocked on 5–7 |
+| 7 | `time_stepper.py` time derivatives | Original bootstrap now obsolete; code not yet updated; will need to target `bvp_experiment.py`'s solver once stabilized, not `bvp_solver.relax_initial_state` |
+| 8–10 | Outer time loop, adaptive dt, output | Not started — blocked on `PLAN_BVP.md` Milestones 1–3 (T=13000K convergence) |
 
 **Stubs present but empty:** `main.py`, `ReadMe.txt`.
 
@@ -335,7 +385,6 @@ Unchanged.
 
 ### `gradients.py` — Schwarzschild criterion + new diagnostic helper
 
-`grad_radiative` and `effective_gradient` are unchanged. **New this session:**
 `marginal_convective_luminosity(m, P, T, kappa, grad_ad)` — inverts
 $\nabla_\text{rad}(L,\ldots)=\nabla_\text{ad}$ for $L$ in closed form (the "marginally
 efficient convection" closure). Used by `bvp_solver.solve_static_structure()` to populate a
@@ -343,6 +392,26 @@ physically meaningful, non-trivial $L(m)$ for a $t=0$ structure whose $T(m)$ was
 directly from the adiabat rather than solved for — not consumed by `solve_timestep` (which
 only ever interpolates `state_prev.T`, `.P`, never `.L`), so this is a diagnostic/plotting
 convenience, not something load-bearing for the time evolution itself.
+
+**`grad_radiative` and `effective_gradient` revised 2026-08-06** (§5 has the full
+diagnostic trail): both previously had a *hard* switch — `L_safe=max(L,0)` in
+`grad_radiative`, `nabla_eff=min(nabla_rad,nabla_ad)` (via `np.where`) in
+`effective_gradient` — each a genuine non-differentiable kink, confirmed by direct
+instrumentation to be blocking `relax_initial_state`'s adaptive $\alpha$-ramp at
+$T_\text{CENTER\_INITIAL}=13000$K. Both replaced with a smooth hyperbolic
+("smoothed absolute value"/pseudo-Huber) form, computed in the algebraically-equivalent,
+cancellation-safe way (`config.GRAD_RAD_L_FLOOR_EPSILON`,
+`config.GRAD_EFF_SWITCH_EPSILON` — see those constants' own comments for the full scale
+derivation and the two real bugs the standalone verification step caught before either was
+trusted). `is_convective`'s hard comparison is unchanged and still exact — it's
+informational only, never fed back into the ODE integration, so it doesn't need smoothing.
+**This fix is necessary but not sufficient**: a third, still-unresolved wall appeared in the
+same region of $\alpha$-space immediately after both were fixed (opacity's Bell & Lin hard
+regime switches are the leading unconfirmed suspect) — this, combined with the pattern of
+three independent kinks clustering in the same narrow region, motivated the 2026-08-06
+architectural decision (§5) to abandon shooting for `scipy.integrate.solve_bvp` entirely.
+`gradients.py` itself is unaffected by that pivot — it's reused unmodified by
+`bvp_experiment.py`.
 
 ### `odes.py` — the 4-ODE right-hand side
 
@@ -361,6 +430,15 @@ reasoning for why). The mechanical residual (`P_b - P_neb`) and both center resi
 place this session to match the new (nonlinear in $T_b$) formula.
 
 ### `bvp_solver.py` — shooting-method solver, $t=0$ and every $t>0$ step
+
+**⚠ 2026-08-06: shooting is architecturally ABANDONED — see §5's "Architectural decision"
+entry and `PLAN_BVP.md`.** `solve_static_structure()` (the $t=0$ adiabatic seed
+construction) remains in active use, reused unmodified by `bvp_experiment.py` to build
+initial guesses — but `relax_initial_state()` and the shooting/LM machinery described below
+are no longer the project's target solver, kept only as historical reference and a fallback
+until the `solve_bvp` pivot (`PLAN_BVP.md`) is proven. Everything below this note describes
+the shooting-era implementation and is retained for that historical record, not as current
+architecture guidance.
 
 **Substantially rewritten this session; current content described in full since this is
 the module under active investigation.**
@@ -574,6 +652,55 @@ before), `_integrate_timestep_outward` (now also event-based, same photosphere e
 at the photosphere event point, not a fixed grid endpoint). **Still not validated end-to-end**
 — blocked on `relax_initial_state` producing a usable `state_1` to test it against.
 
+### `bvp_experiment.py` — new 2026-08-06, the active `solve_bvp` architecture
+
+Standalone, isolated `scipy.integrate.solve_bvp` implementation — the project's target
+architecture going forward (§5's "Architectural decision" entry, `PLAN_BVP.md`). Imports and
+calls `bvp_solver.solve_static_structure`/`_build_output_grid`, `odes.stellar_odes`,
+`boundary_conditions.boundary_conditions`, `eos.grad_adiabatic` unmodified; reimplements
+only the RHS/BC glue as new, properly mesh-vectorized functions (`bvp_solver.
+_implicit_rhs_logm` is written for `solve_ivp`'s single-point-at-a-time contract and isn't
+directly reusable for `solve_bvp`, which evaluates the whole mesh at once). Same state
+representation as shooting (`y=[r, lnP, L, lnT]`, log $P$/$T$ for guaranteed positivity).
+
+Structurally simpler than shooting for the surface condition: since `M_TOTAL` is a known
+project constant (not a shooting unknown), the mass domain `[m_min, M_TOTAL]` is fixed, so
+the photospheric condition is a genuine boundary equation at the true endpoint — no
+`solve_ivp` event, no mass-matching residual. `P_center`/`T_center` are just `ya[1]`,
+`ya[3]`, part of the one global unknown `solve_bvp` solves for directly.
+
+**★ Current status (2026-08-07): CONVERGES at the project's active target, confirmed at
+TWO temperatures (T=11500K and T=12000K).** `status=0` at both; residuals to
+$9.79\times10^{-7}$ (11500K) and $8.88\times10^{-16}$ (12000K, tighter). Required, beyond the RHS/BC glue described above: a nondimensionalized state
+vector $z=[\hat r,\ln P,\hat L,\ln T]$ (`implicit_rhs_scaled`, `implicit_rhs_jacobian_scaled`,
+`make_bc_scaled`, `make_bc_jacobian_scaled` - `_to_physical`/`_to_scaled` convert to/from the
+original `y=[r,lnP,L,lnT]`), hand-derived analytic Jacobians (`fun_jac`/`bc_jac`, verified
+against finite differences before use - `verify_jacobians()`), corrected EOS thermodynamics
+in the shared `eos.py`/`odes.py`/`config.py` (γ, μ, δ - see §5's Milestone 6 entry), and a
+continuation endpoint of `ALPHA_MAX=1-1e-5` rather than literal `alpha=1.0` (empirically
+required - the exact endpoint diverges via mesh-explosion-to-NaN, `ALPHA_MAX` doesn't).
+`T_CENTER_INITIAL` moved 13000K→11500K as a direct consequence of the EOS correction (see
+`config.py`'s own comment). Toy-opacity substitution (Milestone 1) remains available but
+unused in this configuration - opacity was already ruled out as a cause.
+
+Getting here required six milestones (`PLAN_BVP.md` §3.0-3.6), each ruling out one
+candidate cause by direct, isolated test (ionization, dissociation-μ, opacity switches,
+center-BC self-consistency, log-space surface BC, FD-Jacobian imprecision) before Milestone
+6 combined nondimensionalization with the EOS corrections and succeeded. Two real
+implementation bugs were caught by the mandatory FD cross-check before the scaled Jacobian
+was trusted (§5's Milestone 6 entry has both); a third, more subtle case (the `bc_jac`
+verification metric itself producing a false-alarm on near-zero entries at T=2000K) was
+caught and fixed 2026-08-07 while preparing the second-temperature confirmation, mirroring
+the same fix already applied to `fun_jac`'s metric (row-normalized error, not per-entry).
+**Open items before this is production-ready**: a slightly negative `L_surface` — now
+confirmed reproducible at both tested temperatures (`PLAN_BVP.md` §3.6.4), not resolved but
+no longer a one-run curiosity; the `alpha=1.0`-specific instability's mechanism is inferred
+(regularization) not derived; a full validation-suite pass against a converged solution has
+not yet been run. T=2000K was attempted as a third data point and found to be outside the
+atomic/post-dissociation EOS regime (`config.MU`/`GAMMA` don't describe molecular H) — not
+re-attempted, documented as a scope boundary rather than a gap. `PLAN_BVP.md` §3.6/§3.6.4
+and §6 have the complete trail and the promotion plan - not duplicated further here.
+
 ### `diagnostics.py` — post-solve physical diagnostics
 
 **New this session (2026-08-01):** three visual diagnostic plots — `plot_structure_profile`
@@ -708,6 +835,341 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-07 — ★ Milestone 6 (PLAN_BVP.md): first genuine, fully-converged `solve_bvp` solution — state-vector nondimensionalization + EOS corrections (γ, μ, δ), executed under a one-week thesis deadline
+
+**This is the headline result of the `solve_bvp` pivot to date.** After Milestones 0–4 each
+independently ruled out a candidate physics/BC cause of the T=13000K near-photosphere
+crash without moving it at all, and after an independent scientific review (conducted in a
+separate session, its conclusions carried into `PLAN_BVP.md` directly) found the analytic
+Jacobian to be effectively singular at nearly every mesh point — traced to
+`gradients.effective_gradient`'s $d(\nabla_\text{eff})/d(\nabla_\text{rad})=0$ identically
+wherever convection has locally saturated (100% of the sampled profile, given the
+"infinitely-efficient convection" idealization) — a full mixing-length-theory fix was
+explicitly ruled out as too slow for the deadline. This entry documents the pragmatic
+alternative that was executed instead: attack the Jacobian's *conditioning* directly via
+nondimensionalization, and close two independent, silently-wrong physics terms at the same
+time, rather than the deeper structural rank issue.
+
+**1. Physics corrections — applied directly to `config.py`/`eos.py`/`odes.py` (shared,
+permanent, not `bvp_experiment.py`-local, since these are genuine model corrections, not
+solver-architecture experiments):**
+
+- `config.GAMMA`: $1.4\to5/3$, `config.MU`: $2.34\to1.278$. Stage 3 (this project's scope)
+  is, by definition, already past H$_2$ dissociation - the envelope is atomic, not
+  molecular, essentially everywhere in the relevant T range, so the molecular
+  (diatomic $\gamma=7/5$) values were wrong throughout. Consequence accepted in advance:
+  $\nabla_\text{ad}=(\gamma-1)/\gamma$ rises from 0.2857 to 0.4, a genuine ~40% shift in the
+  Schwarzschild threshold everywhere.
+- New `eos.thermodynamic_delta(rho,T,mu,mu_e)`: the energy equation's
+  $\delta=-(\partial\ln\rho/\partial\ln T)_P$ coefficient (Kippenhahn & Weigert eq. 4.26,
+  $dL/dm=-c_p\,dT/dt+(\delta/\rho)\,dP/dt$) was hardcoded to 1 in `odes.py` - exact only for
+  a pure ideal gas. Derived by implicit differentiation of the EOS's defining equation
+  ($\delta=P_\text{ideal}/(\rho D)$); verified against both limiting cases ($\to1$ ideal,
+  $\to0$ fully degenerate) and the actual T=11500K center density
+  ($\delta\approx0.205$ there - the old hardcoded value was off by nearly 5x at exactly the
+  point it mattered most, given degeneracy dominates this project's interior).
+- `config.T_CENTER_INITIAL`: $13000\text{K}\to11500\text{K}$ - a **direct, measured
+  consequence** of the $\gamma$/$\mu$ correction, not an independent choice. Swept
+  `mass_error(P_\text{center})` across nearly 6 orders of magnitude at 13000K under the
+  corrected EOS: it never reaches zero, its minimum overshoots $M_\text{TOTAL}$ by 5.36% -
+  no compact adiabatic seed exists there anymore (more ideal-gas thermal support at fixed
+  $\rho,T$ inflates the structure). Scanned T, found the feasibility boundary between
+  12000K (root exists, marginally, 0.9922) and 13000K (does not); chose 11500K for margin
+  (0.9613). `bvp_solver.solve_static_structure`'s bracket-search window was widened as a
+  related companion fix (`1.01`$^{200}$→`1.03`$^{300}$, ~7.3x→~7100x) - the same
+  T-independent-seed limitation already flagged for Sub-task 8a/Milestone 5, now also
+  binding here at the *current* target, not just at high T.
+
+**2. State-vector scaling — `bvp_experiment.py`-local.** New state
+$z=[\hat r,\ln P,\hat L,\ln T]$: $\hat r=r/R_\text{Jup}$ (linear),
+$\hat L=\operatorname{arcsinh}(L/L_\text{scale})$ (nonlinear, sign-preserving, log-like
+compression; $L_\text{scale}=$ `config.L_KH_SCALE_ERG_S`, already vetted this session).
+Motivated directly, not by intuition: a single Jacobian-verification point this session
+showed $L$ **28 orders of magnitude** larger than $\ln T$ in the same state vector Newton
+was inverting. The Jacobian transform required an extra, easy-to-drop nonlinear correction
+term ($-L/(L^2+L_\text{scale}^2)\cdot f_2(y)$, present only in the $\hat L$ row/column,
+since only $\hat L$'s scaling is nonlinear) beyond simple row/column rescaling - derived
+and implemented explicitly (`implicit_rhs_jacobian_scaled`).
+
+**Two real bugs caught by the mandatory FD cross-check, neither found by inspection:**
+1. `_to_physical(z)` intentionally returns $[r,\ln P,L,\ln T]$ (mixed, matching the
+   existing RHS convention), but the new scaled boundary-condition functions unpacked it as
+   fully physical - feeding `eos.density` $\ln P\approx25$ as if it were a pressure in
+   dyn/cm² (should be $\sim10^{11}$). Caught as a 25x `bc_jac`-vs-FD disagreement.
+2. A thermal-BC Jacobian term copied the already-chain-ruled $d/d(\ln T_b)$ form ($T_b^4$,
+   correct for the *old*, unscaled Jacobian) into a slot meant for the plain $d/dT_b$
+   derivative ($T_b^3$), then chain-ruled it a second time. Caught as a ~10x disagreement.
+
+After both fixes: `fun_jac` matches finite differences to $6.5\times10^{-7}$, `bc_jac` to
+$1.5\times10^{-5}$ - both comfortably inside the $10^{-4}$ verification gate, every sampled
+entry checked, not spot-checked.
+
+**3. Result.** With scaling + corrected physics + analytic Jacobians combined, the
+$\alpha$-continuation converged **cleanly through $\alpha=0.00,0.25,0.50,0.75$** -
+residuals to $9\times10^{-7}$, boundary residuals to machine precision
+($6.94\times10^{-18}$) - the first time in this entire investigation the ramp advanced past
+the historical $\alpha\approx0.05$-$0.09$ wall at all. The literal $\alpha=1.0$ endpoint
+initially still failed, via a *new* mode (exponentially escalating mesh refinement to NaN,
+not the old `eos.density` crash). Finer stepping showed $\alpha=0.9,0.95,0.98,0.99,0.995,
+0.999$ **all converge cleanly** - only the exact value 1.0 fails, regardless of step size
+approaching it. Since the real gradient term is computed identically at every $\alpha>0$,
+this points to the vanishing adiabatic admixture acting as a regularizer on a marginal
+instability in the pure unblended system (consistent with, though not fully derived from,
+the rank-deficiency finding above) - not a genuine physical discontinuity at $\alpha=1$.
+**Fix: `ALPHA_MAX=1-10^{-5}$`, not exactly 1.0** (0.001% adiabatic contamination,
+quantifiably negligible). With this, the full continuation **converges completely,
+`status=0`, every step**:
+
+```
+center:  P_c=1.152e+11 dyn/cm^2, T_c=1.152e+04 K   (self-consistent with the 11500K target)
+surface: R=5.109 R_Jup, T_surf=49.36 K, L_surf=-2.85e+23 erg/s (-7.4e-11 L_sun)
+max residual: 9.79e-7 | boundary residuals: ~1e-18 to 1e-36 (machine precision)
+```
+
+**Honest flag, not swept under the rug**: `L_surface` is slightly *negative* - internally
+consistent with the thermal BC (T_surf landed just below T_NEB=50K, and
+$L=4\pi r^2\sigma(T^4-T_\text{NEB}^4)$ is negative whenever the photosphere is marginally
+cooler than the ambient field), not a numerical artifact, but a genuine open physical
+question (net inward energy flow for a contracting, cooling protoplanet) not yet resolved.
+
+**What remains open, explicitly**: why $\alpha=1.0$ exactly is unstable while $0.9999$ is
+not (regularization is the working hypothesis, not a proven mechanism); the negative
+`L_surface` finding; this result is at T=11500K only, not yet re-tested at other
+temperatures; the underlying rank-deficiency (100% convective saturation) was routed
+around, not fixed - a real mixing-length treatment remains the mathematically complete fix
+and stays explicitly out of scope for this deadline. Full derivation, code changes, and
+this discussion are in `PLAN_BVP.md` §3.6 - not duplicated further here.
+
+### 2026-08-07 — Milestone 0 (PLAN_BVP.md): ionization ruled out as the cause of the T=13000K crash; a real but *different* gap found instead (dissociation, not ionization)
+
+**Context**: a joint architectural review proposed elevating `PLAN.md` Sub-task 8a
+(Saha-equation EOS ionization upgrade) to Priority 1, ahead of the `bvp_experiment.py`
+mesh/BC/opacity work, on the hypothesis that missing hydrogen ionization at
+$T_\text{CENTER\_INITIAL}=13000$K was mechanically forcing the observed near-photosphere
+`solve_bvp` crash. Rather than accept or reject that by argument, ran a cheap, decisive
+empirical test first (`PLAN_BVP.md` §3.0).
+
+**1. Saha ionization fraction, computed along the actual converged T=13000K profile**
+(pure-H Saha quadratic, He assumed neutral across this range given its much higher first
+ionization potential - a standard simplification, revisit only if warranted): negligible
+everywhere. Peak $x\approx5.9\times10^{-4}$ at the hottest point (the center); it falls
+monotonically outward and vanishes to $\lesssim10^{-70}$ well before the crash region
+(`m/M_TOTAL\ge0.999`), reaching $x\le4.5\times10^{-72}$ there. Hydrogen is not
+"significantly ionized" anywhere in this structure at this $T_\text{center}$ - the
+premise of the original hypothesis does not hold, quantitatively.
+
+**2. A real, separate gap was found in the same calculation**: `config.MU=2.34` is a
+*molecular* value, but this profile (already past H$_2$ dissociation, per Stage 3's own
+framing - PLAN.md's `T_CENTER_INITIAL` documentation) should use the neutral-*atomic*
+value, $\mu\approx1.278$ - a genuine $\approx1.83\times$ discrepancy, present essentially
+uniformly across the whole profile (both the hot interior and the crash region alike). The
+original intuition that "the model has roughly 3x too little thermal pressure" was
+directionally right in *magnitude* but wrong in *mechanism* - it's dissociation, not
+ionization, and the two call for very different fixes (a simple $\mu(T)$ correction vs.
+the full, much more numerically severe Saha-equation machinery of Sub-task 8a).
+
+**3. Direct sensitivity test, not just a plausibility argument**: holding the starting
+mesh/guess exactly fixed (the same well-matched `MU=2.34` seed every other T=13000K crash
+test used) and changing only `config.MU\to1.278` for the `solve_bvp` attempt itself, **the
+crash is unchanged** - same location (`m/M_TOTAL\gtrsim0.9995`), same `eos.density`
+Newton-Raphson failure mechanism, same near-instant (<0.1s) timing, for both the direct
+and continuation attempts. A first version of this test needed a widened bracket search
+(the default $\approx7.3\times$ geometric-expansion window failed under the new `MU`, the
+same class of failure already known at high T) and landed on a poorly-matched seed
+(`m_surface/M_TOTAL=1.43`); that version showed a more benign failure mode, but the clean
+rerun confirms this was the mismatched seed, not `MU`, doing the work - a useful caution
+for Sub-task 8a's/Milestone 5's own future seed-generation design, not just a footnote.
+
+**Decision**: `PLAN.md` Sub-task 8a / `PLAN_BVP.md` Milestone 5 (Saha) stays scheduled and
+still mandatory for physical accuracy (especially at the 40000K target) but is **not**
+elevated ahead of `bvp_experiment.py`'s mesh/BC/opacity work - the evidence points away
+from it as the cause of the current crash. `PLAN_BVP.md` §3.0 has the full result recorded
+against the milestone.
+
+**Follow-up physics finding, flagged for future work, independent of Sub-task 8a**: the
+verified $\approx1.83\times$ dissociation gap in `config.MU` is real and worth closing
+eventually, but does not need Saha's ionization machinery (and its documented severe
+stiffness) to fix - a much simpler, lower-risk dissociation-aware $\mu(T)$ correction
+(e.g. a smooth interpolation between the molecular value 2.34 and the atomic value ~1.28
+across the H$_2$ dissociation temperature range, no ionization physics needed) would close
+it far more cheaply. Not implemented; recorded here and in `PLAN_BVP.md` as a small,
+separately-schedulable future item, distinct from and much cheaper than Sub-task 8a.
+
+### 2026-08-06 — `bvp_experiment.py` built and run: partial convergence at T=2000K, decisive near-photosphere crash at T=13000K, hot-end seed generation blocked; `PLAN_BVP.md` roadmap established
+
+Following the architectural decision below, built `bvp_experiment.py` — a standalone,
+isolated `scipy.integrate.solve_bvp` implementation (imports and calls `bvp_solver.py`,
+`odes.py`, `boundary_conditions.py`, `eos.py` unmodified; reimplements only the RHS/BC glue
+as properly mesh-vectorized functions, since `bvp_solver._implicit_rhs_logm` is written for
+`solve_ivp`'s single-point contract and isn't directly reusable). Three timeboxed spot-checks
+(2000K, 13000K, 40000K), per the approved plan.
+
+**Structural note, confirmed by implementation, not just theory**: under `solve_bvp` the
+mass domain `[m_min, M_TOTAL]` is fixed and known exactly (`M_TOTAL` is a project constant,
+not a shooting unknown), so the photospheric condition becomes a genuine boundary equation
+evaluated at the true endpoint — no `solve_ivp` event, no mass-matching residual needed.
+`P_center`/`T_center` are no longer a separate outer root-find's unknowns; they're just
+`ya[1]`, `ya[3]`, solved for as part of the one global `y(x)` `solve_bvp` finds directly.
+
+**A real bug found and fixed along the way**: naively reusing
+`boundary_conditions.boundary_conditions(ya, yb)` for `solve_bvp`'s `bc()` forces
+`r(m_min)=0` *exactly* (its `r_a` residual is literally `ya[0]`) — correct for shooting,
+which always calls it with `ya=np.zeros(4)` as a placeholder (shooting enforces `r=r_seed>0`
+by constructing the integration's initial state, never checking a residual for it). Under
+`solve_bvp`, `ya` is a genuine unknown, and `r=0` exactly is a true $1/r^2$ singularity in
+`dr/dm` sitting on a real mesh point. Fixed by rebuilding the center residual to match
+`r(m_min)=r_\text{seed}` (the same value shooting seeds with), not `r(m_min)=0`.
+
+**T=13000K: decisive crash, both direct ($\alpha=1$) and continuation ($\alpha=0\to1$)
+attempts.** `solve_bvp`'s own Newton iteration — not the initial guess, tested across two
+mesh densities, two $L$-guess strategies, and the center-BC fix above — proposes $\ln P$ as
+extreme as $-5.3\times10^9$, concentrated exclusively at `m/M_TOTAL` $\in[0.9992, 1.000]$:
+the outermost ~0.08% of the mass, at the photosphere. Same physical region as the shooting
+kinks in the entry below.
+
+**T=2000K: genuinely more encouraging.** Direct attempt crashes the same way; the
+$\alpha$-continuation fallback runs 14 real Newton iterations, with the ODE/collocation
+residual converging to $9.99\times10^{-7}$ (near machine precision — the differential
+equations themselves are satisfied) while the *boundary-condition* residual stalls,
+oscillating around $2.68\times10^8$ (`status=3`, "unable to satisfy boundary conditions
+tolerance"). Not a clean pass, but real, attributable progress — and the clearest existing
+evidence that the boundary-condition system specifically, not the interior ODEs, is the
+harder piece to close.
+
+**T=40000K: blocked before `solve_bvp` runs at all.** `bvp_solver.solve_static_structure()`
+(existing, unmodified, shared by both architectures) cannot bracket a root for its $t=0$
+adiabatic seed. Also fails at 20000K and 25000K; 30000K did not resolve within a 10-minute
+check. Traced (not yet fixed) to the seed's geometric-expansion bracket search
+(`P *= 1.01`, 200 iterations $\Rightarrow$ only a fixed $\approx7.3\times$ window) starting
+from a **T-independent** T=0-degenerate-limit estimate — as thermal pressure support becomes
+non-negligible at higher T, the true root drifts further from that fixed seed. Whether a
+compact-radius root exists at all up there, or the search window is simply too narrow, was
+not distinguished this session (the diagnostic — a wide `mass_error(P)` sweep at 20000K —
+was proposed but not run). Independent, already-documented evidence (`config.py`'s
+`T_CENTER_INITIAL` comment: R already exceeds $4\,R_\text{Jup}$ by $T\sim1.7\times10^4$K and
+keeps climbing) suggests the fixed-`MU` ideal-gas term is the deeper cause, not just the
+search algorithm — tied directly to the already-mandatory Sub-task 8a (Saha ionization,
+PLAN.md).
+
+**Reviewed four hypotheses for why the T=13000K crash happens** (opacity-driven, boundary-
+formulation-driven, seed-generation-driven, and a "toy opacity" bootstrapping strategy) and
+consolidated the result into `PLAN_BVP.md` — the new forward-looking roadmap for the
+`solve_bvp` architecture, with four prioritized milestones (opacity bootstrapping, log-space
+boundary formulation, analytic Jacobians, Saha-equation high-T seeds). See that file for the
+full plan; not duplicated here.
+
+### 2026-08-06 — Architectural decision: shooting abandoned, `solve_bvp` (global relaxation) adopted as the sole path forward
+
+**The kink-whack-a-mole pattern became decisive.** This session found and fixed two
+independent hard non-smoothness sources in the shooting-based relaxation homotopy — see the
+entry below — and, immediately after both fixes, a **third** wall appeared at
+$\alpha\approx0.0466$: the residual plateaus at $\sim1.0\times10^{-4}$ regardless of step
+size shrinking to the (now-tightened) $10^{-6}$ floor, the same textbook signature as the
+first two. All three sit in essentially the same narrow neighborhood of the homotopy path and
+the same physical region of the star (the near-photosphere transition, `m/M_TOTAL`
+$\gtrsim0.84$). Opacity's Bell & Lin hard regime switches
+(`config.OPACITY_SMOOTH_TRANSITIONS=False`, already anticipated but never engaged) are the
+leading unconfirmed suspect for this third one.
+
+**Diagnosis**: shooting integrates the whole domain in one continuous pass, so any local
+non-smoothness anywhere along that path corrupts the signal the outer root-find sees at the
+far end — patching kinks one at a time as they're discovered is not a bounded, one-time cost,
+it scales with how much of the (T, $\rho$, opacity-regime, convective-boundary) space the
+project needs to cover, and the required scope ($\approx2000$–$40000$K) covers a lot of it.
+
+**Revisited the historical case against `scipy.integrate.solve_bvp`** (PLAN.md §4.2,
+abandoned July 2026) and found both of its two documented blockers plausibly obsolete: the
+rank-deficient-Jacobian failure was a structural artifact of the old `dT_dt=dP_dt=0` static
+formulation, which no longer exists anywhere in the codebase; the mesh-breaking near-surface
+boundary layer was diagnosed under the old `P(M_TOTAL)=P_neb` mechanical condition, since
+replaced by the photospheric BC, plus the log-$P$/log-$T$ state transform adopted afterward
+for an unrelated reason — both fixed later, for unrelated reasons, while working on shooting,
+never retested against `solve_bvp`.
+
+**Decision: shooting is abandoned. `solve_bvp` — a collocation/relaxation method, the same
+numerical family as Henyey's implicit relaxation used by essentially every production
+stellar-evolution code (MESA, STARS/TWIN, the classical Kippenhahn code) — is the sole path
+forward.** Physical baseline (EOS, opacity law, Schwarzschild criterion, photospheric BC,
+energy source, quasi-static assumption) explicitly reconfirmed and unchanged before any
+`solve_bvp` code was written — this is a numerical, not physical, pivot. Full physical
+baseline list and the empirical `solve_bvp` results are in the entry above and in
+`PLAN_BVP.md`.
+
+### 2026-08-06 — Two hard kinks in the relaxation homotopy fixed: `gradients.grad_radiative`'s $L\ge0$ floor and `gradients.effective_gradient`'s Schwarzschild switch; two real bugs caught by validation along the way
+
+**Confirmed, by direct instrumentation, that the $\alpha\approx0.046$ wall (previous
+entries) was the $L\ge0$ hard floor added 2026-08-01, not the earlier-diagnosed
+`fsolve`/residual-verification bug** (that bug is separately and correctly fixed — see prior
+entries; this is a second, different obstruction found immediately after). Monkey-patched
+`gradients.grad_radiative` to log every pre-floor-negative-$L$ call during the *exact*
+failing LM step: over 40,000 engagements in a single call, spanning `m/M_TOTAL=0.89-1.00`,
+with probed $L$ down to $\approx-8\times10^{54}$erg/s — 27 orders of magnitude beyond the
+physical scale — from finite-difference-probe-scale ($\sim10^{-7}$ relative) perturbations in
+$(P_\text{center}, T_\text{center})$. Both LM's outer finite-difference Jacobian and Radau's
+own inner implicit-stage Newton iteration (which also assumes RHS smoothness) were tripping
+on the same non-differentiable point.
+
+**Fixed with a smooth hyperbolic floor**, $L_\text{safe}=\max(L,0)+\tfrac12\epsilon^2/
+(\sqrt{L^2+\epsilon^2}+|L|)$ (the cancellation-safe form — see below), replacing the hard
+$L_\text{safe}=\max(L,0)$. **Two real bugs caught before this was trustworthy, both by the
+"verify standalone before wiring in" discipline**:
+
+1. **Epsilon chosen for the wrong regime, twice.** First pass ($\epsilon=10^{-3}\times$ a
+   fixed KH-luminosity scale) distorted $L$ by 21-24% right where the genuine T=13000K
+   solution lives — the KH-virial estimate is a fine *residual normalizer* (already used
+   elsewhere) but a bad *absolute smoothing-width anchor*, since it's known
+   ($\sim$78-320$\times$) larger than genuine converged $L$. Corrected to
+   $\epsilon=10^{-6}\times$ that scale ($\approx1.1\times10^{24}$erg/s) — then
+   `validation.py` Check 12 (an unrelated synthetic test point,
+   $L_\text{crit}\approx2.3\times10^{24}$erg/s) immediately broke, because that epsilon was
+   *also* comparable to, not negligible against, a completely different low-$L$ regime the
+   check happened to exercise. Landed on $\epsilon=10^{-9}\times$ the KH scale
+   ($\approx1.1\times10^{21}$erg/s), re-verified against both the standalone check and Check
+   12/13/14. **Lesson, stated generally**: a smoothing width must stay negligible against the
+   *smallest* value the function is ever plausibly handed, not just the one scale used to
+   derive it — a single incidental validation test point exposed the gap immediately.
+2. **Catastrophic cancellation in the naive formula.** `validation.py` Check 15 (a full
+   $T\in[100,50000]$K opacity sweep) caught `effective_gradient`'s naive smoothed-min
+   formula, $0.5(a+b)-0.5\sqrt{(a-b)^2+\epsilon^2}$, letting $\nabla_\text{eff}$ *exceed*
+   $\nabla_\text{ad}$ in float64 — mathematically impossible, but real in finite precision
+   when $|\nabla_\text{rad}|\sim10^8\gg\nabla_\text{ad}\sim0.29$: subtracting two
+   $O(10^8)$-scale quantities to recover an $O(0.1)$-scale result loses precision at the
+   scale of the large operand, not $\epsilon$. Fixed with the algebraically-equivalent,
+   cancellation-safe identity
+   $\sqrt{x^2+\epsilon^2}-|x|=\epsilon^2/(\sqrt{x^2+\epsilon^2}+|x|)$, applied to both the
+   $L$-floor and the Schwarzschild switch.
+
+**The Schwarzschild switch itself was a second, independent kink**, found the same way after
+the $L$-floor fix let the ramp advance further before stalling again at
+$\alpha\approx0.050946$: `gradients.effective_gradient`'s hard
+$\nabla_\text{eff}=\min(\nabla_\text{rad},\nabla_\text{ad})$ idealizes convection as
+infinitely efficient, snapping instantly to $\nabla_\text{ad}$ the moment
+$\nabla_\text{rad}$ crosses it. An instrumented trace of the failing LM call found
+$\nabla_\text{rad}$ within $3\times10^{-5}$ relative of $\nabla_\text{ad}$ ($=2/7$ exactly,
+`config.GAMMA=1.4`) at several profile points — the trial trajectory runs almost exactly
+along the convective boundary. Unlike the $L$-floor, this is not an artificial safety clamp
+— it's a real physical idealization (the standard smoother alternative is mixing-length
+theory's continuous interpolation by superadiabaticity, not implemented here — flagged as a
+new mandatory future sub-task in PLAN.md alongside 8a). Fixed as an interim *numerical*
+smoothing, same hyperbolic family, same cancellation-safe form,
+`config.GRAD_EFF_SWITCH_EPSILON=10^{-4}` (dimensionless — $\nabla_\text{rad}$/
+$\nabla_\text{ad}$ don't span the many-decade range $L$ does, so a single fixed epsilon is
+appropriate here without the regime-dependent derivation the $L$-floor needed).
+
+**Also**: `bvp_solver.relax_initial_state`'s `alpha_step_min` tightened
+$10^{-4}\to10^{-6}$, based on direct evidence (not assumption) that a secondary stopping
+point at $\alpha\approx0.0508$ was a genuine, smoothly-converging root that the old floor
+simply cut off one halving too early (residual shrank cleanly to below tolerance at a step
+just past the old floor) — contrasted explicitly against the real kink's signature (residual
+frozen at a fixed value regardless of arbitrarily small step size), which is what the third
+wall above showed instead, motivating the architectural decision rather than a fourth
+numerical patch.
+
+`validation.py` Checks 13/14 updated from exact-equality assertions to tolerance-based ones
+($10^{-4}$), since the smoothed switch is never bit-exact anywhere by construction — not a
+new check, maintenance to match the approved formula change, same pattern as the earlier
+`solve_static_structure` residual-assertion fix.
 
 ### 2026-08-01 — Solver algorithm evaluated and switched (fsolve→LM); does not fix the stall, but is a genuine improvement kept regardless
 

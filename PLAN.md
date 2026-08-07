@@ -847,5 +847,6 @@ insufficient," is no longer here — promoted out of Extensions to the mandatory
 | 6 | `diagnostics.py` | 5 | Standard (unconfined) virial theorem; multi-regime opacity; visual profile plots | **Done (2026-08-01)** |
 | 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Implemented, not yet validated — dry run prepared but not executed (2026-08-01) |
 | **8a** | **EOS ionization upgrade (Saha equation)** | **8** | **`solve_timestep` converges through a full ionization transition with honestly-tuned tolerances** | **Not started — mandatory, scheduled after 8** |
+| **8b** | **EOS dissociation correction (molecular → atomic $\mu(T)$, distinct from 8a)** | **—** | **`eos.py`'s ideal-gas $\mu$ smoothly interpolates molecular (2.34) → atomic (~1.28) across the H$_2$ dissociation range, instead of the fixed molecular value used everywhere** | **Not started — small, low-cost, independent of 8a (PROGRESS.md 2026-08-07 has the discovery; no ionization physics needed, much cheaper than Saha)** |
 | 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation | Not started — blocked on 7–8 |
 | 10 | `output.py` | all | Reproducible plots from `.npz` | Not started — blocked on 7–8 |

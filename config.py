@@ -35,8 +35,24 @@ T_NEB = 50.0     # Nebular gas temperature imposed at envelope surface, m = M_TO
 # ==========================================
 
 M_TOTAL = 1.898e30   # Total envelope mass, ~1 Jupiter mass [g]
-MU = 2.34            # Mean molecular weight of H2/He gas mixture [dimensionless]
-GAMMA = 1.4           # Adiabatic index of diatomic-dominated ideal gas [dimensionless]
+
+# CORRECTED 2026-08-07 (PLAN_BVP.md Milestone 0/5, PROGRESS.md has the full trail): MU=2.34
+# (molecular H2/He) and GAMMA=1.4 (diatomic) were carried over from an earlier, cooler-regime
+# assumption. Stage 3 (this project's actual scope, PLAN.md "Formation Scenario and Scope")
+# starts PAST H2 dissociation by construction (T_CENTER_INITIAL=13000K, well above the ~2000K
+# dissociation threshold) - the envelope is atomic, not molecular, essentially everywhere in
+# this project's T range. Milestone 0's Saha calculation confirmed ionization itself is
+# negligible here (peak x~5.9e-4), but also surfaced a SEPARATE, real ~1.83x gap: MU should be
+# the neutral ATOMIC value (~1.278, solar H/He: mu~4/(1+3X+Y), X~0.71,Y~0.27), not the
+# molecular one. GAMMA follows the same atomic-vs-molecular logic: monatomic species have only
+# 3 translational degrees of freedom (Cv=3/2*k_B, gamma=5/3), not diatomic's rotational modes
+# (Cv=5/2*k_B, gamma=7/5=1.4) - a bare H/He atom has no molecular bonds to store rotational
+# energy in. ASSUMPTION: still no ionization-dependent mu(rho,T) (that remains Sub-task 8a,
+# Saha equation, PLAN.md - confirmed non-negligible only in the tail of the T range, not
+# needed for the bulk of Stage 3) - this is the atomic-vs-molecular correction only, verified
+# independent of and much cheaper than that.
+MU = 1.278           # Mean molecular weight of neutral ATOMIC H/He mixture, post-dissociation [dimensionless]
+GAMMA = 5.0 / 3.0     # Adiabatic index of monatomic (atomic, post-dissociation) ideal gas [dimensionless]
 
 # ASSUMPTION: mean molecular weight PER ELECTRON (distinct from MU, mean weight per
 # particle) for eos.py's electron-degeneracy pressure term (Sub-task 2f). Standard estimate
@@ -72,7 +88,18 @@ MU_E = 1.17          # Mean molecular weight per electron, solar-like H/He compo
 # (consistent with genuinely being past H2 dissociation, Stage 3) but is NOT self-consistent
 # with respect to hydrogen ionization (Sub-task 8a) - accepted as a second-order error since
 # degeneracy pressure dominates the mechanical structure here.
-T_CENTER_INITIAL = 13000.0   # Prescribed central temperature of the t=0 compact protoplanet [K]
+#
+# LOWERED 2026-08-07 (13000K -> 11500K; PROGRESS.md/PLAN_BVP.md have the full trail): the
+# same session's MU/GAMMA correction (molecular->atomic, dissociation-consistent - see MU's
+# own comment above) increased ideal-gas thermal pressure support enough that 13000K's
+# adiabatic seed construction became genuinely INFEASIBLE, not just numerically hard to
+# bracket: swept P_center across nearly 6 orders of magnitude at 13000K and mass_error never
+# reached zero - its minimum still overshoots M_TOTAL by 5.36%, confirmed by direct
+# calculation, not assumed. A scan across T found the feasibility boundary between 12000K
+# (root exists, m_surface/M_TOTAL=0.9922 at best) and 13000K (infeasible) - 11500K sits
+# comfortably below that boundary (0.9613 at best) rather than right at its edge, while
+# staying well above the ~2000K H2-dissociation threshold that defines Stage 3's lower bound.
+T_CENTER_INITIAL = 11500.0   # Prescribed central temperature of the t=0 compact protoplanet [K]
 
 # ==========================================
 # SECTION: Grid & Solver Parameters

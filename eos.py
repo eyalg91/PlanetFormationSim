@@ -78,6 +78,37 @@ def density(P, T, mu, mu_e):
 
 
 # ==========================================
+# SECTION: Energy-Equation Thermodynamic Coefficient
+# ==========================================
+
+def thermodynamic_delta(rho, T, mu, mu_e):
+    """delta = -(d ln rho / d ln T)_P for the combined ideal+degenerate EOS (Kippenhahn &
+    Weigert eq. 4.26's energy-equation coefficient: dL/dm = -c_p*dT/dt + (delta/rho)*dP/dt).
+
+    ASSUMPTION (CORRECTED 2026-08-07, PROGRESS.md/PLAN_BVP.md have the full trail):
+    odes.py previously hardcoded delta=1, correct ONLY for a pure ideal gas. This project's
+    combined EOS (density()) is not pure ideal gas wherever degeneracy is non-negligible -
+    dominant in the interior at this project's T_center range - so that hardcoding was a
+    silent, systematic energy-equation error, independent of whether the solver converges.
+
+    Derived by IMPLICIT differentiation of the EOS's defining equation
+    P = P_ideal(rho,T) + P_deg(rho) = 0 (same method as the analytic Jacobian's eos density
+    derivatives): delta = P_ideal/(rho*D), D = dP_ideal_drho + dP_deg_drho (the same
+    denominator density()'s own Newton iteration uses for its convergence step).
+
+    Limiting-case check: delta -> 1 exactly as P_deg -> 0 (pure ideal gas, dP_ideal_drho/D ->
+    1); delta -> 0 as P_deg dominates (fully degenerate limit - degenerate pressure is
+    ~T-independent, so density stops responding to T at fixed P, exactly as expected).
+    """
+    dP_ideal_drho = config.K_B * T / (mu * config.M_H)
+    P_ideal = rho * dP_ideal_drho
+    P_deg = degenerate_pressure(rho, mu_e)
+    dP_deg_drho = (5.0 / 3.0) * P_deg / rho
+    D = dP_ideal_drho + dP_deg_drho
+    return P_ideal / (rho * D)
+
+
+# ==========================================
 # SECTION: Specific Heat and Adiabatic Gradient
 # ==========================================
 
