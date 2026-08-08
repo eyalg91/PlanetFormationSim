@@ -352,6 +352,25 @@ R_SCALE = config.R_JUPITER_CM         # [cm] - true constant, r/R_SCALE is a LIN
 L_SCALE = config.L_KH_SCALE_ERG_S     # [erg/s] - already-vetted KH-luminosity reference (config.py)
 
 
+def _interp_state_prev(m, state_prev):
+    """(T_prev, P_prev) at mass m, interpolated from state_prev's own (coarser) grid - used
+    by both implicit_rhs_vectorized and implicit_rhs_jacobian for the dT_dt=(T-T_prev)/dt,
+    dP_dt=(P-P_prev)/dt source terms.
+
+    2026-08-08 (PROGRESS.md): a log-space variant of this interpolation was tried as a
+    candidate fix for the step-2 solve_timestep convergence failure (state_prev's own output
+    grid is measurably too coarse near T_surface->T_NEB - up to ~1-2% error against the true
+    dense solve_bvp interpolant). Confirmed via an isolated test NOT to fix step 2, and to
+    make relax_initial_state itself measurably harder (52949 vs 21682 nodes) by shifting
+    which nearby equally-valid solution the continuation converges to - reverted to plain
+    linear interpolation pending the wide-epsilon Schwarzschild-switch investigation instead
+    (the dominant cause: a genuine marginal-convection band, not an interpolation artifact).
+    """
+    T_prev = np.interp(m, state_prev.m, state_prev.T)
+    P_prev = np.interp(m, state_prev.m, state_prev.P)
+    return T_prev, P_prev
+
+
 def _to_physical(z):
     """z=[r_hat, lnP, L_hat, lnT] -> y=[r, lnP, L, lnT] (physical, P/T still log). L=L_SCALE*
     sinh(L_hat) is the exact inverse of L_hat=arcsinh(L/L_SCALE)."""
@@ -397,8 +416,7 @@ def implicit_rhs_vectorized(x, y, state_prev, dt, alpha):
               f"m/M_TOTAL in [{(m[idx]/config.M_TOTAL).min():.3e}, {(m[idx]/config.M_TOTAL).max():.3e}], "
               f"lnP range=[{np.nanmin(lnP[idx]):.3e},{np.nanmax(lnP[idx]):.3e}], "
               f"lnT range=[{np.nanmin(lnT[idx]):.3e},{np.nanmax(lnT[idx]):.3e}]", flush=True)
-    T_prev = np.interp(m, state_prev.m, state_prev.T)
-    P_prev = np.interp(m, state_prev.m, state_prev.P)
+    T_prev, P_prev = _interp_state_prev(m, state_prev)
     dT_dt = (T - T_prev) / dt
     dP_dt = (P - P_prev) / dt
     y_full = np.array([r, P, L, T])   # shape (4, n) - odes.stellar_odes's native contract
@@ -530,8 +548,7 @@ def implicit_rhs_jacobian(x, y, state_prev, dt, alpha):
     # Row 2: f2 = dL_dm = -c_p*dT_dt + delta*dP_dt/rho, depends on P, T only (not r, not L
     # itself). delta is the genuine EOS-dependent coefficient (eos.thermodynamic_delta),
     # PLAN_BVP.md Milestone 6.
-    T_prev = np.interp(m, state_prev.m, state_prev.T)
-    P_prev = np.interp(m, state_prev.m, state_prev.P)
+    _T_prev, P_prev = _interp_state_prev(m, state_prev)
     dP_dt = (P - P_prev) / dt
     delta = eos.thermodynamic_delta(rho, T, config.MU, config.MU_E)
     ddelta_dP, ddelta_dT = _thermodynamic_delta_derivatives(rho, T, drho_dP, drho_dT, delta)
@@ -883,7 +900,7 @@ def _attempt_continuation_solve(state_prev, dt, bc, bc_jac, x, y_guess, alpha_st
     return sol, total_elapsed
 
 
-def _solve_structure_bvp(state_prev, dt, warm_start_L):
+def _solve_structure_bvp(state_prev, dt, warm_start_L, switch_epsilon):
     """Shared solve_bvp orchestration for both relax_initial_state (dt=pseudo-relaxation
     timestep) and solve_timestep (dt=real elapsed time) - both warm-start the mesh/initial
     guess from state_prev's own profile (matching the old shooting code's warm-start
@@ -891,6 +908,15 @@ def _solve_structure_bvp(state_prev, dt, warm_start_L):
     actual previous converged state). warm_start_L: see _build_mesh_and_guess's docstring -
     False for relax_initial_state (state_0.L is diagnostic-only), True for solve_timestep
     (state_prev.L is a genuine previously-converged solution).
+
+    switch_epsilon: the Schwarzschild-switch smoothing width (gradients.effective_gradient)
+    to use for THIS solve - config.GRAD_EFF_SWITCH_EPSILON's own comment has the full
+    reasoning (2026-08-08). Applied by temporarily overriding config.GRAD_EFF_SWITCH_EPSILON
+    for the duration of the solve (same try/finally pattern _build_mesh_and_guess already
+    uses for N_GRID_POINTS/GRID_OUTER_REFINEMENT) rather than threading a new parameter
+    through gradients.py/odes.py - keeps those modules' existing pure-function signatures
+    untouched; the choice of WHICH epsilon to use is entirely bvp_solver.py's own
+    orchestration concern.
 
     Attempts a direct alpha=1 solve first (cheap, matches the old shooting solve_timestep's
     behavior of not re-relaxing every step); falls back to the config.BVP_ALPHA_CONTINUATION_
@@ -905,13 +931,19 @@ def _solve_structure_bvp(state_prev, dt, warm_start_L):
     x, y_guess = build_mesh_and_guess_scaled(state_prev, warm_start_L)
     _smoke_test_vectorization(state_prev, dt, bc, x, y_guess)
 
-    print("bvp_solver: attempting direct solve_bvp at alpha=1.0 ...", flush=True)
-    sol, elapsed = _attempt_direct_solve(state_prev, dt, bc, bc_jac, x, y_guess, alpha=1.0)
-    if sol.status != 0:
-        print(f"bvp_solver: direct solve_bvp did not converge (status={sol.status}, "
-              f"{sol.message}) after {elapsed:.1f}s - falling back to alpha-continuation", flush=True)
-        sol, elapsed = _attempt_continuation_solve(state_prev, dt, bc, bc_jac, x, y_guess,
-                                                    config.BVP_ALPHA_CONTINUATION_STEPS)
+    switch_epsilon_orig = config.GRAD_EFF_SWITCH_EPSILON
+    config.GRAD_EFF_SWITCH_EPSILON = switch_epsilon
+    try:
+        print(f"bvp_solver: attempting direct solve_bvp at alpha=1.0 (switch_epsilon="
+              f"{switch_epsilon:.1e}) ...", flush=True)
+        sol, elapsed = _attempt_direct_solve(state_prev, dt, bc, bc_jac, x, y_guess, alpha=1.0)
+        if sol.status != 0:
+            print(f"bvp_solver: direct solve_bvp did not converge (status={sol.status}, "
+                  f"{sol.message}) after {elapsed:.1f}s - falling back to alpha-continuation", flush=True)
+            sol, elapsed = _attempt_continuation_solve(state_prev, dt, bc, bc_jac, x, y_guess,
+                                                        config.BVP_ALPHA_CONTINUATION_STEPS)
+    finally:
+        config.GRAD_EFF_SWITCH_EPSILON = switch_epsilon_orig
 
     if sol.status != 0:
         raise RuntimeError(
@@ -922,10 +954,20 @@ def _solve_structure_bvp(state_prev, dt, warm_start_L):
 
 
 def _bvp_solution_to_state(sol, m_min, state_prev, t) -> state.SimulationState:
-    """Converts a converged scaled-state solve_bvp solution into a SimulationState on the
-    standard composite output grid. solve_bvp's domain [m_min, M_TOTAL] is FIXED and known
-    exactly (unlike shooting's event-determined surface) - a structural simplification of
-    this pivot, not an approximation."""
+    """Converts a converged scaled-state solve_bvp solution into a SimulationState. solve_bvp's
+    domain [m_min, M_TOTAL] is FIXED and known exactly (unlike shooting's event-determined
+    surface) - a structural simplification of this pivot, not an approximation.
+
+    2026-08-08 (PROGRESS.md): a densified BVP_MESH_N_GRID_POINTS/BVP_MESH_OUTER_REFINEMENT
+    output grid (matching _build_mesh_and_guess's own densification) was tried as a candidate
+    fix for the step-2 solve_timestep convergence failure - state_prev's coarse default
+    N_GRID_POINTS=200/GRID_OUTER_REFINEMENT=1e-4 grid measurably failed to represent the true
+    dense solve_bvp solution (~1-2% error) near T_surface->T_NEB. An isolated test (with the
+    log-interpolation fix also reverted) confirmed this was NOT the decisive fix either -
+    reverted to the plain default grid pending the wide-epsilon Schwarzschild-switch
+    investigation instead (the dominant cause: a genuine marginal-convection band, not a
+    resolution artifact).
+    """
     m = _build_output_grid(m_min, config.M_TOTAL)
     z = sol.sol(np.log(m))
     r, lnP, L, lnT = _to_physical(z)
@@ -954,7 +996,8 @@ def relax_initial_state(state_0) -> state.SimulationState:
     collocation (PLAN_BVP.md Milestone 6) - same physical role, different numerical method.
     """
     dt_relax = config.RELAX_DT_FRACTION * config.T_KH_TIMESCALE_S
-    sol, m_min = _solve_structure_bvp(state_0, dt_relax, warm_start_L=False)
+    sol, m_min = _solve_structure_bvp(state_0, dt_relax, warm_start_L=False,
+                                       switch_epsilon=config.GRAD_EFF_SWITCH_EPSILON)
     return _bvp_solution_to_state(sol, m_min, state_0, t=state_0.t)
 
 
@@ -963,7 +1006,12 @@ def solve_timestep(state_prev, dt) -> state.SimulationState:
 
     2026-08-08: re-platformed from shooting (bvp_solver_shooting_archive.py) onto solve_bvp
     (PLAN_BVP.md Milestone 6) - same physical role (implicit Henyey-style time differencing,
-    photospheric + net-flux-radiative surface conditions), different numerical method.
+    photospheric + net-flux-radiative surface conditions), different numerical method. Uses
+    config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP (wider than relax_initial_state's switch width -
+    see that constant's own comment) - a real timestep can collapse the outer envelope's L
+    enough to land the whole outer profile in a genuinely marginal-convection band that the
+    narrow switch cannot resolve without the mesh growing without bound.
     """
-    sol, m_min = _solve_structure_bvp(state_prev, dt, warm_start_L=True)
+    sol, m_min = _solve_structure_bvp(state_prev, dt, warm_start_L=True,
+                                       switch_epsilon=config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP)
     return _bvp_solution_to_state(sol, m_min, state_prev, t=state_prev.t + dt)

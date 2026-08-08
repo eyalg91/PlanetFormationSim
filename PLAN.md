@@ -768,22 +768,53 @@ as the star contracts — see PROGRESS.md for the virial-theorem argument) — o
 steps to be clearly above numerical noise; exact step count/$dt$ to be determined
 empirically. Additionally verify the radius halt with an artificially-raised `R_HALT`.
 
-**Status: PARTIALLY validated (2026-08-08)** — `time_stepper.run()` is unchanged code-wise,
-but now runs against the promoted `solve_bvp` solver (PLAN.md §4.2's 2026-08-08 update)
-instead of shooting; `main.py` implements the dry-run entry point this status note used to
-say was missing. Executed: `state_0 = solve_static_structure()` → `relax_initial_state()` →
-`time_stepper.run(..., n_steps=10, dt=1e4 yr)`. **Result: the first real step converged
-cleanly** (`status=0`), and its physical trend is exactly this sub-task's exit criterion,
-one step deep — $T_\text{center}$ 11523.59→11520.10K and $r_\text{surface}$
-5.1089→5.1069 $R_\text{Jup}$, both decreasing (contraction); $T_\text{surface}$ moved to
-within 0.02% of $T_\text{NEB}$ and $|L_\text{surface}|$ dropped ~70x, informative for the
-standing negative-$L_\text{surface}$ question (PROGRESS.md 2026-08-08 has the full numbers).
-**But the SECOND real step does not yet converge** within a generously raised node budget,
-diagnosed as a genuine local difficulty (super-linearly growing mesh-node requirement, not
-a simple resolution shortfall) rather than solved — PROGRESS.md 2026-08-08 has the full
-diagnostic trail. **Not yet a validated sustained multi-step trend, and not yet a full run
-to `config.R_HALT`** — do not mark this sub-task fully done until a run of several
-consecutive real steps succeeds.
+**Status: ★★ Dry-run exit criterion MET (2026-08-08)** — `time_stepper.run()` is unchanged
+code-wise, but now runs against the promoted `solve_bvp` solver (PLAN.md §4.2's 2026-08-08
+update) instead of shooting; `main.py` implements the dry-run entry point this status note
+used to say was missing. Executed: `state_0 = solve_static_structure()` →
+`relax_initial_state()` → `time_stepper.run(..., n_steps=10, dt=1e4 yr)`.
+
+The first real step converged cleanly but a genuine obstacle appeared at the second: a real
+timestep can collapse the outer envelope's $L$ enough (confirmed ~70x in one step) to move
+the whole outer profile from deeply convective into a genuinely MARGINAL convective/
+radiative band (grad_rad landing within a few percent of grad_ad, with multiple sign
+changes, across an extended mass range) — `gradients.py`'s smoothed but numerically narrow
+Schwarzschild switch cannot resolve this without the collocation mesh growing without bound.
+Diagnosed via a full-profile superadiabaticity histogram and direct mesh-concentration
+inspection, not assumed (PROGRESS.md 2026-08-08 has the complete trail, including two
+candidate fixes tried and reverted — log-space `state_prev` interpolation and a densified
+output grid — neither of which was the decisive lever).
+
+**Resolved via a deliberate, explicitly-labeled numerical expedient** (mixing-length theory
+is the mathematically complete fix but was ruled out as too risky for the one-week deadline
+— now formally scheduled as Sub-task 8c, post-thesis): `config.
+GRAD_EFF_SWITCH_EPSILON_TIMESTEP` widens the Schwarzschild switch's smoothing width by
+~4 orders of magnitude, but ONLY for `solve_timestep`'s real-$dt$ solves —
+`relax_initial_state` keeps the original narrow value unchanged, since a single *global*
+widened value was tested first and found to be a genuine either/or (it fixes `solve_timestep`
+but introduces a real regression in `relax_initial_state`, a NaN divergence, not solved by
+this project's whole session of prior work). The value itself was tuned honestly, not
+guessed once and trusted: $\varepsilon=0.1$ (measured margin above the 0.05-0.07 failure
+boundary) got a 5-step chain through cleanly, but a full 10-step run failed at step 6 with
+the same mesh-runaway signature — the marginal band's difficulty evolves step to step, not a
+one-time obstacle. $\varepsilon=0.5$ was retried (already validated once in isolation) and
+**got all 10 steps through cleanly**.
+
+**Result — the dry-run exit criterion is now genuinely met, not just asserted:**
+$T_\text{center}$ decreases smoothly and monotonically over all 10 steps
+(11519.92→11487.93K), $r_\text{surface}$ likewise (5.1035→5.0863 $R_\text{Jup}$) —
+contraction, exactly as required. $L_\text{surface}$ stays positive and nonzero throughout
+(2.13→2.68 ×$10^{-11}$ $L_\odot$), with shrinking step-to-step increments consistent with
+settling toward quasi-steady radiative equilibrium rather than diverging or decaying to
+zero — resolving the standing negative-$L_\text{surface}$ question as a relaxation-
+pseudo-timestep transient, not a persistent bug.
+
+**Honest limitation, not glossed over**: only validated for 10 real steps at
+$\varepsilon=0.5$; there is no proof this value holds indefinitely if the marginal band's
+demands keep growing with further evolution (config.py's own comment says the same). Not
+yet a full run to `config.R_HALT` (5 $R_\text{Jup}\to1\,R_\text{Jup}$ is thousands of steps
+at this `dt`) — re-apply the same margin-finding discipline before attempting a longer run,
+don't assume this value scales.
 
 ---
 
@@ -838,6 +869,59 @@ transition (tracked via $x(\rho,T)$ crossing 0.5) without numerical failure, usi
 honestly-tuned `dt`/`atol`/`rtol` — not a workaround that masks non-convergence.
 
 **Status: Not started — scheduled after Sub-task 8.**
+
+---
+
+#### Sub-task 8c — Mixing-Length Theory (MLT) Convection Treatment — **MANDATORY before quantitative trust in sustained multi-step evolution; formally deferred past the one-week thesis deadline**
+
+**Why this is mandatory, not optional polish.** `gradients.py`'s Schwarzschild switch
+($\nabla_\text{eff}=\min(\nabla_\text{rad},\nabla_\text{ad})$, smoothed only for numerical
+differentiability) idealizes convection as infinitely efficient — instantaneous, lossless
+heat transport the instant $\nabla_\text{rad}$ exceeds $\nabla_\text{ad}$, with zero
+sensitivity to *how much* it exceeds it. This is the direct cause of two independent
+numerical failures found this project (2026-08-06's `relax_initial_state` alpha-ramp wall;
+2026-08-08's `solve_timestep` step-2 mesh explosion, PROGRESS.md has the full diagnostic
+trail for both) — not a coincidence, but the same underlying idealization surfacing twice,
+from opposite directions (saturated-convective rank deficiency, then marginal-convective
+mesh explosion as a real timestep collapses the outer envelope's $L$).
+
+**Interim expedient in place, not a fix (2026-08-08).** `config.
+GRAD_EFF_SWITCH_EPSILON_TIMESTEP` widens the same smoothed switch's transition width by
+~3 orders of magnitude, but ONLY for `bvp_solver.solve_timestep`'s real-$dt$ solves — a
+purely numerical regularization (confirmed, not assumed: it measurably distorts
+$T_\text{surface}$/$L_\text{surface}$ by an amount that scales with the chosen width, e.g.
+$\sim$0.17K/14x respectively between $\varepsilon=0.1$ and $\varepsilon=0.5$ — PROGRESS.md),
+not an approximation to MLT's actual physics (no convective velocity, no mixing length, no
+genuine dependence on superadiabaticity). Chosen and verified over a real 5-step evolution
+run, with margin above the measured failure boundary — but it does not know how the true
+convective flux scales with superadiabaticity, so its accuracy in the transition layer is
+unverified beyond "the bulk quantities barely move and the run doesn't crash."
+
+**Deliverables (design, not yet started):**
+- Standard mixing-length closure (Böhm-Vitense 1958; Kippenhahn & Weigert Ch. 7): convective
+  flux and $\nabla_\text{eff}$ as continuous functions of the local superadiabaticity
+  $(\nabla_\text{rad}-\nabla_\text{ad})$, mixing length $\ell=\alpha_\text{MLT}H_P$ (pressure
+  scale height $H_P$, calibration parameter $\alpha_\text{MLT}\sim1$-$2$), replacing the
+  binary switch with the cubic equation for convective velocity these theories reduce to.
+- Analytic derivatives of the MLT closure for `bvp_solver.py`'s `fun_jac` (the whole point —
+  a genuinely smooth, physically-motivated $\nabla_\text{eff}(\nabla_\text{rad},P,T,\ldots)$
+  removes the need for `GRAD_EFF_SWITCH_EPSILON`/`GRAD_EFF_SWITCH_EPSILON_TIMESTEP`
+  entirely, not just widen them) — cross-checked against finite differences before use, same
+  discipline as every other analytic Jacobian in this codebase.
+- Re-validate `relax_initial_state`/`solve_timestep` against the new closure; confirm the
+  interim wide-epsilon expedient can be fully retired (both constants removed from
+  `config.py`) rather than kept as a parallel fallback.
+- Re-run the negative-$L_\text{surface}$/$T_\text{surface}\to T_\text{NEB}$ diagnostics
+  under the real closure — the interim expedient's own distortion of that exact region means
+  its current read on this question should be treated as provisional, not final.
+
+**Exit criterion:** `solve_timestep` runs a sustained multi-step (tens of steps, not just
+the 5 validated under the interim expedient) evolution using the genuine MLT closure, with
+`GRAD_EFF_SWITCH_EPSILON_TIMESTEP` no longer needed to prevent mesh explosion.
+
+**Status: Not started — deliberately deferred past the one-week thesis deadline (explicit
+user decision, 2026-08-08); the interim wide-epsilon expedient above is what unblocks
+Sub-task 8's dry run in the meantime.**
 
 ---
 

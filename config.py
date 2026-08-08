@@ -277,6 +277,63 @@ GRAD_RAD_L_FLOOR_EPSILON = 1.0e-9 * L_KH_SCALE_ERG_S   # Smoothing width of grad
 # at that scale, purely from catastrophic cancellation, not a math error) - see its comment.
 GRAD_EFF_SWITCH_EPSILON = 1.0e-4   # Smoothing width of effective_gradient's min(grad_rad,grad_ad) switch [dimensionless]
 
+# ASSUMPTION 2026-08-08 (PROGRESS.md - full diagnostic trail): a SECOND, wider smoothing
+# width, used ONLY by bvp_solver.solve_timestep's real-dt solves (relax_initial_state keeps
+# the narrow GRAD_EFF_SWITCH_EPSILON above, unchanged - proven robust at every T_center
+# tested this session). Motivation: a real timestep can collapse the outer envelope's L by
+# ~70x in one step (the Kelvin-Helmholtz source term legitimately shrinking as the surface
+# approaches radiative equilibrium), dragging grad_rad down from deeply super-adiabatic
+# (ratio to grad_ad of 100-1000x) to GENUINELY MARGINAL (grad_rad landing within a few
+# percent of grad_ad, with MULTIPLE sign changes, across an extended mass range m/M_TOTAL in
+# [0.993, 0.99998]) - confirmed directly via a full-profile superadiabaticity histogram, not
+# assumed. At the narrow GRAD_EFF_SWITCH_EPSILON, solve_bvp's adaptive mesh refinement chases
+# this band's curvature (~1/eps) without bound (node count grew super-linearly,
+# 43569->79660->129932, rather than plateauing, confirming a genuine local difficulty, not a
+# simple resolution shortfall). A single GLOBAL widened epsilon was tried first and found to
+# be a genuine either/or: eps>=0.07 fixes solve_timestep but BREAKS relax_initial_state's own
+# continuation (a real regression - NaN residual at alpha=0.999, not just more nodes needed),
+# because state_0's own forced-adiabat construction has a different-shaped near-surface
+# transition that the SAME widened switch distorts. The two failure modes are cleanly
+# separated by WHICH FUNCTION is calling, not by anything varying within a call, so a
+# context-dependent value (narrow for relax_initial_state, wide for solve_timestep) resolves
+# both: verified over a full 5-real-step chain (dt=1e4 yr each) - T_center and r_surface
+# decrease smoothly and monotonically (contraction, PLAN.md Sub-task 8's exit criterion),
+# T_surface/L_surface settle toward a small, steady, slightly-positive value near T_NEB with
+# shrinking step-to-step increments (consistent with relaxing toward quasi-steady radiative
+# equilibrium, not diverging).
+#
+# HONESTLY, NOT A PHYSICAL MODEL: this is a purely numerical regularization of the
+# infinitely-efficient-convection idealization, not an approximation to mixing-length theory
+# (no convective velocity, no mixing length, no dependence on superadiabaticity beyond this
+# switch's own smoothing) - it trades a small, LOCALIZED distortion of the thin near-surface
+# transition layer's exact T(m) gradient (confirmed to affect T_surface/L_surface measurably,
+# e.g. ~0.17K/14x respectively between eps=0.1 and eps=0.5 - PROGRESS.md) for numerical
+# tractability of the outer time loop. Bulk quantities (T_center, r_surface, core structure)
+# are affected far less (<0.1% between those same two eps values) since the affected zone is
+# an extremely thin, low-mass surface layer. A genuine mixing-length treatment remains the
+# mathematically complete fix and is formally scheduled as future work (PLAN.md, post-thesis
+# - explicitly out of scope for the one-week deadline this was developed under).
+#
+# Value chosen with margin, not guessed - and revised once, honestly, when the first choice
+# proved insufficient: swept eps in [0.01, 0.5] against the step-2 failure specifically -
+# the boundary there is between 0.05 (fails) and 0.07 (succeeds), so eps=0.1 (~1.5-2x margin)
+# was tried first and DID resolve step 2 and a validated 5-real-step chain cleanly. But a
+# full 10-step dry run (PLAN.md Sub-task 8, PROGRESS.md 2026-08-08) failed at step 6 with
+# eps=0.1 - the same super-linear mesh-growth signature, meaning the marginal-convection
+# band's difficulty is not a fixed, one-time obstacle but continues to evolve step to step,
+# and eps=0.1's margin was not enough beyond step 5. eps=0.5 (already validated once, in
+# isolation, for step 2, with an even more comfortable direct convergence than 0.1) was
+# retried for the full chain and got through all 10 steps cleanly. Since relax_initial_state
+# uses the SEPARATE, unchanged GRAD_EFF_SWITCH_EPSILON above and never sees this constant,
+# raising this value carries no risk of reopening that regression - confirmed directly
+# (relax_initial_state's own regression check is unaffected either way).
+#
+# HONEST LIMITATION, not swept under the rug: only validated for 10 real steps. If a longer
+# production run is attempted later, re-apply the same margin-finding discipline (sweep a
+# candidate value against the actual failing step, don't assume 0.5 holds indefinitely) -
+# there is no proof yet that the marginal band's demands plateau rather than keep growing.
+GRAD_EFF_SWITCH_EPSILON_TIMESTEP = 5.0e-1   # Wider smoothing width, solve_timestep's real-dt solves only [dimensionless]
+
 # ==========================================
 # SECTION: Simulation Halt Condition
 # ==========================================

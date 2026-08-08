@@ -11,6 +11,27 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**★★★ 2026-08-08 (later same day) — Sub-task 8's dry-run exit criterion MET: a genuine
+10-step time evolution, monotonic contraction, negative-$L_\text{surface}$ question
+resolved.** Supersedes the "open, not yet resolved" step-2 item in the ★★ entry directly
+below. Full trail: §5's "Multi-step time evolution achieved" entry (2026-08-08, above the
+promotion entry in the log). Short version: the step-2 mesh explosion was genuine marginal
+convection (verified via a superadiabaticity histogram, not assumed) — a real timestep can
+collapse the outer envelope's $L$ ~70x, moving $\nabla_\text{rad}$ from deeply
+super-adiabatic to sitting within a few percent of $\nabla_\text{ad}$ across an extended
+band. Two candidate interpolation fixes were tried and honestly reverted (neither was
+decisive). Resolved via a **context-dependent** Schwarzschild-switch smoothing width — the
+user's proposed "wide smoothing" compromise, explicitly not MLT — narrow
+(`config.GRAD_EFF_SWITCH_EPSILON=1e-4`, unchanged) for `relax_initial_state`, wide
+(`config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP=0.5`, tuned with margin, revised once from an
+initial 0.1 that failed at step 6) for `solve_timestep` only. A full 10-step dry run now
+shows $T_\text{center}$/$r_\text{surface}$ decreasing smoothly and monotonically
+(contraction) and $L_\text{surface}$ settling to a small, steady, positive value with
+shrinking increments — resolving the negative-$L$ question as a relaxation-transient, not a
+bug. Genuine MLT remains formally scheduled (new `PLAN.md` Sub-task 8c), explicitly deferred
+past the one-week deadline. **Honest limit**: only validated for 10 steps; not proof the
+chosen $\varepsilon$ holds for an arbitrarily long run.
+
 **★★ 2026-08-08 — `bvp_experiment.py`'s `solve_bvp` machinery PROMOTED to production;
 shooting retired for t>0; first genuine real-time step achieved.** `PLAN_BVP.md`'s roadmap
 is complete and merged into `PLAN.md` (§4.2, Sub-task 5 update). Concretely:
@@ -23,12 +44,16 @@ is complete and merged into `PLAN.md` (§4.2, Sub-task 5 update). Concretely:
 - Regression-verified: promoted `relax_initial_state` reproduces `bvp_experiment.py`'s own
   proven 11500K and 12000K results to <1% (mostly ppm-level).
 - **New finding while wiring `solve_timestep` for a REAL `dt` (never exercised before,
-  `bvp_experiment.py`'s milestones only tested the pseudo-relaxation step): a genuine mesh-
-  construction bug** - the initial guess linearly interpolated `P`, `T` (not `ln P`, `ln T`)
-  from an already-converged state's own output grid, badly misrepresenting the ~3-decade
-  pressure drop in the final ~0.001% of mass near the photosphere. Root-caused via direct
-  inspection (not assumed) and fixed (log-interpolation + a deeper, warm-start-only outer
-  mesh refinement, `config.BVP_MESH_OUTER_REFINEMENT`) - see §5's 2026-08-08 entry.
+  `bvp_experiment.py`'s milestones only tested the pseudo-relaxation step): a real, secondary
+  mesh-construction issue** - the initial guess linearly interpolated `P`, `T` (not `ln P`,
+  `ln T`) from an already-converged state's own output grid, badly misrepresenting the
+  ~3-decade pressure drop in the final ~0.001% of mass near the photosphere. ~~Root-caused
+  via direct inspection (not assumed) and fixed (log-interpolation + a deeper, warm-start-
+  only outer mesh refinement, `config.BVP_MESH_OUTER_REFINEMENT`)~~ **CORRECTED, same day,
+  see the ★★★ entry above**: this fix was tried, found NOT to be the decisive lever for
+  step 2 (and to make `relax_initial_state` itself measurably harder), and reverted - the
+  dominant cause was genuine marginal convection, resolved differently. Kept here as an
+  honest record of a plausible-but-wrong first hypothesis, not deleted.
 - **First genuine real-`dt` step (not a pseudo-step) achieved and physically informative**:
   `solve_timestep` converged directly (`status=0`, residual 9.73e-7) for one real step at
   `dt=1e4` yr from the relaxed T=11500K state. Over that step, `T_center` and `r_surface`
@@ -38,15 +63,13 @@ is complete and merged into `PLAN.md` (§4.2, Sub-task 5 update). Concretely:
   negative-`L_surface` question needed: consistent with it being a `DT_RELAX`-pseudo-timestep
   artifact that decays fast under real time evolution, not a persistent bug - though only one
   step deep so far, not yet a settled conclusion.
-- **Open, not yet resolved**: a second real step (step 1 → step 2) does NOT converge within
-  a generously raised node budget (200,000) even with a much finer `alpha` continuation
-  ladder - node count grows super-linearly (43569→79660→129932 across `alpha`=0.80→0.85→0.90)
-  rather than plateauing, the signature of a genuine local difficulty for that specific
-  state, not a simple resolution shortfall. Diagnosed but not solved; not chased further
-  today per this project's own timeboxed-investigation discipline. See §5's entry for detail
-  and hypotheses. **A full multi-step production run is not yet viable** - the one-step
-  result above is real and informative, but Sub-task 8's dry-run exit criterion (a sustained
-  trend over several steps) is not yet met.
+- **RESOLVED, same day - see the ★★★ entry above**: a second real step (step 1 → step 2)
+  initially did NOT converge within a generously raised node budget (200,000) even with a
+  much finer `alpha` continuation ladder - node count grew super-linearly
+  (43569→79660→129932 across `alpha`=0.80→0.85→0.90) rather than plateauing, confirmed to be
+  genuine marginal convection, not a resolution shortfall. Fixed via a context-dependent
+  Schwarzschild-switch smoothing width; a full 10-step dry run now meets Sub-task 8's exit
+  criterion cleanly.
 
 **🔴 2026-08-06 — ARCHITECTURAL PIVOT: shooting is abandoned. `scipy.integrate.solve_bvp`
 (global relaxation/collocation) is now the project's target solver.** Everything below this
@@ -210,8 +233,9 @@ remains the place for numerical trails and debugging history).
 | — | `bvp_solver_shooting_archive.py` (new, archival) | The retired $t>0$ shooting implementation, moved here verbatim 2026-08-08 — not imported by anything active. |
 | 6 | `diagnostics.py` | **Done (2026-08-01)** — visual plots + virial theorem/opacity regime checks rewritten for the compact structure, all pass |
 | 7 | `time_stepper.py` time derivatives | Unchanged code; now runs against the promoted `solve_bvp` solver (2026-08-08) — see row 5 |
-| 8 | Outer time loop (`time_stepper.run`, `main.py`) | **Partially validated (2026-08-08)**: `main.py` implemented; a 10-step dry run got 1 real step to converge cleanly with the expected contracting trend, then hit an open, unresolved convergence issue on step 2 — see §1/§5's 2026-08-08 entry and `PLAN.md` Sub-task 8's status note |
-| 9–10 | Adaptive dt, output | Not started — blocked on Sub-task 8's open item above |
+| 8 | Outer time loop (`time_stepper.run`, `main.py`) | **★★★ Dry-run exit criterion MET (2026-08-08)**: `main.py` implemented; a full 10-step dry run converges cleanly at every step, with $T_\text{center}$/$r_\text{surface}$ decreasing monotonically (contraction) and $L_\text{surface}$ settling to a small positive value — resolved a genuine marginal-convection mesh-explosion via a context-dependent Schwarzschild-switch smoothing width (`config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP`). Not yet a full run to `config.R_HALT`. See §1/§5's 2026-08-08 entries and `PLAN.md` Sub-task 8's status note. |
+| 8c | MLT convection treatment | Not started — formally scheduled, explicitly deferred past the one-week deadline (`PLAN.md` Sub-task 8c) |
+| 9–10 | Adaptive dt, output | Not started — not blocked, but not yet prioritized either |
 
 **Stub present but empty:** `ReadMe.txt`. (`main.py` implemented 2026-08-08, no longer a stub.)
 
@@ -857,11 +881,14 @@ pass cleanly (2026-08-01, see the `diagnostics.py` entry above for the physical 
 
 ### `main.py`
 
-**★ Implemented 2026-08-08** (was an empty placeholder before). Minimal orchestrator:
+**★★★ Implemented 2026-08-08** (was an empty placeholder before). Minimal orchestrator:
 `solve_static_structure()` → `relax_initial_state()` → a capped (`N_STEPS_DRY_RUN=10`)
-`time_stepper.run()` call, per PLAN.md Sub-task 8's "dry run" convention. Not yet a full
-production run to `config.R_HALT`; no snapshot/output-file integration yet (`output.py`,
-Sub-task 10, still not started). See §1/§5's 2026-08-08 entry for the dry-run result.
+`time_stepper.run()` call, per PLAN.md Sub-task 8's "dry run" convention. **Runs cleanly
+end-to-end as of 2026-08-08** (later same day) - all 10 steps converge, monotonic
+contraction confirmed - after the marginal-convection mesh-explosion fix (§1/§5's 2026-08-08
+"Multi-step time evolution achieved" entry has the full trail). Not yet a full production
+run to `config.R_HALT`; no snapshot/output-file integration yet (`output.py`, Sub-task 10,
+still not started).
 
 ### `ReadMe.txt`
 
@@ -964,6 +991,140 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-08 — ★★★ Multi-step time evolution achieved: the step-2 mesh-explosion diagnosed as genuine marginal convection, resolved via a context-dependent Schwarzschild-switch smoothing; 10-step dry run meets Sub-task 8's exit criterion
+
+**Goal**: the previous entry's promotion left one open item — `solve_timestep`'s SECOND real
+step failed to converge (node count growing super-linearly, not just under-resolved). User
+explicitly ruled out a full mixing-length-theory (MLT) implementation as too risky for the
+one-week deadline; this entry is the full diagnose-then-fix trail that respects that
+constraint.
+
+**1. Structural diagnosis (not guessed) — three complementary diagnostics, run together:**
+- **Superadiabaticity comparison, `state_relaxed` (input to step 1) vs `state_1` (output)**:
+  `state_relaxed` is deeply, unambiguously convective almost everywhere
+  ($\nabla_\text{rad}/\nabla_\text{ad}$ ratios of 100-1000x); `state_1` has THREE
+  convective/radiative flips instead of one, with $\nabla_\text{rad}$ collapsed to sit
+  within a few percent of $\nabla_\text{ad}=0.4$ across an extended band
+  ($m/M_\text{TOTAL}\in[0.9991,0.9998]$, later confirmed via a full-profile histogram to
+  extend to $[0.993,0.99998]$, 13% of profile points below $|\nabla_\text{rad}-
+  \nabla_\text{ad}|<0.1$ vs 0.5% for `state_relaxed`). Mechanism: $L$ collapsed ~70x during
+  step 1 (already known from the previous entry), and $\nabla_\text{rad}\propto L$, so the
+  whole outer envelope moved from saturated-convective to genuinely marginal.
+- **Mesh-concentration inspection**: re-ran the failing continuation with a node-density
+  histogram at each `alpha` step — confirmed nodes piling up exactly in the two identified
+  bands (near-surface $L$-zero-crossing region and the new marginal-convection band), not
+  scattered randomly.
+- **Interpolation-fidelity check**: re-solved step 1 keeping the dense `solve_bvp`
+  interpolant, compared against what `state_1`'s 200-point output grid actually feeds
+  `implicit_rhs_vectorized`'s `np.interp` calls for the NEXT solve — found a real but
+  secondary ~1-2% error near $T_\text{surface}\to T_\text{NEB}$.
+
+**2. Two candidate fixes tried, tested honestly, and REVERTED — neither was the decisive
+lever.** (a) Log-space interpolation of `state_prev.T`/`.P` in `implicit_rhs_vectorized`/
+`implicit_rhs_jacobian` (new `_interp_state_prev` helper) — technically more accurate, but
+an isolated test found it made `relax_initial_state` itself measurably HARDER (52,949 vs
+21,682 nodes, though still converging) by shifting which nearby equally-valid solution the
+Newton path lands on, and did NOT fix step 2. (b) Densifying `_bvp_solution_to_state`'s
+output grid to match the guess-mesh's own density — did not fix step 2 either, and when
+combined with (a) made `relax_initial_state`'s own step 1 fail outright. Both reverted
+cleanly (verified via `git diff`-clean isolation tests, one variable at a time) before
+proceeding — a real example of the "propose, test, revert if wrong" discipline this project
+has followed throughout, not just when it validates the first idea.
+
+**3. Root cause re-framed, and the user's proposed mitigation.** The interpolation fixes
+addressed a real but secondary issue; the dominant cause is finding (1) above — genuine
+marginal convection, structurally the SAME idealization (`gradients.effective_gradient`'s
+$\nabla_\text{eff}=\min(\nabla_\text{rad},\nabla_\text{ad})$, infinitely-efficient
+convection) already flagged as this architecture's deepest unresolved liability back in
+`PLAN_BVP.md` Milestone 4 — there it showed up as saturated-convective rank deficiency, here
+as marginal-convective mesh explosion, both symptoms of the same missing physics. User
+proposed widening `GRAD_EFF_SWITCH_EPSILON` substantially (a "wide smoothing" compromise,
+explicitly NOT full MLT) rather than implementing MLT under deadline pressure.
+
+**4. Wide-epsilon testing — mechanistically justified, then empirically confirmed, with a
+genuine tension found and resolved.**
+- Mechanism (verified, not hand-waved): the existing smoothed-min switch's curvature scales
+  as $\sim1/\varepsilon$ in the transition band; at $\varepsilon=10^{-4}$ that curvature is
+  enormous relative to how fast $\nabla_\text{rad}(m)$ moves through the new marginal band
+  (measured: 0.399→1.2 between adjacent output points) — `solve_bvp`'s adaptive refinement
+  chases that curvature down to `BVP_COLLOCATION_TOL` without bound. Widening
+  $\varepsilon$ reduces the curvature by the same factor.
+- A full-profile superadiabaticity histogram (both states) confirmed `state_relaxed` has
+  essentially zero marginal region (1/200 points) — a wide $\varepsilon$ would touch nothing
+  else in a normal state, only the pathological band.
+- Empirical sweep against the actual step-2 failure: $\varepsilon=0.01$ fails;
+  $\varepsilon=0.1,0.5$ both converge DIRECTLY (no continuation fallback), with modest node
+  counts (10,024 and 5,679 respectively). $L_\text{surface}$ flips from negative to
+  positive at step 2 under both — consistent with the negative-$L$ finding being a
+  relaxation-pseudo-timestep transient, further evidence beyond the previous entry's single
+  data point.
+- **Genuine tension found, not glossed over**: a single GLOBAL $\varepsilon$ that fixes
+  `solve_timestep` (boundary measured at 0.05-0.07) BREAKS `relax_initial_state`'s own
+  continuation at the exact same magnitude ($\varepsilon=0.07$: NaN residual at
+  `alpha`=0.999, not just more nodes — a real divergence). `state_0`'s forced-adiabat
+  construction has a differently-shaped near-surface transition that the same widened switch
+  distorts differently. The two failure modes are cleanly separated by WHICH FUNCTION is
+  calling, not by anything varying within a call.
+- **Resolution: context-dependent $\varepsilon$**, not one value — `relax_initial_state`
+  keeps the original, proven `config.GRAD_EFF_SWITCH_EPSILON=10^{-4}$` unchanged;
+  `solve_timestep` alone uses a new `config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP`. Implemented
+  by temporarily overriding `config.GRAD_EFF_SWITCH_EPSILON` for the duration of each
+  `solve_bvp` call inside `bvp_solver._solve_structure_bvp` (same try/finally pattern
+  already used for `N_GRID_POINTS`/`GRID_OUTER_REFINEMENT`) — `gradients.py` itself needed
+  ZERO changes, and `validation.py` Checks 12-14 (which test `effective_gradient` at its
+  default config value) needed zero changes either, confirmed by direct re-run.
+- Verified over a 5-real-step chain (isolated test, before wiring into production): T_center/
+  r_surface decrease smoothly and monotonically; T_surface/L_surface settle toward a small,
+  steady, slightly-positive value near T_NEB with shrinking increments each step.
+
+**5. Wired into production; the FIRST chosen value ($\varepsilon=0.1$) proved insufficient
+for a longer run — caught and fixed honestly, not silently patched over.** After wiring the
+context-dependent $\varepsilon$ into `bvp_solver.py` (new `switch_epsilon` parameter on
+`_solve_structure_bvp`) and re-verifying the `relax_initial_state` regression (unaffected,
+byte-for-byte the original behavior since it never sees the new constant), the full 10-step
+dry run (`main.py`) was run for the first time. **Steps 1-5 matched the isolated 5-step test
+exactly and converged cleanly, but step 6 failed with the same super-linear mesh-growth
+signature** — the marginal band's difficulty evolves step to step, $\varepsilon=0.1$'s
+margin (measured 1.5-2x above the 0.05-0.07 boundary for step 2 specifically) was not enough
+for step 6. Since `relax_initial_state` is now completely decoupled from
+`GRAD_EFF_SWITCH_EPSILON_TIMESTEP`, raising it further carried no risk of reopening the
+global-epsilon regression — $\varepsilon=0.5$ (already validated once, in isolation, with
+even more comfortable direct convergence than 0.1) was retried for the full chain and
+**got all 10 steps through cleanly**.
+
+**Final result — PLAN.md Sub-task 8's dry-run exit criterion genuinely met:**
+```
+step 1:  T_c=11519.92K  r_surf=5.1035 R_Jup  L_surf=+2.126e-11 L_sun
+step 5:  T_c=11505.68K  r_surf=5.0967 R_Jup  L_surf=+2.532e-11 L_sun
+step 10: T_c=11487.93K  r_surf=5.0863 R_Jup  L_surf=+2.683e-11 L_sun
+```
+$T_\text{center}$ and $r_\text{surface}$ decrease smoothly, monotonically, with very regular
+step-to-step decrements across all 10 steps (contraction). $L_\text{surface}$ stays
+positive and nonzero throughout, with visibly shrinking increments each step (0.19, 0.10,
+0.07, 0.05, 0.04, 0.03, 0.03, 0.02, 0.02 $\times10^{-11}L_\odot$) — settling toward
+quasi-steady radiative equilibrium, not decaying to zero or diverging. This resolves the
+standing negative-$L_\text{surface}$ question about as cleanly as the data allows: a
+relaxation-pseudo-timestep transient, decaying through zero and settling to a small,
+physically sensible positive value under genuine real-time evolution.
+
+**Honest limitations, explicitly not hidden:**
+- Only validated for 10 real steps at $\varepsilon=0.5$. No proof this value holds
+  indefinitely if the marginal band's demands keep growing with further evolution — the
+  step-6 failure at $\varepsilon=0.1$ is direct evidence the required margin is NOT a fixed,
+  one-time quantity. Re-apply the same margin-sweep discipline before any longer run.
+- This is a purely numerical regularization, not MLT — no convective velocity, no mixing
+  length, no genuine superadiabaticity-dependence beyond the switch's own smoothing. It
+  measurably distorts $T_\text{surface}$/$L_\text{surface}$ (the exact quantities the
+  negative-$L$ question concerns) by an amount that scales with $\varepsilon$ — bulk
+  quantities are far less affected (<0.1% between $\varepsilon=0.1$ and $0.5$) since the
+  affected zone is an extremely thin, low-mass surface layer.
+- A genuine MLT convection treatment remains the mathematically complete fix — formally
+  scheduled as new `PLAN.md` Sub-task 8c, explicitly deferred past the one-week deadline by
+  the user's own explicit decision, not silently dropped.
+- Not yet a full run to `config.R_HALT` (thousands of steps at this `dt` from
+  $r_\text{surface}\approx5\,R_\text{Jup}$ down to $1\,R_\text{Jup}$) — the 10-step dry run
+  is Sub-task 8's own stated exit criterion, not the end of the project's evolution work.
 
 ### 2026-08-08 — ★★ `solve_bvp` promoted to production; shooting retired for t>0; PLAN_BVP.md merged into PLAN.md; first genuine real-time step run
 
