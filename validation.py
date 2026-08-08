@@ -5,6 +5,7 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.optimize import brentq
 
 import boundary_conditions
 import bvp_solver
@@ -812,34 +813,51 @@ def plot_constant_density_profile_ode_check(output_path=f"{diagnostics.PLOT_DIR}
 
 def check_boundary_conditions_residuals() -> None:
     """Confirm boundary_conditions() is exactly zero at the true BCs, that perturbing each of
-    ya[0], ya[2], yb[1] shifts exactly its own (linear) residual component and no other, and
-    that the net-flux radiative surface condition (nonlinear in T_b, r_b) matches its exact
-    analytic formula under perturbation of yb[3] and yb[0].
+    ya[0], ya[2] shifts exactly its own (linear) residual component and no other, and that
+    both surface conditions - the photospheric mechanical residual (implicit in P_b, since
+    photospheric_pressure itself depends on P_b via eos.density -> opacity.bell_lin_opacity)
+    and the net-flux radiative thermal residual (nonlinear in T_b, r_b) - match their exact
+    analytic formulas under perturbation.
 
-    Revised for the boundary_conditions.py surface thermal condition change (Sub-task 8,
-    PROGRESS.md): T_b - T_neb replaced with L_b - 4*pi*r_b^2*sigma_SB*(T_b^4-T_neb^4), so the
-    surface residual is no longer linear in T_b or independent of r_b.
+    REVISED 2026-08-08 (found stale while promoting bvp_solver.py to solve_bvp, PLAN.md
+    Sub-task 5 update - unrelated to that migration itself, just never updated before now):
+    this check still asserted the ORIGINAL P_b=config.P_NEB mechanical condition, but
+    boundary_conditions.py has used the Eddington tau=2/3 photospheric pressure
+    (boundary_conditions.photospheric_pressure) since Sub-task 5 (2026-07-27). Because that
+    condition is implicit in P_b, the "exact BC" reference point below is found by a small
+    bracketed root-find at a chosen (r_test, T_test), not simply assumed.
     """
     r_test = 7.0e9         # Representative surface radius [cm]
+    T_test = config.T_NEB   # Surface temperature at equilibrium (thermal residual = 0 here too) [K]
     P_center_test = 1.0e13   # Arbitrary center-side pressure, not constrained by the BCs [dyn cm^-2]
     T_center_test = 1500.0   # Arbitrary center-side temperature, not constrained by the BCs [K]
 
+    # P_b = photospheric_pressure(r_test, P_b, T_test, ...) is implicit in P_b (rho depends on
+    # P_b via eos.density, kappa depends on rho via opacity.bell_lin_opacity) - solved rather
+    # than assumed, the same discipline used throughout this project for this exact equation
+    # (bvp_solver.solve_static_structure's own photosphere event does the analogous thing).
+    def mechanical_residual(P_b):
+        return P_b - boundary_conditions.photospheric_pressure(r_test, P_b, T_test, config.MU, config.MU_E)
+    P_b_test = brentq(mechanical_residual, 1.0e-6, 1.0e12, xtol=1.0e-30, rtol=1.0e-13)
+
     ya0 = np.array([0.0, P_center_test, 0.0, T_center_test])
-    # L_b = 0 matches the net-flux radiative condition exactly when T_b = T_neb (equilibrium).
-    yb0 = np.array([r_test, config.P_NEB, 0.0, config.T_NEB])
+    yb0 = np.array([r_test, P_b_test, 0.0, T_test])
     res0 = boundary_conditions.boundary_conditions(ya0, yb0)
 
     print("Check 19 - boundary_conditions() residual indexing and sign check")
+    print(f"  self-consistent photospheric P_b at r={r_test:.3e} cm, T={T_test} K: {P_b_test:.6e} dyn/cm^2")
     print(f"  residual at exact BCs: {res0}")
     assert res0.shape == (4,), "boundary_conditions() must return exactly 4 residuals for a 4-ODE system"
-    assert np.allclose(res0, 0.0), "Residual should be exactly zero when ya, yb already satisfy all 4 boundary conditions"
+    assert res0[0] == 0.0 and res0[1] == 0.0 and res0[3] == 0.0, (
+        "r_a, L_a, and thermal residuals should be exactly zero by construction at this reference point")
+    assert abs(res0[2]) < 1.0e-6 * abs(P_b_test), (
+        "Mechanical (photospheric) residual should be ~zero at the self-consistent P_b, within the root-find's own precision")
 
     delta = 1.0e5
     # (label, which side, index in y, expected residual index that should shift) - linear terms only
     linear_cases = [
         ("ya[0] (r_center)", "ya", 0, 0),
         ("ya[2] (L_center)", "ya", 2, 1),
-        ("yb[1] (P_surface)", "yb", 1, 2),
     ]
     for label, which, y_idx, res_idx in linear_cases:
         ya, yb = ya0.copy(), yb0.copy()
@@ -851,19 +869,25 @@ def check_boundary_conditions_residuals() -> None:
         print(f"  perturb {label} by {delta:.1e} -> residual shift = {shift}")
         assert np.allclose(shift, expected_shift), f"Perturbing {label} should shift only residual[{res_idx}] by {delta}"
 
-    # yb[3] (T_surface) and yb[0] (r_surface) both enter the new radiative term nonlinearly -
-    # verify against the exact analytic formula rather than a simple linear delta, and confirm
-    # residuals 0-2 stay unaffected.
-    for label, y_idx in [("yb[3] (T_surface)", 3), ("yb[0] (r_surface)", 0)]:
+    # yb[1] (P_surface), yb[3] (T_surface), and yb[0] (r_surface) all enter the photospheric
+    # and/or radiative terms nonlinearly - verify against the exact analytic formulas rather
+    # than a simple linear delta, and confirm the OTHER surface residual stays unaffected.
+    delta_P = P_b_test * 1.0e-4   # a small RELATIVE perturbation - P_b_test's scale depends on the local opacity regime
+    nonlinear_cases = [("yb[1] (P_surface)", 1, delta_P), ("yb[3] (T_surface)", 3, delta), ("yb[0] (r_surface)", 0, delta)]
+    for label, y_idx, delta_here in nonlinear_cases:
         yb = yb0.copy()
-        yb[y_idx] += delta
+        yb[y_idx] += delta_here
         res = boundary_conditions.boundary_conditions(ya0, yb)
-        r_b, _, L_b, T_b = yb
+        r_b, P_b, L_b, T_b = yb
+        P_expected = boundary_conditions.photospheric_pressure(r_b, P_b, T_b, config.MU, config.MU_E)
         L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
+        expected_res2 = P_b - P_expected
         expected_res3 = L_b - L_expected
-        print(f"  perturb {label} by {delta:.1e} -> residual[3] = {res[3]:.6e} (analytic: {expected_res3:.6e})")
-        assert np.isclose(res[3], expected_res3), f"Perturbing {label} should match the exact radiative-flux formula in residual[3]"
-        assert np.allclose(res[:3], res0[:3]), f"Perturbing {label} should not affect residuals 0-2"
+        print(f"  perturb {label} by {delta_here:.3e} -> residual[2]={res[2]:.6e} (analytic: {expected_res2:.6e}), "
+              f"residual[3]={res[3]:.6e} (analytic: {expected_res3:.6e})")
+        assert np.isclose(res[2], expected_res2, rtol=1.0e-8, atol=1.0e-30), f"Perturbing {label} should match the exact photospheric formula in residual[2]"
+        assert np.isclose(res[3], expected_res3, rtol=1.0e-8, atol=1.0e-30), f"Perturbing {label} should match the exact radiative-flux formula in residual[3]"
+        assert np.allclose(res[:2], res0[:2]), f"Perturbing {label} should not affect residuals 0-1"
 
 
 # ==========================================
@@ -955,18 +979,38 @@ def check_static_structure_hydrostatic_balance() -> None:
 # ==========================================
 
 def check_static_structure_isothermal_and_monotonic() -> None:
-    """Confirm solve_static_structure() gives T=T_neb, L=0 exactly, and a monotonic profile
-    with the correct surface pressure."""
+    """Confirm solve_static_structure() gives a monotonic profile (r increasing, P and T
+    decreasing outward) and a surface pressure matching the Eddington tau=2/3 photospheric
+    condition.
+
+    REVISED 2026-08-08 (found stale while promoting bvp_solver.py to solve_bvp, PLAN.md
+    Sub-task 5 update - unrelated to that migration, just never updated before now): this
+    check asserted T==T_neb, L==0 EVERYWHERE and P[-1]==P_neb, leftovers from the original
+    diffuse-cloud (Premise 1) design where the whole t=0 structure was a trivial isothermal,
+    pressure-confined equilibrium. Premise 2 (Sub-task 5, 2026-07-27) replaced that with a
+    compact, hot, fully convective protoplanet whose T(m) genuinely varies from
+    T_CENTER_INITIAL at the center down the adiabat to whatever value the photosphere
+    reaches - confirmed directly (not assumed) to NOT equal T_neb, since this construction
+    has no thermal boundary condition at all (only the mechanical photospheric one - see
+    boundary_conditions.py; the surface temperature is only pulled toward T_neb once the
+    FULL 4-ODE system's net-flux radiative condition is enforced, via
+    bvp_solver.relax_initial_state/solve_timestep, not here).
+    """
     s = bvp_solver.solve_static_structure()
 
-    print("Check 24 - solve_static_structure() exact isothermal/zero-luminosity and monotonicity")
-    print(f"  r range: {s.r[0]:.4e} to {s.r[-1]:.4e} cm ({s.r[-1] / 1.496e13:.2f} AU)")
-    print(f"  P range: {s.P[0]:.6e} to {s.P[-1]:.6e} dyn/cm^2 (target P_neb = {config.P_NEB:.6e})")
-    assert np.all(s.T == config.T_NEB), "T must equal T_neb exactly everywhere (isothermal, see bvp_solver.py docstring)"
-    assert np.all(s.L == 0.0), "L must equal 0 exactly everywhere (see bvp_solver.py docstring)"
+    print("Check 24 - solve_static_structure() monotonicity and photospheric surface pressure")
+    print(f"  r range: {s.r[0]:.4e} to {s.r[-1]:.4e} cm ({s.r[-1] / config.R_JUPITER_CM:.3f} R_Jup)")
+    print(f"  P range: {s.P[0]:.6e} to {s.P[-1]:.6e} dyn/cm^2")
+    print(f"  T range: {s.T[0]:.6e} to {s.T[-1]:.6e} K (T_CENTER_INITIAL={config.T_CENTER_INITIAL} K)")
     assert np.all(np.diff(s.r) > 0.0), "r must be strictly increasing outward"
     assert np.all(np.diff(s.P) < 0.0), "P must be strictly decreasing outward"
-    assert np.isclose(s.P[-1], config.P_NEB, rtol=config.BVP_TOL * 10.0), "Surface pressure does not match P_neb to the solver tolerance"
+    assert np.all(np.diff(s.T) < 0.0), "T must be strictly decreasing outward (fully convective adiabat)"
+    assert np.isclose(s.T[0], config.T_CENTER_INITIAL, rtol=1.0e-6), "Center T must match the prescribed T_CENTER_INITIAL"
+
+    P_photo_expected = boundary_conditions.photospheric_pressure(s.r[-1], s.P[-1], s.T[-1], config.MU, config.MU_E)
+    print(f"  surface P={s.P[-1]:.6e}, photospheric target={P_photo_expected:.6e} dyn/cm^2")
+    assert np.isclose(s.P[-1], P_photo_expected, rtol=1.0e-4), (
+        "Surface pressure should match the Eddington tau=2/3 photospheric condition, not P_neb")
 
 
 # ==========================================
@@ -974,27 +1018,36 @@ def check_static_structure_isothermal_and_monotonic() -> None:
 # ==========================================
 
 def plot_static_structure_profile(output_path=f"{diagnostics.PLOT_DIR}/static_structure_t0.png") -> None:
-    """Save a diagnostic plot of the converged t=0 r(m), P(m) profile.
+    """Save a diagnostic plot of the converged t=0 r(m), P(m), T(m) profile.
 
-    T(m) and L(m) are trivially flat/zero by construction (bvp_solver.py docstring) so are noted
-    rather than plotted as their own (degenerate) panels.
+    REVISED 2026-08-08 (same staleness as Check 24 above): T(m) is genuinely differentiated
+    (center-to-surface adiabat), not flat - now plotted as its own panel rather than noted
+    as degenerate. L(m) remains the marginal-convection DIAGNOSTIC closure (bvp_solver.
+    solve_static_structure's own docstring - not a solved quantity here) and is still not
+    plotted for that reason.
     """
     s = bvp_solver.solve_static_structure()
-    AU = 1.496e13
 
-    fig, (ax_r, ax_P) = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
+    fig, (ax_r, ax_P, ax_T) = plt.subplots(3, 1, figsize=(7, 9), sharex=True)
     x = s.m / config.M_TOTAL
 
-    ax_r.plot(x, s.r / AU)
-    ax_r.set_ylabel("r(m) [AU]")
-    ax_r.set_title(f"t=0 static structure: isothermal at T={config.T_NEB} K, L=0")
+    ax_r.plot(x, s.r / config.R_JUPITER_CM)
+    ax_r.set_ylabel("r(m) [R_Jup]")
+    ax_r.set_title(f"t=0 compact hot start: T_center={config.T_CENTER_INITIAL:.0f} K, fully convective adiabat")
 
     ax_P.plot(x, s.P)
     ax_P.set_yscale("log")
-    ax_P.set_xlabel("m / M_TOTAL")
     ax_P.set_ylabel("P(m) [dyn cm^-2]")
-    ax_P.axhline(config.P_NEB, color="tab:red", linestyle="--", linewidth=0.8, label="P_neb")
+    P_photo = boundary_conditions.photospheric_pressure(s.r[-1], s.P[-1], s.T[-1], config.MU, config.MU_E)
+    ax_P.axhline(P_photo, color="tab:red", linestyle="--", linewidth=0.8, label="photospheric target")
     ax_P.legend(loc="best")
+
+    ax_T.plot(x, s.T)
+    ax_T.set_yscale("log")
+    ax_T.set_xlabel("m / M_TOTAL")
+    ax_T.set_ylabel("T(m) [K]")
+    ax_T.axhline(config.T_NEB, color="tab:red", linestyle="--", linewidth=0.8, label="T_neb")
+    ax_T.legend(loc="best")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -1152,6 +1205,86 @@ def check_finite_difference_time_derivatives_and_interpolation() -> None:
 
 
 # ==========================================
+# SECTION: t>0 solve_bvp — Analytic Jacobian Correctness
+# ==========================================
+
+def check_bvp_jacobian_matches_finite_differences() -> None:
+    """Cross-checks bvp_solver's analytic fun_jac/bc_jac (implicit_rhs_jacobian_scaled,
+    make_bc_jacobian_scaled) against central finite differences at several representative
+    mesh points, at the project's active T_CENTER_INITIAL - promoted from bvp_experiment.py's
+    verify_jacobians (PLAN_BVP.md Milestone 4/6), which caught two real formula bugs and one
+    verification-metric false alarm before the analytic Jacobians were trusted for
+    production (2026-08-08, PLAN.md Sub-task 5 update). A wrong analytic Jacobian is worse
+    than none (steers Newton confidently in the wrong direction), so this stays a standing
+    correctness check here rather than a one-off script.
+
+    ROW-NORMALIZED relative error (not per-entry or per-output-value): avoids two false-alarm
+    modes found while developing this check originally (PROGRESS.md 2026-08-07) - both
+    analytic and FD legitimately near zero in the same entry, or normalizing by an output
+    value that is exactly zero at the test point.
+    """
+    state_0 = bvp_solver.solve_static_structure()
+    dt = config.RELAX_DT_FRACTION * config.T_KH_TIMESCALE_S
+    x, z_guess = bvp_solver.build_mesh_and_guess_scaled(state_0, warm_start_L=False)
+
+    rng = np.random.default_rng(0)
+    test_idx = rng.choice(len(x), size=min(config.JACOBIAN_VERIFY_N_POINTS, len(x)), replace=False)
+
+    def fun_single(x_pt, z_pt):
+        return bvp_solver.implicit_rhs_scaled(np.array([x_pt]), z_pt.reshape(4, 1), state_0, dt, 1.0)[:, 0]
+
+    print("Check 37 - bvp_solver analytic Jacobian (fun_jac, bc_jac) vs finite differences")
+    max_rel_err_fun = 0.0
+    for idx in test_idx:
+        x_pt, z_pt = x[idx], z_guess[:, idx].copy()
+        J_analytic = bvp_solver.implicit_rhs_jacobian_scaled(np.array([x_pt]), z_pt.reshape(4, 1), state_0, dt, 1.0)[:, :, 0]
+        J_fd = np.zeros((4, 4))
+        for j in range(4):
+            step = config.JACOBIAN_VERIFY_REL_STEP * max(abs(z_pt[j]), 1.0)
+            z_plus, z_minus = z_pt.copy(), z_pt.copy()
+            z_plus[j] += step
+            z_minus[j] -= step
+            J_fd[:, j] = (fun_single(x_pt, z_plus) - fun_single(x_pt, z_minus)) / (2.0 * step)
+        row_scale = np.maximum(np.max(np.abs(J_analytic), axis=1), np.max(np.abs(J_fd), axis=1))
+        row_scale = np.maximum(row_scale, 1.0e-30)
+        rel_err = np.abs(J_analytic - J_fd) / row_scale[:, np.newaxis]
+        max_rel_err_fun = max(max_rel_err_fun, np.max(rel_err))
+    print(f"  max row-normalized relative error (fun_jac, {len(test_idx)} points) = {max_rel_err_fun:.4e}")
+
+    m_min = config.M_MIN_FRACTION * config.M_TOTAL
+    bc = bvp_solver.make_bc_scaled(m_min)
+    bc_jac = bvp_solver.make_bc_jacobian_scaled(m_min)
+    z_a, z_b = z_guess[:, 0], z_guess[:, -1]
+    dbc_dza_analytic, dbc_dzb_analytic = bc_jac(z_a, z_b)
+    dbc_dza_fd, dbc_dzb_fd = np.zeros((4, 4)), np.zeros((4, 4))
+    for j in range(4):
+        step = config.JACOBIAN_VERIFY_REL_STEP * max(abs(z_a[j]), 1.0)
+        za_plus, za_minus = z_a.copy(), z_a.copy()
+        za_plus[j] += step
+        za_minus[j] -= step
+        dbc_dza_fd[:, j] = (np.asarray(bc(za_plus, z_b)) - np.asarray(bc(za_minus, z_b))) / (2.0 * step)
+        step = config.JACOBIAN_VERIFY_REL_STEP * max(abs(z_b[j]), 1.0)
+        zb_plus, zb_minus = z_b.copy(), z_b.copy()
+        zb_plus[j] += step
+        zb_minus[j] -= step
+        dbc_dzb_fd[:, j] = (np.asarray(bc(z_a, zb_plus)) - np.asarray(bc(z_a, zb_minus))) / (2.0 * step)
+    row_scale_a = np.maximum(np.max(np.abs(dbc_dza_analytic), axis=1), np.max(np.abs(dbc_dza_fd), axis=1))
+    row_scale_a = np.maximum(row_scale_a, 1.0e-30)
+    row_scale_b = np.maximum(np.max(np.abs(dbc_dzb_analytic), axis=1), np.max(np.abs(dbc_dzb_fd), axis=1))
+    row_scale_b = np.maximum(row_scale_b, 1.0e-30)
+    max_rel_err_bc = max(np.max(np.abs(dbc_dza_analytic - dbc_dza_fd) / row_scale_a[:, np.newaxis]),
+                          np.max(np.abs(dbc_dzb_analytic - dbc_dzb_fd) / row_scale_b[:, np.newaxis]))
+    print(f"  max row-normalized relative error (bc_jac) = {max_rel_err_bc:.4e}")
+
+    assert max_rel_err_fun < config.JACOBIAN_VERIFY_TOL, (
+        f"bvp_solver fun_jac disagrees with finite differences ({max_rel_err_fun:.3e} >= "
+        f"config.JACOBIAN_VERIFY_TOL={config.JACOBIAN_VERIFY_TOL:.1e})")
+    assert max_rel_err_bc < config.JACOBIAN_VERIFY_TOL, (
+        f"bvp_solver bc_jac disagrees with finite differences ({max_rel_err_bc:.3e} >= "
+        f"config.JACOBIAN_VERIFY_TOL={config.JACOBIAN_VERIFY_TOL:.1e})")
+
+
+# ==========================================
 # SECTION: Constants Printout
 # ==========================================
 
@@ -1227,4 +1360,5 @@ if __name__ == "__main__":
     check_mass_reconstruction_matches_lagrangian_grid()
     plot_mass_reconstruction_error()
     check_finite_difference_time_derivatives_and_interpolation()
+    check_bvp_jacobian_matches_finite_differences()
     print("\nAll CGS unit-consistency and Sub-task 1, 2a-2e, 3, 4, 5, 6, 7 checks passed.")

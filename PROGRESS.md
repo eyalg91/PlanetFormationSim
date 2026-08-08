@@ -11,6 +11,43 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**★★ 2026-08-08 — `bvp_experiment.py`'s `solve_bvp` machinery PROMOTED to production;
+shooting retired for t>0; first genuine real-time step achieved.** `PLAN_BVP.md`'s roadmap
+is complete and merged into `PLAN.md` (§4.2, Sub-task 5 update). Concretely:
+- `bvp_solver.py` rewritten: `solve_static_structure` (t=0, `brentq` shooting) unchanged;
+  `relax_initial_state`/`solve_timestep` (t>0) now solve via `scipy.integrate.solve_bvp`
+  collocation (scaled state, analytic Jacobians, `ALPHA_MAX` continuation) instead of the old
+  `fsolve`/`root`-based shooting - same public function names/signatures, so no other module
+  needed to change its call sites. The retired shooting code is archived verbatim in the new
+  `bvp_solver_shooting_archive.py`, not deleted.
+- Regression-verified: promoted `relax_initial_state` reproduces `bvp_experiment.py`'s own
+  proven 11500K and 12000K results to <1% (mostly ppm-level).
+- **New finding while wiring `solve_timestep` for a REAL `dt` (never exercised before,
+  `bvp_experiment.py`'s milestones only tested the pseudo-relaxation step): a genuine mesh-
+  construction bug** - the initial guess linearly interpolated `P`, `T` (not `ln P`, `ln T`)
+  from an already-converged state's own output grid, badly misrepresenting the ~3-decade
+  pressure drop in the final ~0.001% of mass near the photosphere. Root-caused via direct
+  inspection (not assumed) and fixed (log-interpolation + a deeper, warm-start-only outer
+  mesh refinement, `config.BVP_MESH_OUTER_REFINEMENT`) - see §5's 2026-08-08 entry.
+- **First genuine real-`dt` step (not a pseudo-step) achieved and physically informative**:
+  `solve_timestep` converged directly (`status=0`, residual 9.73e-7) for one real step at
+  `dt=1e4` yr from the relaxed T=11500K state. Over that step, `T_center` and `r_surface`
+  both **decreased** (contraction, matching Sub-task 8's exit criterion), `T_surface` moved
+  from 49.36K to 49.99K (essentially onto `T_NEB=50K`), and `L_surface`'s magnitude **dropped
+  ~70x** (-2.85e23 → -4.03e21 erg/s) while staying negative. This is the direct evidence the
+  negative-`L_surface` question needed: consistent with it being a `DT_RELAX`-pseudo-timestep
+  artifact that decays fast under real time evolution, not a persistent bug - though only one
+  step deep so far, not yet a settled conclusion.
+- **Open, not yet resolved**: a second real step (step 1 → step 2) does NOT converge within
+  a generously raised node budget (200,000) even with a much finer `alpha` continuation
+  ladder - node count grows super-linearly (43569→79660→129932 across `alpha`=0.80→0.85→0.90)
+  rather than plateauing, the signature of a genuine local difficulty for that specific
+  state, not a simple resolution shortfall. Diagnosed but not solved; not chased further
+  today per this project's own timeboxed-investigation discipline. See §5's entry for detail
+  and hypotheses. **A full multi-step production run is not yet viable** - the one-step
+  result above is real and informative, but Sub-task 8's dry-run exit criterion (a sustained
+  trend over several steps) is not yet met.
+
 **🔴 2026-08-06 — ARCHITECTURAL PIVOT: shooting is abandoned. `scipy.integrate.solve_bvp`
 (global relaxation/collocation) is now the project's target solver.** Everything below this
 note describing `relax_initial_state`/the shooting $\alpha$-homotopy is historical —
@@ -168,13 +205,15 @@ remains the place for numerical trails and debugging history).
 | 2f | `eos.py` — non-ideal EOS, electron degeneracy pressure | Done, validated (2026-07-27) |
 | 3 | `gradients.py` (Schwarzschild criterion) | Done — `L>=0` floor and Schwarzschild `min()` switch both smoothed 2026-08-06 (were hard, now differentiable; §5) |
 | 4 | `odes.py` + `boundary_conditions.py` | Done (surface conditions revised, §5); reused unmodified by `bvp_experiment.py` |
-| 5 | `bvp_solver.py` ($t=0$ structure + relaxation to self-consistency) | `solve_static_structure` still in active use ($t=0$ seed, reused by `bvp_experiment.py`). **`relax_initial_state`/shooting machinery ARCHITECTURALLY ABANDONED 2026-08-06 — see §1's pivot note and `PLAN_BVP.md`.** |
-| — | `bvp_experiment.py` (new, `solve_bvp` — the active target architecture) | **★ CONVERGES (status=0, machine-precision residuals) at T=11500K AND T=12000K as of 2026-08-07** — state-vector scaling + analytic Jacobians + corrected EOS thermodynamics; see §5's Milestone 6 entry and `PLAN_BVP.md` §3.6/§3.6.4. Negative `L_surface` confirmed reproducible across both temperatures (not resolved, but no longer single-point); T=2000K confirmed out of scope for the atomic EOS, not re-attempted. Remaining item before promotion to production: full validation-suite pass. |
+| 5 | `bvp_solver.py` ($t=0$ structure + $t>0$ solve) | **★★ PROMOTED to `solve_bvp` 2026-08-08.** `solve_static_structure` unchanged ($t=0$ seed). `relax_initial_state`/`solve_timestep` (t>0) rewritten in place onto `solve_bvp` collocation — regression-verified against `bvp_experiment.py`'s 11500K/12000K results; old shooting code archived in `bvp_solver_shooting_archive.py`. See §1/§5's 2026-08-08 entry. |
+| — | `bvp_experiment.py` (SUPERSEDED, historical record) | Its proven logic (state-vector scaling, analytic Jacobians, `ALPHA_MAX` continuation) was promoted into `bvp_solver.py` 2026-08-08 — kept in place unmodified, banner-marked, not imported by anything active. |
+| — | `bvp_solver_shooting_archive.py` (new, archival) | The retired $t>0$ shooting implementation, moved here verbatim 2026-08-08 — not imported by anything active. |
 | 6 | `diagnostics.py` | **Done (2026-08-01)** — visual plots + virial theorem/opacity regime checks rewritten for the compact structure, all pass |
-| 7 | `time_stepper.py` time derivatives | Original bootstrap now obsolete; code not yet updated; will need to target `bvp_experiment.py`'s solver once stabilized, not `bvp_solver.relax_initial_state` |
-| 8–10 | Outer time loop, adaptive dt, output | Not started — blocked on `PLAN_BVP.md` Milestones 1–3 (T=13000K convergence) |
+| 7 | `time_stepper.py` time derivatives | Unchanged code; now runs against the promoted `solve_bvp` solver (2026-08-08) — see row 5 |
+| 8 | Outer time loop (`time_stepper.run`, `main.py`) | **Partially validated (2026-08-08)**: `main.py` implemented; a 10-step dry run got 1 real step to converge cleanly with the expected contracting trend, then hit an open, unresolved convergence issue on step 2 — see §1/§5's 2026-08-08 entry and `PLAN.md` Sub-task 8's status note |
+| 9–10 | Adaptive dt, output | Not started — blocked on Sub-task 8's open item above |
 
-**Stubs present but empty:** `main.py`, `ReadMe.txt`.
+**Stub present but empty:** `ReadMe.txt`. (`main.py` implemented 2026-08-08, no longer a stub.)
 
 ### What we actually know, and how confident we are
 
@@ -429,15 +468,64 @@ reasoning for why). The mechanical residual (`P_b - P_neb`) and both center resi
 (`r_a`, `L_a`) are unchanged. Covered by validation.py's Check 19, which was rewritten in
 place this session to match the new (nonlinear in $T_b$) formula.
 
-### `bvp_solver.py` — shooting-method solver, $t=0$ and every $t>0$ step
+### `bvp_solver.py` — $t=0$ shooting seed + $t>0$ `solve_bvp` collocation solver
 
-**⚠ 2026-08-06: shooting is architecturally ABANDONED — see §5's "Architectural decision"
-entry and `PLAN_BVP.md`.** `solve_static_structure()` (the $t=0$ adiabatic seed
-construction) remains in active use, reused unmodified by `bvp_experiment.py` to build
-initial guesses — but `relax_initial_state()` and the shooting/LM machinery described below
-are no longer the project's target solver, kept only as historical reference and a fallback
-until the `solve_bvp` pivot (`PLAN_BVP.md`) is proven. Everything below this note describes
-the shooting-era implementation and is retained for that historical record, not as current
+**★★ 2026-08-08: PROMOTED to `solve_bvp`, replacing this file's own `relax_initial_state`/
+`solve_timestep` in place.** The 2026-08-06 pivot below is no longer conditional — it's
+done. `solve_static_structure()` (this file's $t=0$ adiabatic seed, `brentq` shooting) is
+**unchanged** and still the active implementation, exactly as before. `relax_initial_state`/
+`solve_timestep` (t>0) have been **rewritten in place** to solve via `scipy.integrate.
+solve_bvp` (nondimensionalized state, analytic Jacobians, `ALPHA_MAX` continuation - the
+machinery `bvp_experiment.py` proved) instead of the shooting/LM code described in the rest
+of this subsection, which is now **archived verbatim in `bvp_solver_shooting_archive.py`**
+(not deleted, not imported by anything active). Both new functions keep their old names and
+`SimulationState`-in/`SimulationState`-out signatures, so `time_stepper.py` and every other
+caller needed zero changes. Full detail: `PLAN.md` §4.2/Sub-task 5's 2026-08-08 update.
+
+**What's new, beyond a straight port of `bvp_experiment.py`'s logic:**
+- A shared internal `_solve_structure_bvp(state_prev, dt, warm_start_L)` helper used by both
+  public functions (the underlying physics/RHS already generalizes over `dt`;
+  `bvp_experiment.py`'s own orchestration had just hardcoded the pseudo-relaxation `dt`).
+- **A genuine new bug, found and fixed while verifying `solve_timestep` with a REAL `dt` for
+  the first time ever** (`bvp_experiment.py`'s milestones only tested the pseudo-relaxation
+  step): the initial-guess mesh linearly interpolated `P`, `T` directly (not `ln P`, `ln T`)
+  from an already-converged warm-start state's OWN output grid. Near the photosphere, a
+  converged solution's `P` genuinely drops ~3 decades over the final ~$10^{-5}$ of the mass
+  (a real, extremely thin "skin," not a numerical artifact) - linear interpolation of `P`
+  itself (then logged) badly misrepresented that drop, feeding `solve_bvp`'s very first
+  collocation midpoint an unphysical trial that crashed `eos.density` before any Newton
+  correction happened. This was silently masked for `relax_initial_state` (warm-starting
+  from `solve_static_structure`'s output, whose shooting-event surface never reaches
+  exactly $m=M_\text{TOTAL}$, so `np.interp`'s boundary clamping happened to avoid the worst
+  of it) - `solve_timestep`'s full-domain warm start is what finally exercised it. **Fixed**:
+  interpolate `ln P`, `ln T` directly (the actual solved-for state variables, not their
+  exponentials), plus a much deeper `GRID_OUTER_REFINEMENT` (new `config.
+  BVP_MESH_OUTER_REFINEMENT`) applied ONLY for `warm_start_L=True` (`relax_initial_state`
+  doesn't need it and was confirmed to get WORSE - more mesh nodes, eventually exceeding
+  the budget - if it were applied there too).
+- `verify_jacobians` (the FD cross-check `bvp_experiment.py` ran before every solve) is
+  **not** carried into the production hot path - re-running an FD check on every real
+  timestep of a long run is wasteful once the Jacobians are trusted. It's promoted instead
+  into `validation.py` (`check_bvp_jacobian_matches_finite_differences`, new Check 37),
+  run once/on-demand rather than every solve.
+
+**Verified before trusting this promotion** (not just "it imports"): `relax_initial_state`
+reproduces `bvp_experiment.py`'s own recorded 11500K/12000K results to <1% (mostly far
+tighter); a genuine real-`dt` `solve_timestep` call converges directly (`status=0`, residual
+9.73e-7) from the relaxed 11500K state - the first time this has ever been demonstrated
+under `solve_bvp`. See §5's 2026-08-08 entry for the full numbers, the physical result (a
+70x drop in $|L_\text{surface}|$ over one real step - informative for the standing
+negative-$L_\text{surface}$ question), and the **open, unresolved** finding that a SECOND
+real step does not yet converge within a generously raised node budget.
+
+---
+
+**⚠ 2026-08-06 (historical from here down): shooting was architecturally ABANDONED for the
+$t>0$ problem** — see §5's "Architectural decision" entry and `PLAN_BVP.md`.
+`solve_static_structure()` (the $t=0$ adiabatic seed construction) remains in active use,
+reused unmodified — but `relax_initial_state()` and the shooting/LM machinery described
+below are the RETIRED implementation (now in `bvp_solver_shooting_archive.py`, per the
+2026-08-08 note above), kept in this subsection only as historical reference, not current
 architecture guidance.
 
 **Substantially rewritten this session; current content described in full since this is
@@ -742,23 +830,42 @@ job, not a documentation nicety.
 
 ### `validation.py` — sanity checks, unit consistency, and diagnostic plots
 
-See §4 below. **Not fully passing as of this writing** — several checks written for
-Premise 1's isothermal $t=0$ state are now stale relative to `bvp_solver.py`'s rewritten
-`solve_static_structure()`. **New this session:** Checks 33-36 (Sub-task 2f's EOS/degeneracy
-checks) were implemented and pass cleanly (2026-07-27); Check 26 (renamed
-`check_virial_balance_unconfined`) and Check 27 (opacity regime distribution) were rewritten
-for the compact structure and now pass cleanly (2026-08-01, see the `diagnostics.py` entry
-above for the physical detail). **Still pending, not yet done:** Check 19
-(`check_boundary_conditions_residuals`) still tests the *old* `P_b-P_\text{neb}$ mechanical
-residual formula — needs revision for the new photospheric one before it will even run
-without erroring against the current `boundary_conditions.py`; Check 30
-(`check_bootstrap_time_derivatives_are_physical`) is confirmed broken (see `time_stepper.py`
-entry above) pending Sub-task 7's bootstrap removal; no new checks have been proposed for
-the photospheric condition or the relaxation homotopy.
+See §4 below. **★ 2026-08-08 update**: Check 19 (`check_boundary_conditions_residuals`) and
+Check 24 (`check_static_structure_isothermal_and_monotonic`) — both flagged stale in the
+paragraph below and left unfixed for a long time — were finally revised while promoting
+`bvp_solver.py` to `solve_bvp` (unrelated to that migration's own code, just discovered
+along the way; §1/§5's 2026-08-08 entry has the full detail): Check 19 now solves for the
+genuinely self-consistent photospheric $P_b$ rather than assuming the old $P_\text{neb}$
+target; Check 24 now checks monotonicity and the photospheric surface pressure instead of
+asserting the old Premise-1 isothermal/$L$=0 conditions. Both pass. A new Check 37
+(`check_bvp_jacobian_matches_finite_differences`) was also added, promoting
+`bvp_experiment.py`'s Jacobian-correctness verification into a standing check — passes.
+Running the full suite end-to-end surfaced **one separate, pre-existing failure**
+unrelated to this work (Check 17, `check_stellar_odes_matches_constant_density_analytic_profile`
+— `dr/dm` off by a factor of ~17 from its analytic target; confirmed via `git diff` that
+`odes.py`/`eos.py`/`gradients.py` are untouched this session, so this predates 2026-08-08,
+most likely dating to the `config.MU`/`GAMMA` atomic-composition correction on 2026-08-07
+never having been re-validated against it) — flagged, not fixed, out of this pass's scope.
 
-### `main.py`, `ReadMe.txt`
+The paragraph below is the pre-2026-08-08 state, kept for its own historical detail (Checks
+33-36, 26, 27's history) — **not fully passing as of that writing** — several checks written
+for Premise 1's isothermal $t=0$ state were stale relative to `bvp_solver.py`'s rewritten
+`solve_static_structure()`. Checks 33-36 (Sub-task 2f's EOS/degeneracy checks) were
+implemented and pass cleanly (2026-07-27); Check 26 (renamed `check_virial_balance_unconfined`)
+and Check 27 (opacity regime distribution) were rewritten for the compact structure and now
+pass cleanly (2026-08-01, see the `diagnostics.py` entry above for the physical detail).
 
-Empty placeholders, unchanged.
+### `main.py`
+
+**★ Implemented 2026-08-08** (was an empty placeholder before). Minimal orchestrator:
+`solve_static_structure()` → `relax_initial_state()` → a capped (`N_STEPS_DRY_RUN=10`)
+`time_stepper.run()` call, per PLAN.md Sub-task 8's "dry run" convention. Not yet a full
+production run to `config.R_HALT`; no snapshot/output-file integration yet (`output.py`,
+Sub-task 10, still not started). See §1/§5's 2026-08-08 entry for the dry-run result.
+
+### `ReadMe.txt`
+
+Empty placeholder, unchanged.
 
 ---
 
@@ -785,13 +892,35 @@ pending regeneration once Sub-task 5 is unblocked and `validation.py` is repaire
 
 ## 4. Validation Suite — what each check confirms, and current status
 
-`validation.py` (`python validation.py`) contains 32 checks. **As of this writing, running
-it is expected to fail** — the checks below are listed as they currently exist in the file
-(this table describes what each one *tests*, unchanged from before), but several no longer
-match `bvp_solver.py`'s actual behavior after this session's premise change. Status flags
-added inline; unflagged checks are believed to still pass (they test regime-independent
-physics-module building blocks — EOS, opacity, gradients, ODE-RHS mechanics — never the
-specific $t=0$ solve).
+**★ 2026-08-08 update, read this first — the table below is a stale historical snapshot,
+kept for its per-check descriptions, not current status.** `validation.py` now has 37
+checks (not 32). Running the full suite end-to-end (`python validation.py`, plus an
+isolated per-check sweep to see past the first crash) gives the actual current picture:
+**every check passes except two**, both confirmed pre-existing and unrelated to any of this
+project's recent work (checked via `git diff` / cross-reference against when each was last
+touched, not assumed):
+- **Check 17** (`check_stellar_odes_matches_constant_density_analytic_profile`): `dr/dm`
+  disagrees with its analytic target by ~17x. `odes.py`/`eos.py`/`gradients.py` are
+  untouched by the 2026-08-08 `bvp_solver.py` promotion (confirmed via `git diff`) — likely
+  dates to the `config.MU`/`GAMMA` atomic-composition correction (2026-08-07) never having
+  been re-validated against this specific check.
+- **Check 23** (`check_static_structure_hydrostatic_balance`): relative error 1.78e-2 against
+  its 1e-3 tolerance. This table's own row for it (below) already flagged, before
+  2026-08-08, that it was "not re-run since the rewrite to confirm" — genuinely never
+  verified passing since an earlier rewrite, not a regression from anything done today.
+
+Both are flagged, not fixed — out of scope for whatever session found them (this table's
+own vintage predates both). Checks 19, 24, 26, 27, 33-37 (state below as "broken"/"not yet
+existing") are now fixed/added and passing — see §1/§5's 2026-08-01/2026-08-07/2026-08-08
+entries for each.
+
+`validation.py` contained 32 checks as of the ORIGINAL writing of this table below. **As of
+that writing, running it was expected to fail** — the checks below are listed as they
+existed in the file at that time (this table describes what each one *tests*), but several
+no longer matched `bvp_solver.py`'s actual behavior after that session's premise change.
+Status flags added inline at that time; unflagged checks were believed to still pass (they
+test regime-independent physics-module building blocks — EOS, opacity, gradients, ODE-RHS
+mechanics — never the specific $t=0$ solve).
 
 | # | Check | Confirms | Status |
 |---|---|---|---|
@@ -835,6 +964,145 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-08 — ★★ `solve_bvp` promoted to production; shooting retired for t>0; PLAN_BVP.md merged into PLAN.md; first genuine real-time step run
+
+**Goal**: turn Milestone 6's proven experiment (`bvp_experiment.py`) into the project's
+actual solver, per `PLAN_BVP.md` §6's own "Path to Production" plan (already written,
+already agreed) — retire shooting for the t>0 problem, re-point nothing (the promoted code
+keeps the same function names/signatures `time_stepper.py` already calls), and actually run
+`time_stepper.run()` for the first time, which doubles as the direct diagnostic for the
+standing negative-`L_surface` question.
+
+**1. Documentation merge.** `PLAN_BVP.md`'s architectural decision and Milestone 6 result
+folded into `PLAN.md` §4.2 (which now documents BOTH the original 2026-07 shooting-vs-
+`solve_bvp` decision AND this second reversal back to `solve_bvp` for t>0 specifically) and
+a new note on Sub-task 5's status entry. `PLAN_BVP.md` itself is kept in place, banner-marked
+as merged/historical, for its detailed milestone-by-milestone numerical trail — not deleted,
+matching this project's standing "archive, don't delete" convention.
+
+**2. `config.py`**: `bvp_experiment.py`'s local numerical constants (tolerance, max nodes,
+mesh density, the `ALPHA_MAX`/continuation ladder, Jacobian-verification parameters, the
+relaxation `dt` fraction) promoted to named `config.py` constants (`BVP_COLLOCATION_TOL`,
+`BVP_MAX_NODES`, `BVP_MESH_N_GRID_POINTS`, `BVP_ALPHA_MAX`, `BVP_ALPHA_CONTINUATION_STEPS`,
+`JACOBIAN_VERIFY_*`, `RELAX_DT_FRACTION`) — CLAUDE.md's "no numerical literals outside
+config.py" rule, previously not binding on `bvp_experiment.py` as an isolated experiment.
+
+**3. `bvp_solver.py` rewritten; old shooting archived.** `solve_static_structure` (t=0,
+`brentq` shooting on the 3-ODE adiabat) is untouched — it was never implicated in the crash
+investigation and `bvp_experiment.py` itself always called it unmodified as a seed-builder.
+`relax_initial_state`/`solve_timestep` (t>0) are rewritten in place with the `solve_bvp`
+machinery, same names/signatures. The retired shooting implementation (`_implicit_rhs_logm`,
+`_integrate_timestep_outward`, the old `relax_initial_state`/`solve_timestep`) is preserved
+verbatim in new `bvp_solver_shooting_archive.py` — not deleted, not imported by anything
+active, kept as the historical record of why this pivot happened (mirrors how
+`bvp_experiment.py` itself was kept after being superseded, now banner-marked as such).
+
+**4. Regression check (Phase 4 of the promotion plan)**: re-ran the promoted
+`relax_initial_state` against the two cached seeds `bvp_experiment.py` already proved
+(T=11500K, T=12000K). Both reproduced the recorded `status=0` results to <1% relative error
+(mostly far tighter — e.g. 12000K's $R_\text{surface}$ agreed to $6.7\times10^{-6}$) —
+confirms the promotion is a faithful port, not a new physics/numerics experiment in
+disguise.
+
+**5. New territory: verifying `solve_timestep` with a REAL `dt` — found and fixed a genuine
+mesh-construction bug never before exercised.** `bvp_experiment.py`'s milestones only ever
+tested the pseudo-relaxation step (`state_0`→itself at `DT_RELAX`); a real subsequent
+timestep from an already-converged state had never been run under `solve_bvp`. First attempt
+crashed immediately (`eos.density` Newton-Raphson failure at solve_bvp's very first
+collocation evaluation, before any Newton correction). **Diagnosed directly, not assumed**:
+printed the actual RHS at every guess-mesh point and found `dlnP/dx` jumping ~860x between
+the last two mesh points (`m/M_TOTAL`=0.99999 to 1.0 exactly) — a real, extremely steep
+$P(m)$ transition in the converged solution (P drops ~3 decades over the final $10^{-5}$ of
+the mass, a genuinely thin photospheric "skin," not a bug), badly under-resolved by the
+mesh-construction's linear (not log) interpolation of `P`, `T` from the warm-start state's
+own 200-point output grid. **First fix attempt (log-interpolating `P`,`T`) didn't change the
+jump at all** — traced further and found the two adjacent points were EXACT (not
+interpolated) matches to the warm-start state's own coarse grid, whose own last interval is
+fundamentally under-resolved by `_build_output_grid`'s fixed `GRID_OUTER_REFINEMENT=1e-4`.
+**Second fix**: a much deeper `config.BVP_MESH_OUTER_REFINEMENT=1e-6`, applied only when
+warm-starting from an already-converged state (a swept comparison, 1e-4 through 1e-12,
+showed the max consecutive-point RHS ratio drop from 860x to 1.2x already at 1e-6). Applying
+this deeper refinement unconditionally was tried first and found to actively HARM
+`relax_initial_state` (mesh nodes balloon across the continuation ladder, exceeding the node
+budget where the original, coarser mesh converged cleanly) — scoped to `solve_timestep`'s
+`warm_start_L=True` case only, confirmed by re-running the `relax_initial_state` regression
+check again afterward (unaffected, identical results).
+
+**Result: `solve_timestep` converges directly** (`status=0`, residual 9.73e-7, no
+continuation fallback needed) for one real step, `dt`=1e4 yr, from the relaxed T=11500K
+state. Physical result, directly relevant to the standing negative-$L_\text{surface}$
+question:
+```
+                    t=0 (relaxed)        t=1e4 yr (1 real step)
+T_center            11523.59 K           11520.10 K       (decreasing - contraction)
+r_surface            5.1089 R_Jup         5.1069 R_Jup     (decreasing - contraction)
+T_surface            49.36 K              49.99 K          (-> T_NEB=50K)
+L_surface           -2.847e23 erg/s      -4.033e21 erg/s   (magnitude dropped ~70x)
+```
+$T_\text{center}$ and $r_\text{surface}$ both decreasing over real time is exactly Sub-task
+8's exit criterion, one step in. The $|L_\text{surface}|$ drop (~70x in one step, while
+$T_\text{surface}$ moved to within 0.02% of $T_\text{NEB}$, from 1.3% before) is strong
+supporting evidence — not yet proof — that the negative $L_\text{surface}$ finding was a
+`DT_RELAX`-pseudo-timestep artifact decaying under genuine time evolution, as hypothesized
+when it was first found (PLAN_BVP.md §3.6.4).
+
+**6. Open, unresolved: a SECOND real step does not converge.** `solve_timestep` from step
+1's own result (`warm_start_L=True`, same mesh-refinement fix applied) exceeds the node
+budget (80000) even via continuation. Diagnosed, not just retried blindly: swept a much
+finer `alpha` ladder (steps of 0.1 instead of jumping straight to 0.5) — this got further
+(converged cleanly through `alpha`=0.7) but still failed exceeding the budget at 0.9-0.95;
+raising the node budget to 200,000 got further still (converged through `alpha`=0.90 at
+129,932 nodes) but the node count is growing **super-linearly** across steps
+(43569→79660→129932 for `alpha`=0.80→0.85→0.90), the signature of approaching a genuine
+local difficulty for this specific state, not a bounded resolution shortfall that a bigger
+budget alone will fix. Not chased further today, per this project's own established
+timeboxed-investigation discipline (PLAN_BVP.md §4). **Working hypothesis, not yet tested**:
+step 1's state has $T_\text{surface}$ already extremely close to $T_\text{NEB}$
+(49.99K, 0.02% below) — possibly related to (though not proven to be the same mechanism as)
+the historical "frozen fixed point near a rigid $T=T_\text{neb}$ clamp" degeneracy discussed
+in `PLAN.md` §4.7, even though the net-flux BC was specifically designed to avoid that exact
+literal degeneracy.
+
+**7. `validation.py`: two pre-existing stale checks fixed, one new check added.** Found
+while confirming the "full validation-suite pass" checklist item, unrelated to this
+migration's own code (just never updated before now): **Check 19**
+(`check_boundary_conditions_residuals`) still asserted the ORIGINAL $P_b=P_\text{neb}$
+mechanical condition, when `boundary_conditions.py` has used the Eddington $\tau=2/3$
+photospheric pressure since Sub-task 5 (2026-07-27) — fixed by solving for the genuinely
+self-consistent $P_b$ (implicit, via a small bracketed root-find) rather than assuming a
+constant target, and moving the now-nonlinear mechanical-residual perturbation test into the
+same nonlinear-formula-testing pattern already used for the thermal residual. **Check 24**
+(`check_static_structure_isothermal_and_monotonic`) still asserted `T==T_neb`, `L==0`
+everywhere and `P_surface==P_neb` — leftovers from the original diffuse-cloud (Premise 1)
+design; rewritten to check what the CURRENT compact, differentiated construction actually
+guarantees (monotonic r/P/T, center T matching `T_CENTER_INITIAL`, surface P matching the
+photospheric target) — confirmed directly that `solve_static_structure`'s raw output does
+NOT reach `T_neb` at the surface (10.6K at 11500K, well below it), since this construction
+has no thermal boundary condition at all. `plot_static_structure_profile` updated to match
+(now a real 3-panel r/P/T plot, not a 2-panel with T noted as "trivially flat"). **New Check
+37** (`check_bvp_jacobian_matches_finite_differences`): promotes `bvp_experiment.py`'s
+`verify_jacobians` into a standing validation check (run once, not on every production
+solve) — confirmed `fun_jac`/`bc_jac` still match finite differences to $6.5\times10^{-7}$/
+$5.0\times10^{-11}$ at the production `T_CENTER_INITIAL`.
+
+**8. Full-suite run surfaced two PRE-EXISTING, unrelated failures — flagged, not fixed.**
+Running `python validation.py` end-to-end (not just the checks touched above), plus an
+isolated per-check sweep to see past the first crash, found every check passes except two:
+`check_stellar_odes_matches_constant_density_analytic_profile` (Check 17: `dr/dm` disagrees
+with its closed-form target by ~17x) and `check_static_structure_hydrostatic_balance` (Check
+23: relative error 1.78e-2 against a 1e-3 tolerance). **Confirmed via `git diff` that
+`odes.py`, `eos.py`, and `gradients.py` are completely untouched by this session's work**,
+and §4's own validation-suite table already flagged Check 23 as "not re-run since [an
+earlier] rewrite to confirm" — both pre-existing, most likely Check 17 dating to the
+`config.MU`/`GAMMA` atomic-composition correction (2026-08-07) never having been
+re-validated against it. Out of scope for this pass (this promotion's own explicit scope was
+Checks 19/24 only); recorded here so neither is mistaken for a regression this session
+caused, and so neither is lost before the next validation-suite pass addresses them.
+
+**Deliberately not done in this pass** (matches the promotion plan's own explicit scope):
+a full multi-step production run to `config.R_HALT` (blocked on item 6 above); Sub-task 9
+adaptive `dt`; a full audit of `validation.py` beyond Checks 19/24/37.
 
 ### 2026-08-07 — ★ Milestone 6 (PLAN_BVP.md): first genuine, fully-converged `solve_bvp` solution — state-vector nondimensionalization + EOS corrections (γ, μ, δ), executed under a one-week thesis deadline
 

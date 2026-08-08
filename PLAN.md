@@ -136,7 +136,8 @@ PlanetFormationSim/
 ├── gradients.py               # ∇_rad, ∇_ad, Schwarzschild criterion → ∇_eff
 ├── odes.py                    # RHS of the 4-ODE system
 ├── boundary_conditions.py    # Center + surface residuals (net-flux radiative surface BC)
-├── bvp_solver.py              # Shooting-method solver: t=0 structure and every t>0 step
+├── bvp_solver.py              # t=0 structure (brentq shooting) + t>0 solve_bvp collocation solve (2026-08-07 pivot)
+├── bvp_solver_shooting_archive.py  # RETIRED t>0 shooting code (relax_initial_state/solve_timestep) - archived, not imported
 ├── time_stepper.py           # Outer loop: run(); compute_time_derivatives (diagnostic only)
 ├── diagnostics.py            # Virial theorem, energy conservation, regime logging
 └── output.py                 # NPZ snapshots, matplotlib plotting helpers
@@ -153,7 +154,8 @@ PlanetFormationSim/
 | `gradients.py` | Schwarzschild switch; returns $\nabla_\text{eff}$ and a boolean `is_convective` mask; also a marginal-convection diagnostic luminosity helper |
 | `odes.py` | Pure function: takes $(m, \mathbf{y}, \dot{T}, \dot{P})$ and returns $d\mathbf{y}/dm$ |
 | `boundary_conditions.py` | Pure function: 4 residuals — center ($r=0$, $L=0$) and surface ($P=P_\text{neb}$, net-flux radiative) |
-| `bvp_solver.py` | Shooting-method solver for both the $t=0$ compact hot-start structure and every $t>0$ implicit timestep; `solve_bvp` is not used anywhere |
+| `bvp_solver.py` | $t=0$ compact hot-start structure via `brentq` shooting (unchanged since Sub-task 5); every $t>0$ implicit timestep via `scipy.integrate.solve_bvp` collocation (2026-08-07 pivot, `PLAN_BVP.md`) |
+| `bvp_solver_shooting_archive.py` | Retired $t>0$ shooting implementation (`relax_initial_state`, `solve_timestep`), kept for historical reference only — not imported by any active module |
 | `time_stepper.py` | Outer time loop (`run`); `compute_time_derivatives` retained as a post-hoc finite-difference diagnostic only — not on the critical solve path |
 | `diagnostics.py` | Post-solve checks; virial theorem; opacity regime distribution per timestep |
 | `output.py` | Snapshot I/O and matplotlib helpers; no physics |
@@ -170,7 +172,7 @@ graph TD
     diag[diagnostics.py]
     output[output.py]
 
-    subgraph BVP_Loop[Shooting Solver - t=0 and every t>0 step]
+    subgraph BVP_Loop[bvp_solver.py: brentq shooting at t=0, solve_bvp collocation at t>0]
         bvp[bvp_solver.py]
         odes[odes.py]
         bcs[boundary_conditions.py]
@@ -204,23 +206,59 @@ graph TD
 
 A `@dataclass` holding `m` (mass grid), `r`, `P`, `T`, `L`, `rho` (numpy arrays), current time `t`, and a reference to the previous state. All modules receive state and return new state — none hold mutable state themselves. This enforces functional purity and simplifies testing.
 
-### 4.2 Shooting-Method Formulation (supersedes an earlier `solve_bvp` design)
+### 4.2 Shooting-Method Formulation, then a Second Pivot Back to `solve_bvp` for $t>0$
+
+**★ 2026-08-07 update — read this paragraph first.** The "shooting for everything" picture
+below (originally written 2026-08-06) is now **historical for the $t>0$ problem only**.
+After a second, more careful investigation (`PLAN_BVP.md`, kept as the full
+milestone-by-milestone record — Milestones 0-6), shooting was retired for the $t>0$
+relaxation/timestep solve and replaced by `scipy.integrate.solve_bvp` again, this time
+successfully. The short version: five independent physics/BC hypotheses (ionization,
+dissociation-$\mu$, opacity switches, center-BC self-consistency, log-space surface BC)
+were each ruled out in isolation without moving a persistent near-photosphere crash;
+analytic Jacobians (replacing scipy's FD estimate) reproduced the crash identically but
+revealed *why* — the Jacobian is genuinely rank-deficient almost everywhere, because
+100% convective saturation under the infinitely-efficient-convection idealization makes
+$d(\nabla_\text{eff})/d(\nabla_\text{rad})=0$, decoupling $L$ from the $P$-$T$ relation.
+The fix that shipped (state-vector nondimensionalization — $\hat r=r/R_\text{Jup}$,
+$\hat L=\operatorname{arcsinh}(L/L_\text{scale})$ — plus corrected EOS thermodynamics
+$\gamma\to5/3$, $\mu\to1.278$, a previously-hardcoded energy-equation $\delta$ coefficient,
+plus a continuation endpoint `ALPHA_MAX`$=1-10^{-5}$ just short of literal $\alpha=1$)
+attacks the conditioning directly rather than fixing the underlying rank deficiency — a
+genuine mixing-length-theory convection treatment remains the mathematically complete fix
+and stays on the roadmap, deliberately deferred. `bvp_solver.py`'s $t>0$ machinery
+(`relax_initial_state`, `solve_timestep`) now uses this `solve_bvp`-based approach; the old
+shooting implementation is archived in `bvp_solver_shooting_archive.py`, not deleted.
+`PLAN_BVP.md` §3.6/§3.6.4 has the complete derivation, both real bugs the mandatory
+FD-Jacobian cross-check caught, and the two-temperature (11500K, 12000K) confirmation.
+
+**$t=0$ is unaffected by this second pivot** — `solve_static_structure()`'s shooting (a
+simple 1D `brentq` root-find on $P_\text{center}$ alone, for a 3-ODE pure-adiabat
+construction) was never implicated in the crash investigation and is unchanged; the
+`solve_bvp` seed for the harder 4-ODE $t>0$ problem is literally built by calling this
+function first. The original 2026-08-06 shooting-vs-`solve_bvp` history below is kept for
+context — it explains why shooting was tried at all — but no longer describes $t>0$'s
+actual solver.
+
+---
 
 `scipy.integrate.solve_bvp` was the original design (state vector $\mathbf{y}=[r,P,L,T]$,
 independent variable $m$) but proved structurally unreliable for this problem at both
 $t=0$ and $t>0$: a source-term-driven energy equation gives a rank-deficient Jacobian, and
 the near-surface pressure-scale-height boundary layer (P dropping many decades over a small
 mass range) breaks its collocation mesh regardless of the scaling strategy tried. Every
-solve in this codebase instead uses a **shooting method**: integrate outward from the
+solve in this codebase then used a **shooting method**: integrate outward from the
 center with `scipy.integrate.solve_ivp` (adaptive, no global Jacobian) from trial central
 conditions, and root-find on those trial values until the surface conditions are met.
 
-- **$t=0$:** shoot on $P_\text{center}$ alone ($T_\text{center}$ fixed at
+- **$t=0$ (still true today):** shoot on $P_\text{center}$ alone ($T_\text{center}$ fixed at
   `config.T_CENTER_INITIAL`, a prescribed "hot start" parameter — not a shooting unknown)
-  to match $P(M_\text{total})=P_\text{neb}$.
-- **$t>0$:** shoot on $(\ln P_\text{center}, \ln T_\text{center})$ (log-parametrized for
-  guaranteed positivity) to match both $P(M_\text{total})=P_\text{neb}$ and the net-flux
-  radiative surface condition (§4.7), via `scipy.optimize.fsolve`.
+  to match the photospheric mass-matching condition (§4.7/§5 Sub-task 5 — superseded the
+  $P(M_\text{total})=P_\text{neb}$ condition shown here originally).
+- **$t>0$ (superseded 2026-08-07, see above):** shot on $(\ln P_\text{center}, \ln
+  T_\text{center})$ via `scipy.optimize.fsolve`/`root(method="lm")` to match both the
+  photospheric and net-flux radiative surface conditions (§4.7) — replaced by the
+  `solve_bvp` collocation approach described above.
 
 ### 4.3 Bell & Lin (1994) Opacity — Density-Dependent Regime Boundaries
 
@@ -604,6 +642,19 @@ residual (not divergence).
 the pre-photospheric-BC residual formula; no new validation checks have been proposed for the
 photospheric condition, the relaxation homotopy, or the `L>=0` floor.
 
+**★ 2026-08-07/08 update — the `relax_initial_state`/`solve_timestep` bridge described above
+(shooting via `fsolve`/`root(method="lm")` on a homotopy in $\alpha$) was subsequently
+replaced.** The shooting-based bridge worked at `T_CENTER_INITIAL=13000K` as documented
+above, but repeatedly hit non-smooth "kinks" while stabilizing further (§4.2 above has the
+short version; `PLAN_BVP.md` has the full milestone trail) — traced to a genuine Jacobian
+rank deficiency, not a fixable local kink. `bvp_solver.relax_initial_state`/`solve_timestep`
+now solve the same physical problem via `scipy.integrate.solve_bvp` collocation (state-vector
+nondimensionalization, analytic Jacobians, an `ALPHA_MAX` continuation regularizer), promoted
+into production 2026-08-08 after two-temperature confirmation (11500K, 12000K). The old
+shooting implementation is preserved in `bvp_solver_shooting_archive.py`. `solve_static_structure`
+above (this sub-task's actual subject — the $t=0$ seed) is completely unaffected by this
+second pivot.
+
 ---
 
 #### Sub-task 6 — `diagnostics.py` — **✅ DONE (2026-08-01)**
@@ -717,11 +768,22 @@ as the star contracts — see PROGRESS.md for the virial-theorem argument) — o
 steps to be clearly above numerical noise; exact step count/$dt$ to be determined
 empirically. Additionally verify the radius halt with an artificially-raised `R_HALT`.
 
-**Status: implemented, NOT yet validated (2026-08-01)** — code written and compiles, the
-relaxed $T_\text{center}=13000$K starting state is cached, and a strictly-capped 5-step
-"dry run" script is prepared, but has not been executed — session paused before running it
-(user request). See PROGRESS.md's "Sub-task 8 dry-run PREPARED, not run" entry for exact
-resume steps. Do not mark this done until the dry run's output has actually been inspected.
+**Status: PARTIALLY validated (2026-08-08)** — `time_stepper.run()` is unchanged code-wise,
+but now runs against the promoted `solve_bvp` solver (PLAN.md §4.2's 2026-08-08 update)
+instead of shooting; `main.py` implements the dry-run entry point this status note used to
+say was missing. Executed: `state_0 = solve_static_structure()` → `relax_initial_state()` →
+`time_stepper.run(..., n_steps=10, dt=1e4 yr)`. **Result: the first real step converged
+cleanly** (`status=0`), and its physical trend is exactly this sub-task's exit criterion,
+one step deep — $T_\text{center}$ 11523.59→11520.10K and $r_\text{surface}$
+5.1089→5.1069 $R_\text{Jup}$, both decreasing (contraction); $T_\text{surface}$ moved to
+within 0.02% of $T_\text{NEB}$ and $|L_\text{surface}|$ dropped ~70x, informative for the
+standing negative-$L_\text{surface}$ question (PROGRESS.md 2026-08-08 has the full numbers).
+**But the SECOND real step does not yet converge** within a generously raised node budget,
+diagnosed as a genuine local difficulty (super-linearly growing mesh-node requirement, not
+a simple resolution shortfall) rather than solved — PROGRESS.md 2026-08-08 has the full
+diagnostic trail. **Not yet a validated sustained multi-step trend, and not yet a full run
+to `config.R_HALT`** — do not mark this sub-task fully done until a run of several
+consecutive real steps succeeds.
 
 ---
 
@@ -843,9 +905,9 @@ insufficient," is no longer here — promoted out of Extensions to the mandatory
 | 3 | `gradients.py` | 2c | Schwarzschild switch correct over full T range | Done |
 | 4 | `odes.py`, `boundary_conditions.py` | 1–3 | Dimensional consistency check | Done |
 | **5a** | **`bvp_solver.py` outer BC redesign (photospheric, replaces $P=P_\text{neb}$)** | **2f, 4** | **Compact structure reaches a physically-motivated surface condition, not a $\sim10^7$ relative residual** | **Done (2026-07-27)** |
-| 5 | `bvp_solver.py` ($t=0$, compact hot start + relaxation to self-consistency) | 4, 2f, 5a | Compact, self-consistent $t=0$ structure; `solve_timestep` converges from it with a small residual | **Done, verified end-to-end (2026-08-01)** |
+| 5 | `bvp_solver.py` ($t=0$, compact hot start + relaxation to self-consistency) | 4, 2f, 5a | Compact, self-consistent $t=0$ structure; `solve_timestep` converges from it with a small residual | **Done, verified end-to-end (2026-08-01); $t>0$ bridge re-platformed onto `solve_bvp` (2026-08-08), see §4.2/§5 update** |
 | 6 | `diagnostics.py` | 5 | Standard (unconfined) virial theorem; multi-regime opacity; visual profile plots | **Done (2026-08-01)** |
-| 7–8 | `time_stepper.py` | 5–6 | Envelope contracts over time, no bootstrap needed | Implemented, not yet validated — dry run prepared but not executed (2026-08-01) |
+| 7–8 | `time_stepper.py`, `main.py` | 5–6 | Envelope contracts over time, no bootstrap needed | **Partially validated (2026-08-08): dry run executed against the promoted `solve_bvp` solver, first real step converges and shows the expected contracting trend; second step does not yet converge — see §4.2/Sub-task 8's own status note** |
 | **8a** | **EOS ionization upgrade (Saha equation)** | **8** | **`solve_timestep` converges through a full ionization transition with honestly-tuned tolerances** | **Not started — mandatory, scheduled after 8** |
 | **8b** | **EOS dissociation correction (molecular → atomic $\mu(T)$, distinct from 8a)** | **—** | **`eos.py`'s ideal-gas $\mu$ smoothly interpolates molecular (2.34) → atomic (~1.28) across the H$_2$ dissociation range, instead of the fixed molecular value used everywhere** | **Not started — small, low-cost, independent of 8a (PROGRESS.md 2026-08-07 has the discovery; no ionization physics needed, much cheaper than Saha)** |
 | 9 | Adaptive $\Delta t$ | 7–8 | Better energy conservation | Not started — blocked on 7–8 |

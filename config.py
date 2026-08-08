@@ -292,3 +292,83 @@ GRAD_EFF_SWITCH_EPSILON = 1.0e-4   # Smoothing width of effective_gradient's min
 # track. It will need reinstating (with its original 2000 K value) if Stage 1 (the first
 # core, PLAN.md "Phase 3 - Extensions") is ever modeled separately.
 R_HALT = 1.0 * R_JUPITER_CM   # Surface radius at which time_stepper.run() halts (Sub-task 8) [cm]
+
+# ==========================================
+# SECTION: solve_bvp Collocation Solver (bvp_solver.py t>0, promoted from bvp_experiment.py 2026-08-08)
+# ==========================================
+#
+# PLAN_BVP.md Milestone 6 (2026-08-07) replaced bvp_solver.py's shooting-based t>0 solve
+# (relax_initial_state/solve_timestep) with scipy.integrate.solve_bvp collocation, after the
+# shooting Jacobian was found to be structurally rank-deficient (100% convective saturation
+# under the infinitely-efficient-convection idealization - PLAN_BVP.md Milestone 4). These
+# constants were proven at T_CENTER_INITIAL=11500K and 12000K in bvp_experiment.py before
+# being promoted here as production values (PLAN.md Sub-task 5 update, 2026-08-08).
+
+# ASSUMPTION: same pseudo-relaxation-timestep convention as the old (archived) shooting
+# relax_initial_state - NOT real elapsed physical time (bvp_solver.relax_initial_state
+# leaves state.t unchanged). Order-of-magnitude choice (1% of the KH contraction timescale),
+# not derived; used only to make state_0's assumed-adiabatic construction into a genuine
+# solution of the real, time-differenced 4-ODE system before real time evolution begins.
+RELAX_DT_FRACTION = 0.01   # Fraction of T_KH_TIMESCALE_S used as relax_initial_state's pseudo-timestep [dimensionless]
+
+# ASSUMPTION: looser than BVP_TOL (which governs solve_static_structure's solve_ivp/brentq
+# precision, unaffected by this pivot) by design - solve_bvp's collocation residual control
+# is a different numerical quantity (global mesh residual, not a local ODE step error) and
+# was never tuned tighter than this in bvp_experiment.py's proven runs (residuals achieved
+# were still machine-precision-level in practice, 1e-7 to 1e-16 - PLAN_BVP.md Milestone 6/
+# section 3.6.4).
+BVP_COLLOCATION_TOL = 1.0e-6   # scipy.integrate.solve_bvp's own tol parameter (global mesh residual control) [dimensionless]
+
+# RAISED 2026-08-07 (20000->80000) - PLAN_BVP.md Milestone 6: with scaling+analytic
+# Jacobians, the continuation's near-alpha=1 step exhausted the old 20000-node budget while
+# still actively refining (a mesh-budget limit, not a divergence) - PROGRESS.md has the trace.
+BVP_MAX_NODES = 80000   # scipy.integrate.solve_bvp's max_nodes parameter [dimensionless]
+
+# ASSUMPTION: denser than N_GRID_POINTS=200 (the OUTPUT sampling grid, unaffected by this
+# pivot) - solve_bvp's 4th-order collocation scheme extrapolates a midpoint value from y and
+# dy/dx at each FIXED mesh interval BEFORE any Newton refinement; a first attempt at
+# N_GRID_POINTS=200 overshot into an unphysical (P,T) region on that very first midpoint
+# evaluation (PROGRESS.md 2026-08-06). A denser initial mesh bounds that per-interval
+# extrapolation more tightly.
+BVP_MESH_N_GRID_POINTS = 2000   # solve_bvp-specific initial mesh density [dimensionless]
+
+# ASSUMPTION: much deeper than GRID_OUTER_REFINEMENT=1e-4 (the OUTPUT/reporting grid's own
+# refinement, unaffected by this pivot). Found 2026-08-08 (PROGRESS.md) diagnosing a
+# solve_timestep-only crash: GRID_OUTER_REFINEMENT's log-spaced outer points stop at
+# delta_min=GRID_OUTER_REFINEMENT*0.1*M_TOTAL from the surface, leaving a SINGLE final,
+# UNRESOLVED gap (m_surface-delta_min to m_surface itself) with no intermediate points - at
+# 1e-4 this final gap is ~1e-5 of M_TOTAL, tiny in mass terms but P/T genuinely drop by
+# ~3 orders of magnitude across it in a converged, self-consistent solution (a real,
+# extremely thin photospheric "skin", not a numerical artifact). solve_bvp's cubic-Hermite
+# collocation midpoint estimate (built from y AND dy/dx at each mesh interval's endpoints)
+# massively overshoots when dy/dx itself jumps ~860x between the last two guess points - a
+# swept comparison (1e-4 through 1e-12) found the max CONSECUTIVE dy/dx ratio drops from
+# ~860x to ~1.2x already at 1e-6, giving solve_bvp a smooth enough initial trial to Newton-
+# correct from, without needing the output grid's own resolution changed at all (solve_bvp's
+# own dense interpolant is smooth regardless of how coarsely it's later SAMPLED for
+# reporting - only the INITIAL guess mesh fed into the Newton iteration needs this).
+BVP_MESH_OUTER_REFINEMENT = 1.0e-6   # Guess-mesh-only outer refinement (deeper than GRID_OUTER_REFINEMENT) [dimensionless]
+
+# PLAN_BVP.md Milestone 6 (2026-08-07): the literal alpha=1.0 continuation endpoint diverges
+# via exponentially escalating mesh refinement to NaN, while alpha=0.99999 converges cleanly
+# - diagnosed as the tiny adiabatic admixture acting as a regularizer for a marginal
+# instability in the pure, unblended system (consistent with, not fully explained by, the
+# rank-deficiency finding above). A quantifiably negligible (0.001%) adiabatic contamination,
+# not a discretization artifact.
+BVP_ALPHA_MAX = 1.0 - 1.0e-5   # Continuation endpoint for the nabla_eff alpha-blend, just short of the unstable literal 1.0 [dimensionless]
+
+# Empirically-tuned continuation ladder (PLAN_BVP.md Milestone 6/3.6.4): finer near alpha=1
+# where the real, Schwarzschild-selected gradient's rank-deficient regions dominate; coarser
+# near alpha=0 where the pure adiabat (well-conditioned) still holds. Proven at both
+# T_CENTER_INITIAL=11500K and 12000K.
+BVP_ALPHA_CONTINUATION_STEPS = (0.0, 0.5, 0.9, 0.99, 0.999, 0.9999, BVP_ALPHA_MAX)   # nabla_eff alpha-blend continuation schedule [dimensionless]
+
+# ASSUMPTION: a wrong analytic Jacobian is worse than none (steers Newton confidently in the
+# wrong direction) - validation.py's Jacobian-correctness check cross-verifies fun_jac/bc_jac
+# against central finite differences at this many randomly-sampled mesh points before they
+# are trusted, using a row-normalized relative-error metric (PROGRESS.md 2026-08-07: a naive
+# per-entry/output-value metric produces false alarms when both analytic and FD values are
+# legitimately near zero).
+JACOBIAN_VERIFY_N_POINTS = 15    # Number of randomly-sampled mesh points checked against finite differences [dimensionless]
+JACOBIAN_VERIFY_REL_STEP = 1.0e-6   # Relative finite-difference step size for the Jacobian cross-check [dimensionless]
+JACOBIAN_VERIFY_TOL = 1.0e-4     # Maximum acceptable row-normalized relative error before refusing to trust the analytic Jacobian [dimensionless]

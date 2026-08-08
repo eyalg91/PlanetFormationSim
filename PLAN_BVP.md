@@ -1,5 +1,12 @@
 # PLAN_BVP.md — Roadmap: Pivoting to a Global Relaxation (`solve_bvp`) Architecture
 
+> **★ MERGED INTO PLAN.md, 2026-08-08.** This roadmap's conclusion (Milestone 6, §3.6/§3.6.4)
+> has been promoted into production `bvp_solver.py`, and the architectural decision is now
+> recorded in `PLAN.md` §4.2 and its Sub-task 5 status note. `PLAN.md` is once again the
+> single active forward-looking reference; this document is kept in place, unmaintained
+> going forward, as the detailed milestone-by-milestone numerical trail (Milestones 0-6)
+> behind that decision — link to it for the "why," not the current "what."
+
 **Status (2026-08-07): Active. This supersedes shooting (`bvp_solver.py`) as the project's
 target numerical architecture, per an explicit architectural decision recorded below.**
 This document is the forward-looking roadmap for that pivot, in the same spirit as

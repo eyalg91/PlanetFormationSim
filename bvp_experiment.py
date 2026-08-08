@@ -1,3 +1,9 @@
+# bvp_experiment.py — SUPERSEDED 2026-08-08: this experiment's proven logic (state-vector
+# scaling, analytic Jacobians, the ALPHA_MAX continuation) was promoted into production
+# bvp_solver.py (PLAN.md §4.2, PLAN_BVP.md §6). Kept in place, unmodified, as the historical
+# experiment record - not imported by any active module. For the current production solver,
+# see bvp_solver.py.
+#
 # bvp_experiment.py — Standalone, isolated experiment: scipy.integrate.solve_bvp (a
 # collocation/relaxation method - the same numerical FAMILY as Henyey's implicit relaxation,
 # not local shooting) as a candidate replacement for bvp_solver.py's shooting architecture.

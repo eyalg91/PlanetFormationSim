@@ -5,33 +5,55 @@
 # PRESCRIBED central temperature (config.T_CENTER_INITIAL - a chosen "hot start" parameter,
 # not derived; standard practice for gas-giant "hot start" models, e.g. Marley et al. 2007).
 # It is not static (dT_dt=dP_dt=0): it is already contracting at its natural Kelvin-Helmholtz
-# rate (T/t_KH, 4P/t_KH, config.T_KH_TIMESCALE_S), evaluated on the current trial profile.
+# rate, evaluated on the current trial profile via implicit (Henyey-style) time differencing.
 # Compactness (a few R_Jup, not a few hundred) requires non-relativistic electron-degeneracy
 # pressure (eos.py), included additively with the ideal-gas term.
 #
 # OUTER BOUNDARY: the photosphere (Eddington tau=2/3, boundary_conditions.py), not a fixed
 # ambient pressure P_neb - a degenerate-supported structure's atmosphere hands off to a
 # photosphere at a pressure set by its own surface gravity and opacity, not by the ambient
-# nebula. Both shooting routines integrate outward with the photosphere as a solve_ivp EVENT
-# and match the ENCLOSED MASS at that event to M_TOTAL, rather than checking a residual at a
-# fixed m=M_TOTAL grid endpoint.
+# nebula.
 #
-# SOLVER: shooting (scipy.integrate.solve_ivp, Radau, outward integration + root-finding on
-# the central conditions), not scipy.integrate.solve_bvp - the surface pressure boundary
-# layer and the wide dynamic range of P, T across the mass grid defeat its collocation
-# Jacobian.
+# SOLVER, TWO DIFFERENT METHODS FOR TWO DIFFERENT PROBLEMS (2026-08-08 architecture):
+#   - t=0 (solve_static_structure): a simple 3-ODE pure-adiabat construction, ONE shooting
+#     unknown (P_center). Integrates outward with scipy.integrate.solve_ivp as a solve_ivp
+#     EVENT locates the photosphere, `brentq` root-finds on enclosed-mass-at-event=M_TOTAL.
+#     This has always been robust (never implicated in the crash investigation below) and is
+#     UNCHANGED by the 2026-08-08 pivot.
+#   - t>0 (relax_initial_state, solve_timestep): the full 4-ODE system, previously solved by
+#     the same shooting strategy (root-find via scipy.optimize.root on two unknowns,
+#     P_center/T_center) - RETIRED 2026-08-08, archived verbatim in
+#     bvp_solver_shooting_archive.py. PLAN_BVP.md (Milestones 0-4) traced repeated numerical
+#     kinks near the photosphere to a genuine Jacobian rank deficiency (100% convective
+#     saturation under the infinitely-efficient-convection idealization makes
+#     d(nabla_eff)/d(nabla_rad)=0, decoupling L from the P-T relation) - not fixable by
+#     patching individual physics/BC terms, confirmed by five independent isolated tests.
+#     Now solved via scipy.integrate.solve_bvp (global collocation/relaxation, the same
+#     numerical family as Henyey's implicit relaxation used by production stellar-evolution
+#     codes): a NONDIMENSIONALIZED state vector (r, L rescaled to be O(1)-comparable with the
+#     already-log-transformed P, T), analytic Jacobians (fun_jac/bc_jac, replacing scipy's
+#     default finite-difference estimate), and a continuation in alpha (blending the pure
+#     adiabat toward the real Schwarzschild-selected gradient) ending just short of the
+#     literal alpha=1.0 endpoint (config.BVP_ALPHA_MAX - a small, empirically-required
+#     regularizer, PLAN_BVP.md Milestone 6) together attack the Jacobian's CONDITIONING
+#     directly, without fixing the underlying rank deficiency itself - a genuine
+#     mixing-length-theory convection treatment remains the mathematically complete fix and
+#     stays on the roadmap, deliberately deferred (PLAN_BVP.md §6). Proven at
+#     T_CENTER_INITIAL=11500K and 12000K in the standalone bvp_experiment.py before being
+#     promoted here.
 #
-# STATE REPRESENTATION: both RHS functions below integrate ln P, ln T rather than P, T
-# directly, so P=exp(lnP)>0, T=exp(lnT)>0 hold by construction through the stiff solver's
-# internal probing - the standard Henyey/MESA-style representation. See PROGRESS.md for the
-# full physical/numerical history behind these design choices (photospheric BC, log state
-# variables, the L>=0 floor in gradients.grad_radiative).
+# STATE REPRESENTATION: P, T are always log-transformed (lnP, lnT) so P=exp(lnP)>0,
+# T=exp(lnT)>0 hold by construction through the solver's internal probing - the standard
+# Henyey/MESA-style representation. For t>0, r and L are ADDITIONALLY nondimensionalized
+# (r_hat=r/R_JUPITER_CM, L_hat=arcsinh(L/L_KH_SCALE_ERG_S)) - see the State-Vector Scaling
+# section below. See PROGRESS.md and PLAN_BVP.md for the full physical/numerical history
+# behind every design choice in this file.
 
-import warnings
+import time
 
 import numpy as np
-from scipy.integrate import solve_ivp
-from scipy.optimize import brentq, root
+from scipy.integrate import solve_bvp, solve_ivp
+from scipy.optimize import brentq
 
 import boundary_conditions
 import config
@@ -109,16 +131,16 @@ def _adiabatic_center_guess():
 # ==========================================
 
 def _build_output_grid(m_min, m_surface):
-    """Composite Lagrangian mass grid for sampling the dense solve_ivp solution: log-spaced
-    in the core (unchanged), and log-spaced in DISTANCE-TO-SURFACE over the outer
+    """Composite Lagrangian mass grid for sampling the dense solve_ivp/solve_bvp solution:
+    log-spaced in the core (unchanged), and log-spaced in DISTANCE-TO-SURFACE over the outer
     config.GRID_OUTER_MASS_FRACTION of the mass, so resolution increases smoothly toward the
     photosphere instead of collapsing to ~1-2 points there.
 
     ASSUMPTION: pure np.logspace(m_min, m_surface) puts the outer 10% of mass (where T, rho,
     P actually change fastest, near the photosphere) into only ~0.05 of the grid's ~6 decades
-    in log-space - starving that region of points regardless of solve_ivp's own dense,
-    accurate interior interpolant. This produced a visibly jagged, under-resolved drop in
-    structure-profile plots even though the underlying physics is smooth (PROGRESS.md
+    in log-space - starving that region of points regardless of the underlying solve's own
+    dense, accurate interior interpolant. This produced a visibly jagged, under-resolved drop
+    in structure-profile plots even though the underlying physics is smooth (PROGRESS.md
     2026-08-01 entry has the diagnosis).
     """
     n_outer = int(round(config.N_GRID_POINTS * config.GRID_OUTER_POINT_FRACTION))
@@ -136,12 +158,15 @@ def _build_output_grid(m_min, m_surface):
 
 
 # ==========================================
-# SECTION: Photosphere Event (tau=2/3 surface location)
+# SECTION: Photosphere Event (tau=2/3 surface location) — t=0 adiabat only
 # ==========================================
-# Both shooting routines below terminate their outward integration at the photosphere
-# (boundary_conditions.photospheric_pressure) via a solve_ivp EVENT, not a residual at a fixed
-# m=M_TOTAL grid endpoint - see that module's docstring for the physical reasoning. The two
-# event functions differ only in how they unpack the RHS's state vector.
+# solve_static_structure locates the surface via a solve_ivp EVENT (tau=2/3 photosphere,
+# boundary_conditions.photospheric_pressure) and matches the ENCLOSED MASS at that event to
+# M_TOTAL, rather than checking a residual at a fixed m=M_TOTAL grid endpoint - see that
+# module's docstring for the physical reasoning. This is the t=0 problem's OWN solve_ivp
+# integration (3-ODE adiabat, `brentq` shooting) - unrelated to the t>0 solve_bvp machinery
+# below, where the mass domain [m_min, M_TOTAL] is fixed and known exactly instead (no event
+# needed - see the t>0 sections' own docstrings).
 
 def _photosphere_event_adiabatic(x, y):
     r, lnP, lnT = y
@@ -151,16 +176,8 @@ _photosphere_event_adiabatic.terminal = True
 _photosphere_event_adiabatic.direction = -1
 
 
-def _photosphere_event_implicit(x, y):
-    r, lnP, L, lnT = y
-    P, T = np.exp(lnP), np.exp(lnT)
-    return P - boundary_conditions.photospheric_pressure(r, P, T, config.MU, config.MU_E)
-_photosphere_event_implicit.terminal = True
-_photosphere_event_implicit.direction = -1
-
-
 # ==========================================
-# SECTION: Adiabatic (Fully Convective) Right-Hand Side
+# SECTION: Adiabatic (Fully Convective) Right-Hand Side — t=0 only
 # ==========================================
 
 def _adiabatic_rhs_logm(x, y):
@@ -298,7 +315,7 @@ def solve_static_structure() -> state.SimulationState:
     rho = eos.density(P, T, config.MU, config.MU_E)
 
     # Diagnostic L(m): marginally-efficient-convection closure (gradients.py), NOT consumed by
-    # solve_timestep (which only ever interpolates state_prev.T, .P - see _implicit_rhs_logm) -
+    # solve_timestep (which only ever interpolates state_prev.T, .P - see implicit_rhs_scaled) -
     # exists to make state_0 a fully populated, physically meaningful SimulationState for
     # diagnostics/plots. Automatically satisfies the center BC L->0 as m->m_min (L is
     # proportional to m in this formula), no special-casing needed.
@@ -314,330 +331,639 @@ def solve_static_structure() -> state.SimulationState:
 
 
 # ==========================================
-# SECTION: Implicit Per-Timestep Solve
+# SECTION: State-Vector Scaling (t>0, PLAN_BVP.md Milestone 6)
 # ==========================================
+#
+# Motivation: the raw physical state y=[r,lnP,L,lnT] has extreme, directly-measured
+# heterogeneity - a single Jacobian-verification point showed y=[r=2.9e10, lnP=5.9,
+# L=2.6e29, lnT=3.6] - L is 28 ORDERS OF MAGNITUDE larger than lnT in the same vector Newton
+# must invert, a textbook cause of an ill-conditioned Jacobian independent of any individual
+# physics term. r and L are rescaled to be O(1)-comparable with the already-good lnP/lnT; P
+# and T stay log-transformed (unchanged, already well-conditioned and positivity-guaranteed).
+#
+# New state z = [r_hat, lnP, L_hat, lnT]:
+#   r_hat = r / R_SCALE                          (linear rescaling - R_SCALE is a true constant)
+#   L_hat = arcsinh(L / L_SCALE)                 (nonlinear, sign-preserving, log-like compression)
+#
+# arcsinh over a hand-rolled sign*log1p: a single closed-form expression (arcsinh(x)=
+# ln(x+sqrt(x^2+1))), smooth (C-infinity) with no piecewise branching, and its own derivative
+# (1/sqrt(x^2+1)) is simple and well-conditioned everywhere, including at x=0.
+R_SCALE = config.R_JUPITER_CM         # [cm] - true constant, r/R_SCALE is a LINEAR rescaling
+L_SCALE = config.L_KH_SCALE_ERG_S     # [erg/s] - already-vetted KH-luminosity reference (config.py)
 
-def _implicit_rhs_logm(x, y, state_prev, dt, alpha=1.0):
-    """dy/dx (x=ln(m)) for the full 4-ODE system. dT_dt, dP_dt are computed from the current
-    trial (T, P) differenced against state_prev's (interpolated) profile - the implicit
-    (Henyey-style) form: the energy equation's source term is exactly this state difference.
+
+def _to_physical(z):
+    """z=[r_hat, lnP, L_hat, lnT] -> y=[r, lnP, L, lnT] (physical, P/T still log). L=L_SCALE*
+    sinh(L_hat) is the exact inverse of L_hat=arcsinh(L/L_SCALE)."""
+    r_hat, lnP, L_hat, lnT = z
+    return np.array([r_hat * R_SCALE, lnP, L_SCALE * np.sinh(L_hat), lnT])
+
+
+def _to_scaled(y):
+    """y=[r, lnP, L, lnT] (physical, P/T still log) -> z=[r_hat, lnP, L_hat, lnT]."""
+    r, lnP, L, lnT = y
+    return np.array([r / R_SCALE, lnP, np.arcsinh(L / L_SCALE), lnT])
+
+
+# ==========================================
+# SECTION: Vectorized Physical-Space RHS and Jacobian (t>0)
+# ==========================================
+# solve_bvp calls fun(x, y) / fun_jac(x, y) with the WHOLE mesh at once (x shape (n,), y shape
+# (4, n)) - odes.stellar_odes is already vectorized this way (CLAUDE.md style rule), so these
+# call it directly rather than wrapping it point-by-point (contrast the retired shooting
+# _implicit_rhs_logm in bvp_solver_shooting_archive.py, written for solve_ivp's single-point
+# contract).
+
+def implicit_rhs_vectorized(x, y, state_prev, dt, alpha):
+    """dy/dx for the full 4-ODE system (y=[r,lnP,L,lnT], PHYSICAL, not yet nondimensionalized),
+    vectorized across solve_bvp's whole mesh at once. dT_dt, dP_dt are the implicit
+    (Henyey-style) time derivatives: the current trial (T,P) differenced against state_prev's
+    (interpolated) profile - the energy equation's source term is exactly this difference.
 
     alpha blends nabla_eff between the pure adiabat (alpha=0, matches solve_static_structure's
-    own construction) and the real Schwarzschild-selected value (alpha=1, the default - every
-    genuine solve_timestep() call uses this; only relax_initial_state()'s pseudo-steps use
-    alpha<1). At alpha=0 this reduces to dlnT_dm = grad_ad*dlnP_dm exactly. dL/dm is NEVER
-    scaled by alpha - dL/dm has no other source in this codebase, so scaling it would force
+    own construction) and the real Schwarzschild-selected value (alpha=1). dL/dm is NEVER
+    scaled by alpha - it has no other source in this codebase, so scaling it would force
     dL/dm=0 identically at alpha=0.
-
-    State is (r, lnP, L, lnT); P=exp(lnP)>0, T=exp(lnT)>0 hold by construction (module
-    docstring) - odes.stellar_odes and eos.density still receive/return linear, physical (P, T).
     """
     m = np.exp(x)
     r, lnP, L, lnT = y
     P, T = np.exp(lnP), np.exp(lnT)
+    # Diagnostic only (does not alter behavior): report WHERE along the mesh a trial (P,T) is
+    # extreme, before it potentially crashes eos.density downstream.
+    bad = ~np.isfinite(P) | ~np.isfinite(T) | (P <= 0) | (T <= 0) | (np.abs(lnP) > 300) | (np.abs(lnT) > 300)
+    if np.any(bad):
+        idx = np.where(bad)[0]
+        print(f"bvp_solver: [diag] extreme/non-finite (P,T) trial at {len(idx)} mesh point(s), "
+              f"m/M_TOTAL in [{(m[idx]/config.M_TOTAL).min():.3e}, {(m[idx]/config.M_TOTAL).max():.3e}], "
+              f"lnP range=[{np.nanmin(lnP[idx]):.3e},{np.nanmax(lnP[idx]):.3e}], "
+              f"lnT range=[{np.nanmin(lnT[idx]):.3e},{np.nanmax(lnT[idx]):.3e}]", flush=True)
     T_prev = np.interp(m, state_prev.m, state_prev.T)
     P_prev = np.interp(m, state_prev.m, state_prev.P)
     dT_dt = (T - T_prev) / dt
     dP_dt = (P - P_prev) / dt
-    y_full = np.array([[r], [P], [L], [T]])
-    dr_dm, dP_dm, dL_dm, dT_dm_real = odes.stellar_odes(
-        np.array([m]), y_full, np.array([dT_dt]), np.array([dP_dt])
-    )
-    dlnP_dm = dP_dm[0] / P
+    y_full = np.array([r, P, L, T])   # shape (4, n) - odes.stellar_odes's native contract
+    dr_dm, dP_dm, dL_dm, dT_dm_real = odes.stellar_odes(m, y_full, dT_dt, dP_dt)
+    dlnP_dm = dP_dm / P
     if alpha == 1.0:
-        dlnT_dm = dT_dm_real[0] / T
+        dlnT_dm = dT_dm_real / T
     else:
-        # grad_ad=dlnT/dlnP by definition (eos.grad_adiabatic, single source of truth); dlnP_dm
-        # is shared (hydrostatic equilibrium doesn't depend on the temperature gradient), so
-        # only the temperature-gradient term needs recombining.
-        dlnT_dm_adiabatic = eos.grad_adiabatic(config.GAMMA) * dlnP_dm
-        dlnT_dm = (1.0 - alpha) * dlnT_dm_adiabatic + alpha * (dT_dm_real[0] / T)
-    return [dr_dm[0] * m, dlnP_dm * m, dL_dm[0] * m, dlnT_dm * m]
+        # grad_ad=dlnT/dlnP by definition (eos.grad_adiabatic).
+        dlnT_dm_ad = eos.grad_adiabatic(config.GAMMA) * dlnP_dm
+        dlnT_dm = (1.0 - alpha) * dlnT_dm_ad + alpha * (dT_dm_real / T)
+    # Chain rule: d/dx = m * d/dm, since x = ln(m)
+    return np.array([dr_dm, dlnP_dm, dL_dm, dlnT_dm]) * m
 
 
-def _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_prev, dt, alpha=1.0):
-    """Integrate the full 4-ODE system outward for a trial (P_center, T_center), terminating
-    at the photosphere event; see _implicit_rhs_logm. L starts at exactly 0 (center BC).
+def _eos_density_derivatives(P, T, rho):
+    """d(rho)/dP, d(rho)/dT via IMPLICIT differentiation of the EOS's defining equation
+    (NOT differentiating through eos.density's own Newton iteration): F(rho,P,T) =
+    P_ideal(rho,T) + P_deg(rho) - P = 0.
 
-    atol=config.BVP_TOL on the log components gives uniform relative precision on P, T across
-    their many-decade range (see _integrate_adiabatic_outward).
+    Standard implicit-function-theorem result: drho/dP = -(dF/dP)/(dF/drho),
+    drho/dT = -(dF/dT)/(dF/drho). dF/drho is exactly the same quantity
+    (dP_ideal_drho + dP_deg_drho) eos.density's own Newton loop already computes as its
+    convergence-step denominator - reproduced here (eos.py exposes no derivative API by
+    design, since gradients.py/odes.py never needed one before this solver).
     """
-    def rhs(x, y):
-        return _implicit_rhs_logm(x, y, state_prev, dt, alpha)
-    return solve_ivp(
-        rhs, x_span, [r_start, np.log(P_center), 0.0, np.log(T_center)], method="Radau",
-        dense_output=True, events=_photosphere_event_implicit,
-        rtol=config.BVP_TOL, atol=[1.0, config.BVP_TOL, 1.0, config.BVP_TOL],
-    )
+    dP_ideal_drho = config.K_B * T / (config.MU * config.M_H)              # dF/drho, ideal term
+    P_deg = eos.degenerate_pressure(rho, config.MU_E)
+    dP_deg_drho = (5.0 / 3.0) * P_deg / rho                                 # dF/drho, degenerate term
+    D = dP_ideal_drho + dP_deg_drho                                        # dF/drho total
+    drho_dP = 1.0 / D                                                      # dF/dP = -1
+    P_ideal = rho * dP_ideal_drho
+    drho_dT = -(P_ideal / T) / D                                           # dF/dT = -P_ideal/T
+    return drho_dP, drho_dT
+
+
+def _thermodynamic_delta_derivatives(rho, T, drho_dP, drho_dT, delta):
+    """d(delta)/dP, d(delta)/dT for eos.thermodynamic_delta, via logarithmic differentiation
+    of delta=P_ideal/(rho*D), D=dP_ideal_drho+dP_deg_drho (same quantities eos.
+    thermodynamic_delta itself computes). Both -> 0 as dP_deg_drho -> 0 (pure ideal gas,
+    delta=1 exactly, a true constant - zero sensitivity), matching eos.thermodynamic_delta's
+    own limiting-case docstring.
+    """
+    dP_ideal_drho = config.K_B * T / (config.MU * config.M_H)
+    P_deg = eos.degenerate_pressure(rho, config.MU_E)
+    dP_deg_drho = (5.0 / 3.0) * P_deg / rho
+    D = dP_ideal_drho + dP_deg_drho
+    ddelta_dP = -delta * (2.0 / 3.0) * (dP_deg_drho / (rho * D)) * drho_dP
+    ddelta_dT = delta * (dP_deg_drho / D) * (1.0 / T - (2.0 / 3.0) * drho_dT / rho)
+    return ddelta_dP, ddelta_dT
+
+
+def _opacity_derivatives(rho, T, kappa):
+    """d(kappa)/d(rho), d(kappa)/dT from the LOCALLY active Bell & Lin regime's own power
+    law, kappa=kappa_i*rho^a*T^b: d(kappa)/d(rho)=a*kappa/rho, d(kappa)/dT=b*kappa/T - exact
+    almost everywhere (undefined only exactly AT a regime transition, measure zero)."""
+    regime_idx = opacity.determine_regime(rho, T)
+    a = np.array([opacity.REGIMES[i].a for i in np.atleast_1d(regime_idx).ravel()]).reshape(np.shape(regime_idx))
+    b = np.array([opacity.REGIMES[i].b for i in np.atleast_1d(regime_idx).ravel()]).reshape(np.shape(regime_idx))
+    dkappa_drho = a * kappa / rho
+    dkappa_dT = b * kappa / T
+    return dkappa_drho, dkappa_dT
+
+
+def _grad_radiative_derivatives(L, m, P, T, kappa, rho, drho_dP, drho_dT, dkappa_drho, dkappa_dT, grad_rad):
+    """d(grad_rad)/dL, dP, dT for grad_rad = 3*kappa*L_safe*P/(16*pi*A_RAD*C_LIGHT*G*m*T^4)
+    (gradients.grad_radiative). L_safe is the smoothed hyperbolic floor - differentiated here
+    from the mathematically-equivalent SIMPLE form L_safe=0.5*(L+sqrt(L^2+eps^2)) (algebraically
+    identical to the cancellation-safe form gradients.py evaluates, so the exact derivative is
+    identical too). grad_rad depends on P, T both explicitly (T^-4, P^1) AND implicitly through
+    kappa(rho(P,T),T) - both channels included via the chain rule.
+    """
+    eps_L = config.GRAD_RAD_L_FLOOR_EPSILON
+    dLsafe_dL = 0.5 * (1.0 + L / np.sqrt(L**2 + eps_L**2))
+    C_rad = 3.0 * kappa * P / (16.0 * np.pi * config.A_RAD * config.C_LIGHT * config.G * m * T**4)
+    dgrad_rad_dL = C_rad * dLsafe_dL
+    dgrad_rad_dP = grad_rad * ((dkappa_drho / kappa) * drho_dP + 1.0 / P)
+    dgrad_rad_dT = grad_rad * ((dkappa_drho / kappa) * drho_dT + dkappa_dT / kappa - 4.0 / T)
+    return dgrad_rad_dL, dgrad_rad_dP, dgrad_rad_dT
+
+
+def _effective_gradient_derivative(grad_rad, grad_ad):
+    """d(grad_eff)/d(grad_rad) for grad_eff=min_smooth(grad_rad,grad_ad)
+    (gradients.effective_gradient), differentiated from the simple form
+    grad_eff=0.5*(a+b)-0.5*sqrt((a-b)^2+eps^2). grad_ad is a constant (eos.grad_adiabatic),
+    so this is the only channel."""
+    eps_s = config.GRAD_EFF_SWITCH_EPSILON
+    diff = grad_rad - grad_ad
+    return 0.5 * (1.0 - diff / np.sqrt(diff**2 + eps_s**2))
+
+
+def implicit_rhs_jacobian(x, y, state_prev, dt, alpha):
+    """d(dy/dx)/dy, shape (4,4,n) - solve_bvp's fun_jac contract, physical-space (y=[r,lnP,
+    L,lnT]). Mirrors implicit_rhs_vectorized's physics exactly. Derived by hand; cross-checked
+    against finite differences before use (validation.py's Jacobian-correctness check)."""
+    m = np.exp(x)
+    r, lnP, L, lnT = y
+    P, T = np.exp(lnP), np.exp(lnT)
+    n = len(np.atleast_1d(x))
+
+    rho = eos.density(P, T, config.MU, config.MU_E)
+    drho_dP, drho_dT = _eos_density_derivatives(P, T, rho)
+
+    dP_dm = -config.G * m / (4.0 * np.pi * r**4)   # f1 numerator, before dividing by P
+    f0 = 1.0 / (4.0 * np.pi * r**2 * rho)           # dr_dm
+    f1 = dP_dm / P                                   # dlnP_dm
+
+    kappa = opacity.bell_lin_opacity(rho, T)
+    dkappa_drho, dkappa_dT = _opacity_derivatives(rho, T, kappa)
+    grad_ad = eos.grad_adiabatic(config.GAMMA)
+    grad_rad = gradients.grad_radiative(L, m, P, T, kappa)
+    dgrad_rad_dL, dgrad_rad_dP, dgrad_rad_dT = _grad_radiative_derivatives(
+        L, m, P, T, kappa, rho, drho_dP, drho_dT, dkappa_drho, dkappa_dT, grad_rad)
+
+    J = np.zeros((4, 4, n))
+
+    # Row 0: f0 = dr_dm, depends on r (explicit) and rho(P,T)
+    J[0, 0] = -2.0 * f0 / r
+    J[0, 1] = -P * f0 / rho * drho_dP                 # d/d(lnP) = P*d/dP
+    J[0, 2] = 0.0
+    J[0, 3] = -T * f0 / rho * drho_dT                 # d/d(lnT) = T*d/dT
+
+    # Row 1: f1 = dlnP_dm, depends on r (via dP_dm) and P (via the /P) only
+    J[1, 0] = -4.0 * f1 / r
+    J[1, 1] = -f1                                      # d(dP_dm/P)/d(lnP) = -f1
+    J[1, 2] = 0.0
+    J[1, 3] = 0.0
+
+    # Row 2: f2 = dL_dm = -c_p*dT_dt + delta*dP_dt/rho, depends on P, T only (not r, not L
+    # itself). delta is the genuine EOS-dependent coefficient (eos.thermodynamic_delta),
+    # PLAN_BVP.md Milestone 6.
+    T_prev = np.interp(m, state_prev.m, state_prev.T)
+    P_prev = np.interp(m, state_prev.m, state_prev.P)
+    dP_dt = (P - P_prev) / dt
+    delta = eos.thermodynamic_delta(rho, T, config.MU, config.MU_E)
+    ddelta_dP, ddelta_dT = _thermodynamic_delta_derivatives(rho, T, drho_dP, drho_dT, delta)
+    df2_dP = delta / (dt * rho) + dP_dt * ddelta_dP / rho - delta * dP_dt / rho**2 * drho_dP
+    c_p = eos.specific_heat_cp(config.GAMMA, config.MU)
+    df2_dT = -c_p / dt + dP_dt * ddelta_dT / rho - delta * dP_dt / rho**2 * drho_dT
+    J[2, 0] = 0.0
+    J[2, 1] = P * df2_dP
+    J[2, 2] = 0.0
+    J[2, 3] = T * df2_dT
+
+    # Row 3: f3 = dlnT_dm = G_blend*f1, G_blend=(1-alpha)*grad_ad + alpha*grad_eff -
+    # dlnT/dm = grad_eff*dlnP/dm identically, so f3 factors through f1 exactly.
+    if alpha == 0.0:
+        G_blend = np.full(n, grad_ad)
+        dGblend_dP = np.zeros(n)
+        dGblend_dL = np.zeros(n)
+        dGblend_dT = np.zeros(n)
+    else:
+        grad_eff = gradients.effective_gradient(grad_rad, grad_ad)[0]
+        dgeff_dgrad = _effective_gradient_derivative(grad_rad, grad_ad)
+        dGblend_dL = alpha * dgeff_dgrad * dgrad_rad_dL
+        dGblend_dP = alpha * dgeff_dgrad * dgrad_rad_dP
+        dGblend_dT = alpha * dgeff_dgrad * dgrad_rad_dT
+        G_blend = (1.0 - alpha) * grad_ad + alpha * grad_eff
+    f3 = G_blend * f1
+    J[3, 0] = G_blend * J[1, 0]                                    # via f1's r-dependence only
+    J[3, 1] = (P * dGblend_dP) * f1 + G_blend * J[1, 1]            # explicit G_blend(P) + f1(lnP) terms
+    J[3, 2] = dGblend_dL * f1                                       # f1 has no L-dependence
+    J[3, 3] = (T * dGblend_dT) * f1                                 # f1 has no T-dependence
+
+    # Chain rule: d/dx = m * d/dm, so the WHOLE Jacobian (of m*f, not just f) scales by m.
+    return J * m
 
 
 # ==========================================
-# SECTION: Initial-Model Relaxation (bridges solve_static_structure to solve_timestep)
+# SECTION: Nondimensionalized RHS and Jacobian (t>0, the ones solve_bvp actually uses)
+# ==========================================
+
+def implicit_rhs_scaled(x, z, state_prev, dt, alpha):
+    """dz/dx for the scaled state z=[r_hat,lnP,L_hat,lnT] - converts to physical, calls the
+    physical RHS, then applies the OUTPUT-side chain-rule scaling
+    (Phi'=diag(1/R_SCALE, 1, 1/sqrt(L^2+L_SCALE^2), 1))."""
+    y = _to_physical(z)
+    f = implicit_rhs_vectorized(x, y, state_prev, dt, alpha)
+    L = y[2]
+    g = np.empty_like(f)
+    g[0] = f[0] / R_SCALE
+    g[1] = f[1]
+    g[2] = f[2] / np.sqrt(L**2 + L_SCALE**2)
+    g[3] = f[3]
+    return g
+
+
+def implicit_rhs_jacobian_scaled(x, z, state_prev, dt, alpha):
+    """d(dz/dx)/dz, shape (4,4,n) - the scaled-state counterpart of implicit_rhs_jacobian.
+
+    J_new[i,j] = row_scale[i] * J_old[i,j] * col_scale[j] + (extra term, row=col=2 only).
+
+    The extra term: because L_hat's own scaling factor Phi'_2(L)=1/sqrt(L^2+L_SCALE^2) is
+    itself L-dependent (nonlinear, unlike r_hat's constant 1/R_SCALE), differentiating
+    g=Phi'(y)*f(y) a second time picks up a genuine product-rule term from d(Phi')/dy, not
+    just the rescaled df/dy: d(Phi'_2)/dL * dL/d(L_hat) = -L/(L^2+L_SCALE^2) exactly - present
+    ONLY in the (L_hat row, L_hat column) entry.
+    """
+    y = _to_physical(z)
+    L = y[2]
+    f = implicit_rhs_vectorized(x, y, state_prev, dt, alpha)      # physical RHS - needed for the row-2 correction term
+    J_old = implicit_rhs_jacobian(x, y, state_prev, dt, alpha)    # (4,4,n), physical-space
+
+    n = J_old.shape[2]
+    col_scale = np.array([
+        np.full(n, R_SCALE),
+        np.ones(n),
+        np.sqrt(L**2 + L_SCALE**2),   # dL/d(L_hat) = L_SCALE*cosh(L_hat)
+        np.ones(n),
+    ])
+    row_scale = np.array([
+        np.full(n, 1.0 / R_SCALE),
+        np.ones(n),
+        1.0 / np.sqrt(L**2 + L_SCALE**2),
+        np.ones(n),
+    ])
+
+    J_new = J_old * row_scale[:, np.newaxis, :] * col_scale[np.newaxis, :, :]
+    correction = -L / (L**2 + L_SCALE**2) * f[2]
+    J_new[2, 2] += correction
+    return J_new
+
+
+# ==========================================
+# SECTION: Boundary Conditions (t>0, scaled state - reuses boundary_conditions.py's
+# photospheric_pressure but NOT its packaged boundary_conditions(), which assumes the
+# shooting convention of ya=zeros - see make_bc_scaled's own note)
+# ==========================================
+
+def make_bc_scaled(m_min):
+    """Builds the bc(za, zb) closure for solve_bvp, given m_min = the innermost mesh mass.
+    za, zb are SCALED state vectors [r_hat,lnP,L_hat,lnT]; residuals are returned in SCALED
+    units throughout (leaving the thermal residual in raw erg/s while everything else is
+    O(1)-scaled would reintroduce the scale mismatch this whole nondimensionalization exists
+    to remove).
+
+    Center condition: solve_bvp treats za as a genuine solved-for unknown (unlike shooting,
+    which always constructs r=r_seed>0, L=0 directly and never checks a residual for it) -
+    calling boundary_conditions.boundary_conditions() with za=zeros would force r(m_min)=0
+    EXACTLY, a true 1/r^2 singularity in dr_dm at solve_bvp's own m_min mesh point. Instead,
+    r(m_min) is tied to the LIVE trial center density via the analytic constant-density-center
+    relation r(m)=(3m/(4*pi*rho_c))^(1/3), re-evaluated from (P_a,T_a) at every Newton
+    iteration (PLAN_BVP.md Milestone 2) - not a fixed pre-estimate.
+    """
+    def bc(za, zb):
+        y_a, y_b = _to_physical(za), _to_physical(zb)
+        r_a, P_a, L_a, T_a = y_a[0], np.exp(y_a[1]), y_a[2], np.exp(y_a[3])
+        r_b, P_b, L_b, T_b = y_b[0], np.exp(y_b[1]), y_b[2], np.exp(y_b[3])
+
+        res = np.zeros(4)
+        rho_c = eos.density(P_a, T_a, config.MU, config.MU_E)
+        # Analytic constant-density-center relation (PLAN_BVP.md Milestone 2):
+        # r(m_min) = (3*m_min/(4*pi*rho_c))^(1/3)   [cm]
+        r_analytic = (3.0 * m_min / (4.0 * np.pi * rho_c)) ** (1.0 / 3.0)
+        res[0] = za[0] - r_analytic / R_SCALE   # r_hat(m_min) = r_analytic/R_SCALE
+        res[1] = za[2]                            # L_hat(m_min) = arcsinh(0/L_SCALE) = 0 (no nuclear source)
+
+        # Mechanical (photospheric) residual, log space - consistent with P,T already being
+        # log-transformed throughout (PLAN_BVP.md Milestone 3): a linear P_b-P_photo residual
+        # sits a ~1e11 dyn/cm^2-scale term in the same vector as center residuals near
+        # machine-zero, a scale mismatch the log form removes. zb[1] is already ln(P_b).
+        P_photo = boundary_conditions.photospheric_pressure(r_b, P_b, T_b, config.MU, config.MU_E)
+        res[2] = zb[1] - np.log(P_photo)
+
+        # Thermal (net-flux radiative) residual, in the SAME arcsinh units as the state
+        # vector's own L_hat.
+        L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
+        res[3] = zb[2] - np.arcsinh(L_expected / L_SCALE)
+        return res
+    return bc
+
+
+def make_bc_jacobian_scaled(m_min):
+    """Scaled-state counterpart of make_bc_scaled - dbc/d(za), dbc/d(zb), each (4,4). Derived
+    by direct differentiation of make_bc_scaled's residuals."""
+    def bc_jac(za, zb):
+        y_a, y_b = _to_physical(za), _to_physical(zb)
+        r_a, P_a, L_a, T_a = y_a[0], np.exp(y_a[1]), y_a[2], np.exp(y_a[3])
+        r_b, P_b, L_b, T_b = y_b[0], np.exp(y_b[1]), y_b[2], np.exp(y_b[3])
+
+        rho_a = eos.density(P_a, T_a, config.MU, config.MU_E)
+        drho_dP_a, drho_dT_a = _eos_density_derivatives(P_a, T_a, rho_a)
+        r_analytic = (3.0 * m_min / (4.0 * np.pi * rho_a)) ** (1.0 / 3.0)
+        dr_analytic_drho = -r_analytic / (3.0 * rho_a)
+
+        dbc_dza = np.zeros((4, 4))
+        dbc_dza[0, 0] = 1.0
+        dbc_dza[0, 1] = -(dr_analytic_drho * drho_dP_a * P_a) / R_SCALE
+        dbc_dza[0, 3] = -(dr_analytic_drho * drho_dT_a * T_a) / R_SCALE
+        dbc_dza[1, 2] = 1.0
+
+        rho_b = eos.density(P_b, T_b, config.MU, config.MU_E)
+        drho_dP_b, drho_dT_b = _eos_density_derivatives(P_b, T_b, rho_b)
+        kappa_b = opacity.bell_lin_opacity(rho_b, T_b)
+        dkappa_drho_b, dkappa_dT_b = _opacity_derivatives(rho_b, T_b, kappa_b)
+        P_photo = boundary_conditions.photospheric_pressure(r_b, P_b, T_b, config.MU, config.MU_E)
+
+        dPphoto_dr = -2.0 * P_photo / r_b
+        dPphoto_dP = -P_photo * (dkappa_drho_b / kappa_b) * drho_dP_b
+        dPphoto_dT = -P_photo * ((dkappa_drho_b / kappa_b) * drho_dT_b + dkappa_dT_b / kappa_b)
+
+        L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
+        dLexp_dr = 8.0 * np.pi * r_b * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
+        dLexp_dT = 16.0 * np.pi * r_b**2 * config.SIGMA_SB * T_b**3   # plain d(L_expected)/dT_b - see the chain-rule note below
+        d_arcsinh = 1.0 / np.sqrt(L_expected**2 + L_SCALE**2)   # d(arcsinh(L_expected/L_SCALE))/d(L_expected)
+
+        dbc_dzb = np.zeros((4, 4))
+        dbc_dzb[2, 0] = (-dPphoto_dr / P_photo) * R_SCALE                # d/d(r_hat_b) = R_SCALE * d/d(r_b)
+        dbc_dzb[2, 1] = 1.0 - (dPphoto_dP / P_photo) * P_b
+        dbc_dzb[2, 3] = -(dPphoto_dT / P_photo) * T_b
+        dbc_dzb[3, 0] = -d_arcsinh * dLexp_dr * R_SCALE                  # d/d(r_hat_b) = R_SCALE * d/d(r_b)
+        dbc_dzb[3, 2] = 1.0
+        dbc_dzb[3, 3] = -d_arcsinh * dLexp_dT * T_b                      # d/d(lnT_b) = T_b * d/d(T_b), chain rule applied once here
+
+        return dbc_dza, dbc_dzb
+    return bc_jac
+
+
+# ==========================================
+# SECTION: Mesh and Initial Guess (t>0)
+# ==========================================
+
+def _build_mesh_and_guess(guess_state, warm_start_L):
+    """Composite log-mass mesh (_build_output_grid, reused, with a solve_bvp-specific point
+    count - config.BVP_MESH_N_GRID_POINTS) and an initial y guess interpolated from
+    guess_state's own (r,P,T) profile - spanning x=[ln(m_min), ln(M_TOTAL)] exactly, since
+    under solve_bvp the domain is fixed and known (unlike shooting's event-determined
+    surface).
+
+    warm_start_L distinguishes the two callers' very different guess_state.L reliability:
+    - relax_initial_state (warm_start_L=False): guess_state is solve_static_structure's raw
+      output, whose L is the diagnostic-only marginal-convection closure - confirmed
+      2026-08-06 to be a poor seed for the real, Schwarzschild-selected L(m) (surface
+      thermal BC residual ~5e24 at the initial guess). A simple monotonic ramp toward the
+      KH-timescale luminosity scale is used instead.
+    - solve_timestep (warm_start_L=True): guess_state is itself a GENUINE, already-converged
+      solve_bvp solution (from a previous relax_initial_state/solve_timestep call) - its own
+      L(m) IS the physically meaningful profile close to the next dt's answer (found
+      2026-08-08, PROGRESS.md: reusing the KH-ramp guess here instead - which can be 10+
+      orders of magnitude off in both scale AND sign from the true, already-relaxed L, e.g.
+      ~+1e29 ramped vs ~-1e23 converged - fed solve_bvp's very first midpoint collocation
+      evaluation an unphysical (P,T) trial that crashed eos.density before any Newton
+      refinement even began).
+    """
+    m_min = config.M_MIN_FRACTION * config.M_TOTAL
+    n_grid_points_orig = config.N_GRID_POINTS
+    outer_refinement_orig = config.GRID_OUTER_REFINEMENT
+    config.N_GRID_POINTS = config.BVP_MESH_N_GRID_POINTS   # runtime-only override, restored below
+    # ASSUMPTION: the deeper BVP_MESH_OUTER_REFINEMENT only helps (and is only needed) for
+    # warm_start_L=True (solve_timestep, warm-starting from an already-CONVERGED, full-domain
+    # state whose own profile is genuinely steep in the final micro-interval - config.py's own
+    # comment). relax_initial_state's guess_state (state_0, the adiabatic seed) never reaches
+    # exactly m=M_TOTAL in the first place (np.interp's boundary clamping already avoids the
+    # problem there - see the warm_start_L docstring note above), so applying the deeper
+    # refinement unconditionally was tried and confirmed 2026-08-08 to be actively HARMFUL for
+    # relax_initial_state specifically: it inflates the initial guess mesh enough that solve_
+    # bvp's node count balloons across the alpha-continuation ladder and exceeds config.
+    # BVP_MAX_NODES before reaching alpha=1, where the original (coarser) mesh converged
+    # cleanly. Scoped to warm_start_L only, not a blanket change.
+    if warm_start_L:
+        config.GRID_OUTER_REFINEMENT = config.BVP_MESH_OUTER_REFINEMENT
+    try:
+        m_grid = _build_output_grid(m_min, config.M_TOTAL)
+    finally:
+        config.N_GRID_POINTS = n_grid_points_orig
+        config.GRID_OUTER_REFINEMENT = outer_refinement_orig
+    x = np.log(m_grid)
+
+    r_guess = np.interp(m_grid, guess_state.m, guess_state.r)
+    # ASSUMPTION: interpolate ln(P), ln(T) directly, NOT P, T then log() afterward - found
+    # 2026-08-08 (PROGRESS.md) while diagnosing a solve_timestep-only crash: P, T drop by
+    # ~3 orders of magnitude over the final ~0.001% of mass near the photosphere (a genuine,
+    # extremely steep physical transition, not a numerical artifact), and guess_state's own
+    # profile is stored on only config.N_GRID_POINTS=200 output points - far coarser than
+    # this new BVP_MESH_N_GRID_POINTS=2000 target mesh. Linearly interpolating P, T (then
+    # logging the result) approximates that decade-spanning drop with straight line segments
+    # in LINEAR space, producing a badly wrong lnP/lnT guess exactly where the profile is
+    # steepest; interpolating ln(P), ln(T) directly (the actual state variables the solver
+    # works in) tracks the true profile far better, since P, T are much closer to log-linear
+    # in m through the outer radiative layers. This was silently masked for
+    # relax_initial_state (guess_state=state_0): solve_static_structure's shooting-event
+    # surface never reaches exactly m=M_TOTAL, so np.interp's boundary-clamping quietly
+    # avoided ever extrapolating across the worst part of this transition - solve_timestep's
+    # guess_state (an already-converged, full-domain solve_bvp state) is the first case that
+    # actually exercises it.
+    lnP_guess = np.interp(m_grid, guess_state.m, np.log(guess_state.P))
+    lnT_guess = np.interp(m_grid, guess_state.m, np.log(guess_state.T))
+    if warm_start_L:
+        L_guess = np.interp(m_grid, guess_state.m, guess_state.L)
+    else:
+        L_scale_guess = config.G * config.M_TOTAL**2 / (guess_state.r[-1] * config.T_KH_TIMESCALE_S)
+        L_guess = L_scale_guess * (m_grid / config.M_TOTAL)
+    y_guess = np.array([r_guess, lnP_guess, L_guess, lnT_guess])
+    return x, y_guess
+
+
+def build_mesh_and_guess_scaled(guess_state, warm_start_L):
+    """Scaled-state counterpart of _build_mesh_and_guess - same mesh/guess, converted to
+    z=[r_hat,lnP,L_hat,lnT] via _to_scaled."""
+    x, y_guess = _build_mesh_and_guess(guess_state, warm_start_L)
+    return x, _to_scaled(y_guess)
+
+
+# ==========================================
+# SECTION: Solve Orchestration (t>0) — direct attempt, continuation fallback, crash-safety
+# ==========================================
+
+class _CrashedSolve:
+    """Stand-in for scipy's solve_bvp OptimizeResult when fun() raises instead of solve_bvp
+    itself returning a failed status (e.g. eos.density's own Newton-convergence assertion,
+    triggered by solve_bvp's internal Newton step overshooting into an unphysical (P,T)
+    region) - lets the SAME fallback logic trigger either way, without silently swallowing
+    the crash: the full exception is printed first, never hidden."""
+    def __init__(self, x, y, exc):
+        self.status = -99
+        self.message = f"CRASHED: {type(exc).__name__}: {exc}"
+        self.x = x
+        self.y = y
+
+
+def _safe_solve_bvp(fun, bc, x, y, fun_jac, bc_jac):
+    import traceback
+    try:
+        return solve_bvp(fun, bc, x, y, tol=config.BVP_COLLOCATION_TOL, max_nodes=config.BVP_MAX_NODES,
+                          verbose=2, fun_jac=fun_jac, bc_jac=bc_jac)
+    except Exception as exc:
+        print("bvp_solver: *** solve_bvp raised during Newton iteration (not a clean failed "
+              "status) - full traceback: ***")
+        traceback.print_exc()
+        return _CrashedSolve(x, y, exc)
+
+
+def _smoke_test_vectorization(state_prev, dt, bc, x, y_guess):
+    """Cheap sanity check that the RHS/bc closures behave correctly on a small synthetic
+    multi-point mesh BEFORE spending time on a real solve_bvp call - catches a shape-mismatch
+    bug immediately rather than deep inside a slow, hard-to-diagnose run."""
+    x_small, y_small = x[:5], y_guess[:, :5]
+    dzdx = implicit_rhs_scaled(x_small, y_small, state_prev, dt, 1.0)
+    assert dzdx.shape == y_small.shape, f"RHS shape mismatch: dzdx {dzdx.shape} vs z {y_small.shape}"
+    assert np.all(np.isfinite(dzdx)), "RHS produced non-finite values on the smoke-test mesh"
+    res = np.asarray(bc(y_guess[:, 0], y_guess[:, -1]))
+    assert res.shape == (4,), f"bc() shape mismatch: {res.shape}"
+    assert np.all(np.isfinite(res)), "bc() produced non-finite residuals"
+
+
+def _attempt_direct_solve(state_prev, dt, bc, bc_jac, x, y_guess, alpha):
+    def fun(x_, y_):
+        return implicit_rhs_scaled(x_, y_, state_prev, dt, alpha)
+    def fun_jac(x_, y_):
+        return implicit_rhs_jacobian_scaled(x_, y_, state_prev, dt, alpha)
+    t0 = time.time()
+    sol = _safe_solve_bvp(fun, bc, x, y_guess, fun_jac, bc_jac)
+    return sol, time.time() - t0
+
+
+def _attempt_continuation_solve(state_prev, dt, bc, bc_jac, x, y_guess, alpha_steps):
+    """Fallback if the direct alpha=1 solve fails: step alpha 0->1, warm-starting each
+    solve_bvp call from the previous alpha's dense solution.
+
+    config.BVP_ALPHA_MAX, not exactly 1.0 (PLAN_BVP.md Milestone 6): continuation converges
+    cleanly through alpha=0.9999 but the LITERAL alpha=1.0 diverges via exponentially
+    escalating mesh refinement to NaN - the tiny adiabatic admixture at BVP_ALPHA_MAX acts as
+    a regularizer, damping a marginal instability in the pure unblended system.
+    """
+    x_curr, y_curr = x, y_guess
+    total_elapsed = 0.0
+    sol = None
+    for alpha in alpha_steps:
+        def fun(x_, y_, alpha=alpha):
+            return implicit_rhs_scaled(x_, y_, state_prev, dt, alpha)
+        def fun_jac(x_, y_, alpha=alpha):
+            return implicit_rhs_jacobian_scaled(x_, y_, state_prev, dt, alpha)
+        t0 = time.time()
+        sol = _safe_solve_bvp(fun, bc, x_curr, y_curr, fun_jac, bc_jac)
+        elapsed = time.time() - t0
+        total_elapsed += elapsed
+        print(f"bvp_solver: continuation alpha={alpha:.5f}: status={sol.status}, "
+              f"message={sol.message}, nodes={sol.x.size}, elapsed={elapsed:.1f}s", flush=True)
+        if sol.status != 0:
+            return sol, total_elapsed
+        x_curr, y_curr = sol.x, sol.y
+    return sol, total_elapsed
+
+
+def _solve_structure_bvp(state_prev, dt, warm_start_L):
+    """Shared solve_bvp orchestration for both relax_initial_state (dt=pseudo-relaxation
+    timestep) and solve_timestep (dt=real elapsed time) - both warm-start the mesh/initial
+    guess from state_prev's own profile (matching the old shooting code's warm-start
+    convention: relax_initial_state seeded from state_0 itself, solve_timestep from the
+    actual previous converged state). warm_start_L: see _build_mesh_and_guess's docstring -
+    False for relax_initial_state (state_0.L is diagnostic-only), True for solve_timestep
+    (state_prev.L is a genuine previously-converged solution).
+
+    Attempts a direct alpha=1 solve first (cheap, matches the old shooting solve_timestep's
+    behavior of not re-relaxing every step); falls back to the config.BVP_ALPHA_CONTINUATION_
+    STEPS ladder only if that fails - bvp_experiment.py's proven strategy (PLAN_BVP.md
+    Milestone 6).
+
+    Returns (sol, m_min) - the raw solve_bvp OptimizeResult (scaled-state solution).
+    """
+    m_min = config.M_MIN_FRACTION * config.M_TOTAL
+    bc = make_bc_scaled(m_min)
+    bc_jac = make_bc_jacobian_scaled(m_min)
+    x, y_guess = build_mesh_and_guess_scaled(state_prev, warm_start_L)
+    _smoke_test_vectorization(state_prev, dt, bc, x, y_guess)
+
+    print("bvp_solver: attempting direct solve_bvp at alpha=1.0 ...", flush=True)
+    sol, elapsed = _attempt_direct_solve(state_prev, dt, bc, bc_jac, x, y_guess, alpha=1.0)
+    if sol.status != 0:
+        print(f"bvp_solver: direct solve_bvp did not converge (status={sol.status}, "
+              f"{sol.message}) after {elapsed:.1f}s - falling back to alpha-continuation", flush=True)
+        sol, elapsed = _attempt_continuation_solve(state_prev, dt, bc, bc_jac, x, y_guess,
+                                                    config.BVP_ALPHA_CONTINUATION_STEPS)
+
+    if sol.status != 0:
+        raise RuntimeError(
+            f"bvp_solver: solve_bvp failed to converge even via alpha-continuation "
+            f"(status={sol.status}, {sol.message}) after {elapsed:.1f}s - not a genuine solution"
+        )
+    return sol, m_min
+
+
+def _bvp_solution_to_state(sol, m_min, state_prev, t) -> state.SimulationState:
+    """Converts a converged scaled-state solve_bvp solution into a SimulationState on the
+    standard composite output grid. solve_bvp's domain [m_min, M_TOTAL] is FIXED and known
+    exactly (unlike shooting's event-determined surface) - a structural simplification of
+    this pivot, not an approximation."""
+    m = _build_output_grid(m_min, config.M_TOTAL)
+    z = sol.sol(np.log(m))
+    r, lnP, L, lnT = _to_physical(z)
+    P, T = np.exp(lnP), np.exp(lnT)
+    rho = eos.density(P, T, config.MU, config.MU_E)
+
+    print(f"bvp_solver: t>0 solve_bvp converged, t={t:.4e} s, nodes={sol.x.size}, "
+          f"P_center={P[0]:.6e} dyn/cm^2, T_center={T[0]:.6e} K, "
+          f"r_surface={r[-1]/config.R_JUPITER_CM:.4f} R_Jup, L_surface={L[-1]:.4e} erg/s")
+
+    return state.SimulationState(m=m, r=r, P=P, L=L, T=T, rho=rho, t=t, prev=state_prev)
+
+
+# ==========================================
+# SECTION: Public t>0 Solves (relax_initial_state, solve_timestep)
 # ==========================================
 
 def relax_initial_state(state_0) -> state.SimulationState:
     """Relax state_0 (solve_static_structure's output - built by forcing the pure ideal-gas
     adiabat, not a genuine solution of the real 4-ODE system's Schwarzschild-selected
     temperature gradient) into a state that IS self-consistent with the same implicit
-    equations solve_timestep() uses, via continuation in alpha (_implicit_rhs_logm's
-    nabla_eff blend fraction).
+    equations solve_timestep() uses, via solve_bvp at a small pseudo-timestep
+    (config.RELAX_DT_FRACTION*T_KH_TIMESCALE_S - NOT real elapsed time, t is left unchanged).
 
-    T_CENTER_INITIAL is a prescribed hand-off value, not derived from a previous state, so
-    state_0 has no reason to already be a root of solve_timestep's real, time-differenced
-    equations. Standard "initial model relaxation" practice (MESA-style pre-main-sequence
-    relaxation; classical Henyey-code ZAMS construction): walk a continuous path of
-    increasingly real problems from alpha=0 (reproduces state_0's own construction exactly) to
-    alpha=1 (the real target), using each step's converged (P_center, T_center) to warm-start
-    the next.
-
-    Convergence criteria: each pseudo-step's root-find (scipy.optimize.root, method="lm" -
-    see ASSUMPTION below for why not fsolve's default hybrd) must report success AND an
-    independently-verified residual below config.RESIDUAL_TOL, or the step is rejected and
-    retried at a smaller alpha step (see ADAPTIVE STEPPING below) - a failed step no longer
-    raises immediately unless even the minimum step size fails. The achieved [mass, thermal]
-    residual is printed for every attempt (successful or not) for a visible audit trail; a
-    >50% (P_center, T_center) jump between consecutive steps is flagged as a possible
-    solution-branch jump.
-
-    ADAPTIVE STEPPING (2026-08-01, PROGRESS.md has the full motivating trail): replaces the
-    original fixed 11-step grid. Two independent root-find algorithms (hybrd and LM)
-    converged to the identical non-zero residual attempting the alpha=0.0->0.1 jump directly
-    - evidence that a fixed step of 0.1 is genuinely too large for a local Newton/Gauss-
-    Newton-type step to bridge at this T_CENTER_INITIAL, not a solver-choice problem.
-    Standard numerical-continuation practice (parameter-continuation software; MESA/Henyey-
-    code relaxation) for a homotopy whose local difficulty varies along the path: try a
-    target step, halve and retry from the last genuinely-converged state on failure, grow
-    back toward the target after success so easy stretches aren't crawled through
-    unnecessarily. A minimum step floor raises loudly rather than halving forever.
+    2026-08-08: re-platformed from shooting (bvp_solver_shooting_archive.py) onto solve_bvp
+    collocation (PLAN_BVP.md Milestone 6) - same physical role, different numerical method.
     """
-    alpha_step_target = 0.1   # nominal/target step - also the ceiling step recovery grows back toward
-    # ASSUMPTION: 1e-4 (used until 2026-08-06) was an arbitrary safety floor, not derived from
-    # any genuine numerical limit. After fixing the L>=0 floor's kink (gradients.py, see
-    # config.GRAD_RAD_L_FLOOR_EPSILON), a separate, much narrower difficult patch was found
-    # near alpha~0.0508: the adaptive stepper hit this floor and raised, but a direct probe
-    # past it (PROGRESS.md 2026-08-06 has the full trace) showed the residual continuing to
-    # shrink smoothly and monotonically well below 1e-4 step sizes (converging cleanly by
-    # step~1e-5) - the textbook signature of a well-conditioned root that just needed a finer
-    # step, NOT a plateau (contrast with the genuine kink's signature: residual frozen at a
-    # fixed value regardless of step size, PROGRESS.md 2026-08-01/2026-08-06). Tightened based
-    # on that direct evidence, not assumed; kept well above machine precision so a genuine
-    # unreachable root still raises rather than looping toward xtol-level step sizes.
-    alpha_step_min = 1.0e-6   # safety floor - below this, raise rather than halve indefinitely
-    dt_relax = 0.01 * config.T_KH_TIMESCALE_S   # pseudo-timestep; not real elapsed time (t is left unchanged below)
-
-    m_min = config.M_MIN_FRACTION * config.M_TOTAL
-    x_span = (np.log(m_min), np.log(50.0 * config.M_TOTAL))
-    r_start = state_0.r[0]
-    # ASSUMPTION: a fixed Kelvin-Helmholtz-timescale luminosity estimate, NOT the trial's own
-    # photospheric L - tried self-scaling by the trial's own L instead (2026-08-01) and it
-    # made things WORSE, not better: at T_CENTER_INITIAL=13000K this fixed estimate
-    # (~2.6e29 erg/s) is actually ~78x LARGER than the genuine converged L (~3.4e27 erg/s),
-    # so switching to the trial's own L as the denominator shrinks it, not grows it -
-    # backwards from the intended fix, and it also introduced a new near-zero-denominator
-    # risk during fsolve's own internal probing. The real conditioning problem (PROGRESS.md
-    # 2026-08-01) is that the RAW thermal-residual/T_center sensitivity is enormous in this
-    # regime, independent of which constant divides it - a normalization choice can't fix
-    # that; see the residual-magnitude safety-net check below instead.
-    L_scale = config.G * config.M_TOTAL**2 / (state_0.r[-1] * config.T_KH_TIMESCALE_S)
-
-    def residual(u, alpha):
-        P_center, T_center = np.exp(u)
-        sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_0, dt_relax, alpha)
-        if len(sol.t_events[0]) == 0:
-            raise RuntimeError(
-                f"relax_initial_state: alpha={alpha:.3f} did not reach the photosphere at "
-                f"P_center={P_center:.6e}, T_center={T_center:.6e}"
-            )
-        m_event = np.exp(sol.t_events[0][0])
-        yb = sol.y_events[0][0]   # (r, lnP, L, lnT) at the photosphere event
-        yb_physical = np.array([yb[0], np.exp(yb[1]), yb[2], np.exp(yb[3])])
-        res_full = boundary_conditions.boundary_conditions(np.zeros(4), yb_physical)
-        mass_residual = (m_event - config.M_TOTAL) / config.M_TOTAL
-        return [mass_residual, res_full[3] / L_scale]
-
-    # ASSUMPTION: seeded from state_0's own center values, nudged by a tiny (1e-6) relative
-    # amount to avoid catastrophic cancellation in dT_dt=(T-T_prev)/dt: at the exact match
-    # point (alpha=0), T_trial and T_prev coincide to near machine precision (both follow the
-    # same adiabat by construction), so the difference is floating-point noise, not a genuine
-    # solution-boundary failure.
-    u = np.array([np.log(state_0.P[0]), np.log(state_0.T[0])]) * (1.0 + 1.0e-6)
-
-    # ASSUMPTION: Levenberg-Marquardt (MINPACK lmdif/lmder), not fsolve's default hybrd -
-    # hybrd's ONLY convergence criterion is xtol (relative step size between iterates); it
-    # has no ftol option at all, and reported ier==1 (2026-08-01, PROGRESS.md) even while the
-    # residual stayed frozen at ~1.3e-2, three orders above tolerance. LM's ftol (relative
-    # reduction in the sum of squares - a genuine, tunable criterion on the residual itself,
-    # not just the parameters) and its adaptively-damped Gauss-Newton/gradient-descent steps
-    # are the standard, textbook choice for a badly row-scaled Jacobian. ftol is a RELATIVE-
-    # progress criterion, not a literal "stop when |residual|<ftol" guarantee, so the
-    # explicit RESIDUAL_TOL check below remains the real, uncompromisable backstop regardless
-    # of which criterion LM itself stops on - confirmed necessary in practice, not
-    # theoretical: switching to LM alone did NOT resolve the alpha=0.0->0.1 stall (PROGRESS.md
-    # 2026-08-01), which is what motivated the adaptive stepping below.
-    alpha = 0.0
-    step = alpha_step_target
-    n_attempts = 0
-    max_attempts = 1000   # hard backstop against an unforeseen infinite loop - the step-floor
-                           # check below is the primary, expected termination guarantee; this
-                           # is only extra defense-in-depth, not expected to bind
-    while alpha < 1.0:
-        n_attempts += 1
-        if n_attempts > max_attempts:
-            raise RuntimeError(
-                f"relax_initial_state: exceeded {max_attempts} adaptive-step attempts without "
-                f"reaching alpha=1.0 (stuck at alpha={alpha:.6f}) - should be structurally "
-                f"impossible given the step floor; investigate rather than raise this cap"
-            )
-
-        alpha_trial = min(alpha + step, 1.0)
-        u_prev = u.copy()
-        try:
-            opt_result = root(lambda u_trial: residual(u_trial, alpha_trial), u, method="lm",
-                               options={"xtol": config.BVP_TOL, "ftol": config.RESIDUAL_TOL})
-            res_mass, res_L = opt_result.fun
-            max_residual = max(abs(res_mass), abs(res_L))
-            step_ok = opt_result.success and max_residual <= config.RESIDUAL_TOL
-        except RuntimeError as e:
-            # ASSUMPTION: NOT a blind catch-all - residual() raises RuntimeError for exactly
-            # one well-understood, anticipated case (the trial integration doesn't reach the
-            # photosphere at all, a real possibility when LM's own internal probing tries an
-            # aggressive step). A legitimate "this attempt failed, retry smaller" signal for
-            # the adaptive stepper, not a hidden failure - if step-halving can't recover
-            # either, the loop still raises loudly via the step-floor check below.
-            step_ok = False
-            res_mass = res_L = None
-            print(f"bvp_solver: relaxation step alpha={alpha:.4f}->{alpha_trial:.4f} "
-                  f"(step={step:.2e}) raised during root-find: {e}")
-
-        if step_ok:
-            u = opt_result.x
-            jump = np.max(np.abs(u - u_prev))   # ln-space, so this is a relative-change measure
-            if alpha_trial > 0.0 and jump > np.log(1.5):
-                warnings.warn(
-                    f"relax_initial_state: (P_center, T_center) jumped >50% between alpha "
-                    f"steps (alpha={alpha_trial:.4f}) - possible solution-branch jump, not "
-                    f"just smooth continuation; inspect before trusting this relaxation run",
-                    RuntimeWarning
-                )
-            print(f"bvp_solver: relaxation pseudo-step alpha={alpha_trial:.4f} converged "
-                  f"(step={step:.4f}), P_center={np.exp(u[0]):.6e}, T_center={np.exp(u[1]):.6e} K, "
-                  f"residuals=[{res_mass:.3e}, {res_L:.3e}]")
-            alpha = alpha_trial
-            step = min(step * 2.0, alpha_step_target)   # step recovery, capped at the nominal target
-        else:
-            step /= 2.0
-            if step < alpha_step_min:
-                raise RuntimeError(
-                    f"relax_initial_state: adaptive alpha-step fell below the minimum floor "
-                    f"({alpha_step_min:.1e}) trying to advance past alpha={alpha:.6f} - could "
-                    f"not find a convergent step even at minimum resolution; the true root may "
-                    f"be genuinely unreachable via local continuation from this point"
-                )
-            if res_mass is not None:
-                print(f"bvp_solver: relaxation step alpha={alpha:.4f}->{alpha_trial:.4f} FAILED "
-                      f"(residual [{res_mass:.3e}, {res_L:.3e}] exceeds "
-                      f"config.RESIDUAL_TOL={config.RESIDUAL_TOL:.1e}), halving step to {step:.2e}")
-            else:
-                print(f"bvp_solver: relaxation step alpha={alpha:.4f}->{alpha_trial:.4f} FAILED "
-                      f"(see error above), halving step to {step:.2e}")
-
-    P_center, T_center = np.exp(u)
-    sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_0, dt_relax, 1.0)
-    m_surface = np.exp(sol.t_events[0][0])
-
-    m = _build_output_grid(m_min, m_surface)
-    r, lnP, L, lnT = sol.sol(np.log(m))
-    P, T = np.exp(lnP), np.exp(lnT)
-    rho = eos.density(P, T, config.MU, config.MU_E)
-
-    print(f"bvp_solver: initial-state relaxation complete (alpha=1.0, genuine solution of the "
-          f"real 4-ODE system), T_center={T_center:.6e} K, r_surface={r[-1]/config.R_JUPITER_CM:.3f} R_Jup, "
-          f"m_surface/M_TOTAL={m_surface/config.M_TOTAL:.8f}")
-
-    # t is left at state_0.t: this is a mathematical relaxation device (pseudo-steps at a fixed
-    # pseudo-dt, state_prev held fixed at state_0 throughout), not real elapsed physical time.
-    return state.SimulationState(m=m, r=r, P=P, L=L, T=T, rho=rho, t=state_0.t, prev=state_0)
+    dt_relax = config.RELAX_DT_FRACTION * config.T_KH_TIMESCALE_S
+    sol, m_min = _solve_structure_bvp(state_0, dt_relax, warm_start_L=False)
+    return _bvp_solution_to_state(sol, m_min, state_0, t=state_0.t)
 
 
 def solve_timestep(state_prev, dt) -> state.SimulationState:
-    """Solve the envelope structure at t = state_prev.t + dt via the implicit shooting scheme.
-    Shoots on (ln P_center, ln T_center) to match two conditions at the photosphere event:
-    enclosed mass = M_TOTAL (mechanical) and the net radiative flux balance (thermal,
-    boundary_conditions.py). The center residuals (r_a=0, L_a=0) are satisfied exactly by
-    construction (integration starts at r=r_start, L=0).
+    """Solve the envelope structure at t = state_prev.t + dt via solve_bvp collocation.
+
+    2026-08-08: re-platformed from shooting (bvp_solver_shooting_archive.py) onto solve_bvp
+    (PLAN_BVP.md Milestone 6) - same physical role (implicit Henyey-style time differencing,
+    photospheric + net-flux-radiative surface conditions), different numerical method.
     """
-    m_min = config.M_MIN_FRACTION * config.M_TOTAL
-    x_span = (np.log(m_min), np.log(50.0 * config.M_TOTAL))
-    r_start = state_prev.r[0]
-
-    # Seed the root-find from state_prev's own (P_center, T_center), nudged by a tiny (1e-6) relative
-    # amount - state_prev is itself a converged solution, so without the nudge the trial and
-    # state_prev coincide to near machine precision right at the seed, and dT_dt=(T-T_prev)/dt
-    # amplifies that floating-point noise into a spurious blow-up (same catastrophic-
-    # cancellation mechanism as relax_initial_state's identical seed nudge).
-    u0 = np.array([np.log(state_prev.P[0]), np.log(state_prev.T[0])]) * (1.0 + 1.0e-6)
-
-    # ASSUMPTION: fixed Kelvin-Helmholtz-timescale estimate, not the trial's own photospheric
-    # L - see relax_initial_state's matching note (PROGRESS.md 2026-08-01): self-scaling by
-    # the trial's own L was tried and made things worse (the fixed estimate is actually
-    # *larger* than genuine converged L at hot starting points, so switching denominators
-    # shrinks rather than grows the normalized residual - backwards from intended). The raw
-    # thermal-residual/T_center sensitivity is enormous in this regime regardless of the
-    # normalization constant; the residual-magnitude safety-net check below is the real
-    # defense, not this choice of scale.
-    L_scale = config.G * config.M_TOTAL**2 / (state_prev.r[-1] * config.T_KH_TIMESCALE_S)
-
-    def residual(u):
-        P_center, T_center = np.exp(u)
-        sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_prev, dt)
-        if len(sol.t_events[0]) == 0:
-            raise RuntimeError(
-                f"solve_ivp did not reach the photosphere during timestep shooting at "
-                f"P_center={P_center:.6e}, T_center={T_center:.6e}"
-            )
-        m_event = np.exp(sol.t_events[0][0])
-        yb = sol.y_events[0][0]   # (r, lnP, L, lnT) at the photosphere event
-        yb_physical = np.array([yb[0], np.exp(yb[1]), yb[2], np.exp(yb[3])])
-        res_full = boundary_conditions.boundary_conditions(np.zeros(4), yb_physical)
-        mass_residual = (m_event - config.M_TOTAL) / config.M_TOTAL
-        return [mass_residual, res_full[3] / L_scale]
-
-    # ASSUMPTION: Levenberg-Marquardt, not fsolve's default hybrd - see relax_initial_state's
-    # matching note (PROGRESS.md 2026-08-01) for why: hybrd has no ftol option at all (only
-    # xtol, a step-size criterion), and reported false convergence at this exact class of
-    # badly-scaled thermal-residual problem. ftol is a relative-progress criterion, not a
-    # literal residual-size guarantee, so the explicit RESIDUAL_TOL check below remains the
-    # real backstop regardless of which criterion LM stops on.
-    opt_result = root(residual, u0, method="lm", options={"xtol": config.BVP_TOL, "ftol": config.RESIDUAL_TOL})
-    if not opt_result.success:
-        warnings.warn(f"solve_timestep: LM did not fully converge: {opt_result.message}", RuntimeWarning)
-
-    # ASSUMPTION: independently verify the residual rather than trusting opt_result.success
-    # alone - silently accepting a bad state here would corrupt every subsequent timestep in
-    # the loop. opt_result.fun avoids a redundant re-solve.
-    u_sol = opt_result.x
-    res_mass, res_L = opt_result.fun
-    max_residual = max(abs(res_mass), abs(res_L))
-    if max_residual > config.RESIDUAL_TOL:
-        raise RuntimeError(
-            f"solve_timestep: LM reports success={opt_result.success} but residual "
-            f"[{res_mass:.3e}, {res_L:.3e}] exceeds config.RESIDUAL_TOL={config.RESIDUAL_TOL:.1e} "
-            f"- not a genuine root"
-        )
-
-    P_center, T_center = np.exp(u_sol)
-    sol = _integrate_timestep_outward(P_center, T_center, x_span, r_start, state_prev, dt)
-    if len(sol.t_events[0]) == 0:
-        raise RuntimeError("solve_timestep: converged (P_center, T_center) does not reach the photosphere - numerical precision limit near the root")
-    m_surface = np.exp(sol.t_events[0][0])
-
-    m = _build_output_grid(m_min, m_surface)
-    r, lnP, L, lnT = sol.sol(np.log(m))
-    P, T = np.exp(lnP), np.exp(lnT)
-    rho = eos.density(P, T, config.MU, config.MU_E)
-
-    print(f"bvp_solver: timestep converged, t={state_prev.t + dt:.4e} s, P_center={P_center:.6e}, "
-          f"T_center={T_center:.6e} K, m_surface/M_TOTAL={m_surface/config.M_TOTAL:.8f}, "
-          f"residuals=[{res_mass:.3e}, {res_L:.3e}]")
-
-    return state.SimulationState(m=m, r=r, P=P, L=L, T=T, rho=rho, t=state_prev.t + dt, prev=state_prev)
+    sol, m_min = _solve_structure_bvp(state_prev, dt, warm_start_L=True)
+    return _bvp_solution_to_state(sol, m_min, state_prev, t=state_prev.t + dt)
