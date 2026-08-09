@@ -15,8 +15,9 @@ import config
 
 def compute_time_derivatives(state_curr, state_prev, dt):
     """(dT_dt, dP_dt) on state_curr.m, finite-differenced against state_prev (interpolated
-    onto state_curr.m in case the Lagrangian grid shifted between steps). Diagnostic only -
-    solve_timestep computes its own inline differencing.
+    onto state_curr.m in case the Lagrangian grid shifted between steps). Previously
+    diagnostic-only; now also select_adaptive_dt's own input (Sub-task 9) - solve_timestep
+    itself still computes its own inline differencing, unaffected.
     """
     T_prev_interp = np.interp(state_curr.m, state_prev.m, state_prev.T)
     P_prev_interp = np.interp(state_curr.m, state_prev.m, state_prev.P)
@@ -24,6 +25,49 @@ def compute_time_derivatives(state_curr, state_prev, dt):
     dT_dt = (state_curr.T - T_prev_interp) / dt
     dP_dt = (state_curr.P - P_prev_interp) / dt
     return dT_dt, dP_dt
+
+
+# ==========================================
+# SECTION: Adaptive Time-Stepping (Sub-task 9)
+# ==========================================
+
+def select_adaptive_dt(state_curr, state_prev, dt_used):
+    """Thermal/pressure-timescale limiter (PLAN.md Sub-task 9, PROGRESS.md has the full
+    design discussion):
+        dt_raw = ADAPTIVE_DT_SAFETY_FACTOR * min(min_i(T_i/|dT_i/dt|), min_i(P_i/|dP_i/dt|))
+    then capped by a per-step growth factor (dt_new <= ADAPTIVE_DT_GROWTH_FACTOR*dt_used -
+    growth only; shrinking is never restricted, since a sharp drop in the raw formula is the
+    safety mechanism working as intended) and clamped to [ADAPTIVE_DT_MIN, ADAPTIVE_DT_MAX].
+
+    DELIBERATELY dual (T and P), not T alone: P has been measured swinging by ~3 decades over
+    a tiny mass range near the photosphere all session - a T-only limiter could stay blind to
+    a fast-evolving P profile there.
+
+    DELIBERATELY excludes L: L=0 EXACTLY at the center by construction (the boundary
+    condition) and dL/dt there is also ~0 - a literal 0/0 at m=m_min on every step, not an
+    edge case; near the photosphere L has been observed crossing zero as normal, expected
+    behavior, not a danger signal. T and P already carry the physical signal that matters,
+    and neither has L's structural zero (T, P > 0 everywhere by construction), so no
+    equivalent 0/0 risk exists for them.
+
+    dT_dt, dP_dt are the REALIZED rates from the just-completed step (state_curr vs
+    state_prev, at dt_used) via compute_time_derivatives - a lagged estimate used to select
+    the NEXT step's dt, not a predictor-corrector.
+    """
+    dT_dt, dP_dt = compute_time_derivatives(state_curr, state_prev, dt_used)
+
+    # Points where the rate is exactly zero give T_i/0 = +inf (not NaN - T_i, P_i > 0 always,
+    # no structural 0/0 the way L has at the center) - naturally excluded by the min() below,
+    # no special-casing needed. Suppress the resulting numpy divide-by-zero warning
+    # explicitly rather than letting it print for an expected, harmless case.
+    with np.errstate(divide="ignore"):
+        T_timescale = state_curr.T / np.abs(dT_dt)
+        P_timescale = state_curr.P / np.abs(dP_dt)
+
+    dt_raw = config.ADAPTIVE_DT_SAFETY_FACTOR * min(T_timescale.min(), P_timescale.min())
+    dt_growth_capped = min(dt_raw, config.ADAPTIVE_DT_GROWTH_FACTOR * dt_used)
+    dt_new = np.clip(dt_growth_capped, config.ADAPTIVE_DT_MIN, config.ADAPTIVE_DT_MAX)
+    return float(dt_new)
 
 
 # ==========================================
@@ -39,22 +83,32 @@ def run(state_prev, n_steps, dt, snapshot_interval=1):
     solve_timestep's equations (bvp_solver.relax_initial_state's output, not
     solve_static_structure's directly).
 
+    dt is always the SEED timestep for step 1. If config.USE_ADAPTIVE_DT is False (default),
+    it is also used for every subsequent step, unchanged from before Sub-task 9. If True,
+    every step after the first instead uses select_adaptive_dt's thermal/pressure-timescale
+    selection, lagged from the JUST-COMPLETED step's realized dT/dt, dP/dt - no prior real-dt
+    derivative exists before step 1, hence the fixed seed there regardless of the flag.
+
     Returns the list of snapshots taken: state_prev itself, then every snapshot_interval-th
     step, always including the final step regardless of interval.
     """
     history = [state_prev]
-    dt_yr = dt / config.SECONDS_PER_YEAR
-    print(f"time_stepper.run: starting KH-contraction loop, n_steps={n_steps}, dt={dt_yr:.4e} yr, "
+    mode = "ADAPTIVE (Sub-task 9)" if config.USE_ADAPTIVE_DT else "FIXED"
+    print(f"time_stepper.run: starting KH-contraction loop, n_steps={n_steps}, dt_mode={mode}, "
+          f"seed dt={dt / config.SECONDS_PER_YEAR:.4e} yr, "
           f"R_HALT={config.R_HALT / config.R_JUPITER_CM:.3f} R_Jup")
 
     state = state_prev
+    dt_used = dt
     for step in range(1, n_steps + 1):
-        state = bvp_solver.solve_timestep(state, dt)
+        state_before_step = state
+        state = bvp_solver.solve_timestep(state, dt_used)
 
         r_surface = state.r[-1]
         t_yr = state.t / config.SECONDS_PER_YEAR
+        dt_used_yr = dt_used / config.SECONDS_PER_YEAR
         L_surface_lsun = state.L[-1] / config.L_SUN_ERG_S
-        print(f"time_stepper.run: step {step}/{n_steps}, t={t_yr:.4e} yr, dt={dt_yr:.4e} yr, "
+        print(f"time_stepper.run: step {step}/{n_steps}, t={t_yr:.4e} yr, dt={dt_used_yr:.4e} yr, "
               f"r_surface={r_surface / config.R_JUPITER_CM:.4f} R_Jup, "
               f"T_center={state.T[0]:.6e} K, L_surface={L_surface_lsun:.4e} L_sun")
 
@@ -67,5 +121,11 @@ def run(state_prev, n_steps, dt, snapshot_interval=1):
                   f"{r_surface / config.R_JUPITER_CM:.4f} R_Jup) at step {step}, "
                   f"t={t_yr:.4e} yr - halting")
             break
+
+        if config.USE_ADAPTIVE_DT:
+            dt_next = select_adaptive_dt(state, state_before_step, dt_used)
+            print(f"time_stepper.run: adaptive dt selected for next step: "
+                  f"{dt_next / config.SECONDS_PER_YEAR:.4e} yr (was {dt_used_yr:.4e} yr)")
+            dt_used = dt_next
 
     return history

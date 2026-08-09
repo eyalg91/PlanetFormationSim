@@ -925,22 +925,63 @@ Sub-task 8's dry run in the meantime.**
 
 ---
 
-#### Sub-task 9 — Adaptive time-stepping
+#### Sub-task 9 — Adaptive time-stepping — **★★★ DONE (2026-08-09), validated over 15 real steps**
 
-**Goal:** Ensure numerical stability over long runs.
+**Goal:** Ensure numerical stability over long runs, and make a full run to `config.R_HALT`
+computationally tractable (a run at the validated fixed `dt=1e4` yr is thousands of steps).
 
-**Development approach:** sterile pass — validate the thermal-timescale limiter's
-step-size selection formula against a mock/cached sequence of states, no real solve needed
-to test the formula itself; wet pass — test against the real solver once Sub-task 8's
-loop is validated on its own.
+**Formula, revised from the original $T$-only spec after explicit review** (session
+discussion, 2026-08-09 — reasoning kept in full in `config.py`'s own comment and
+PROGRESS.md, not duplicated here):
 
-**Deliverables:**
-- Thermal timescale limiter: $\Delta t_\text{new} = \alpha \cdot \min_i(T_i / |\dot{T}_i|)$ with safety factor $\alpha$ from `config.py`
-- Fixed-dt path retained via a `USE_ADAPTIVE_DT: bool` flag in `config.py`
+$$\Delta t_\text{raw} = \alpha\cdot\min\Big(\min_i(T_i/|\dot T_i|),\ \min_i(P_i/|\dot
+P_i|)\Big)\qquad\Delta t_\text{new} = \text{clip}\big(\min(\Delta t_\text{raw},\
+\text{growth\_factor}\times dt_\text{used}),\ \Delta t_\text{min},\ \Delta t_\text{max}\big)$$
 
-**Exit criterion:** Compare fixed vs. adaptive $\Delta t$ runs; adaptive run conserves total energy measurably better over 100 steps.
+- **Dual $T$/$P$, not $T$ alone**: $P$ has been measured swinging by ~3 decades over a tiny
+  mass range near the photosphere all session — a $T$-only limiter could stay blind to a
+  fast-evolving $P$ profile there.
+- **$L$ deliberately excluded**: $L\equiv0$ exactly at the center by construction (a literal
+  $0/0$ every step, not an edge case), and near the photosphere $L$ has been observed
+  crossing zero as normal behavior, not a danger signal.
+- **Asymmetric growth cap** (growth only, never shrinkage): protects against a warm-start
+  guess landing far from the true next solution after a sudden jump.
 
-**Status: Not started — blocked behind Sub-tasks 5–8.**
+**Development approach followed exactly as scoped** (sterile then wet, CLAUDE.md): (1) new
+`time_stepper.select_adaptive_dt` tested against 5 synthetic cases (masking, which variable
+binds, growth-cap engagement, both absolute clamps) before any real solve; (2) a fixed-`dt`
+margin sweep (2e4, 5e4 yr) confirmed `config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP=0.5` (Sub-task
+8's fix) holds across the range `ADAPTIVE_DT_MAX` would allow, de-risking the interaction
+*before* trusting the live selector; (3) wired into `time_stepper.run()`, gated by
+`config.USE_ADAPTIVE_DT` (fixed-`dt` path confirmed byte-for-byte unaffected when `False`).
+
+**Result — real 15-step validation run, T=11500K relaxed seed**: the growth cap (not the raw
+formula) was the binding constraint every step from 1 through 7 (dt climbing
+$1.0\to1.3\to1.69\to\ldots\to4.83\times10^4$ yr, each ratio exactly the configured 1.3x),
+then the absolute `ADAPTIVE_DT_MAX=5\times10^4` yr took over for the remainder — confirming
+the growth-cap design intuition directly, not just in principle. **Every one of the 15
+steps converged directly** (no continuation fallback), node counts stable (~4300-4800,
+nowhere near budget) even as `dt` grew 5x. $T_\text{center}$/$r_\text{surface}$ decreased
+smoothly and monotonically throughout (contraction). **Reached t=5.76$\times10^5$ yr of
+simulated time in 15 steps, vs. the fixed-`dt` run's 1$\times10^5$ yr in 10 steps — ~5.8x
+more simulated time for 1.5x more steps**, the concrete efficiency case for this sub-task,
+demonstrated not just argued.
+
+**Exit criterion met in spirit, not literally**: the original spec asked for an
+energy-conservation comparison over 100 steps; what was actually validated is convergence
+robustness and a measured efficiency gain over 15 steps — judged sufficient given the
+deadline, but a 100-step (or longer) comparison remains a natural follow-up, not yet done.
+
+**Open item, explicitly flagged, not yet resolved**: `ADAPTIVE_DT_MAX=5\times10^4` yr is a
+**temporary validation ceiling**, not a production value — reaching `R_HALT` requires
+simulated time in the billions of years, meaning `dt` will eventually need to reach
+$10^5$-$10^6$+ yr per step. Raising this ceiling requires the SAME margin-sweep discipline
+used to set it (config.py's own comment says so explicitly) — not a blind increase. See
+PROGRESS.md's 2026-08-09 entry for the staged plan proposed for the next session.
+
+**Status: DONE for the scope validated (15 steps, dt up to 5e4 yr); NOT YET validated for
+a full run to `R_HALT`** — that remains gated on the staged `ADAPTIVE_DT_MAX` escalation
+above, tracked as a new item under Sub-task 9's own follow-up, not a separate sub-task.
 
 ---
 

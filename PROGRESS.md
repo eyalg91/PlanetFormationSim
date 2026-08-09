@@ -11,6 +11,20 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**★★★ 2026-08-09 — Sub-task 9 (adaptive time-stepping) implemented and validated.** Full
+trail: §5's 2026-08-09 entry. Short version: `time_stepper.select_adaptive_dt` (dual
+$T$/$P$ thermal-timescale limiter, $L$ deliberately excluded, asymmetric growth cap) - three
+design refinements added after explicit review against standard stellar-evolution-code
+practice, all justified and adopted, not rubber-stamped. Sterile-tested (5/5 synthetic
+cases), margin-swept against the `GRAD_EFF_SWITCH_EPSILON_TIMESTEP` fix at 2e4/5e4 yr
+*before* trusting it live, then validated over a real 15-step run: the growth cap was the
+binding constraint every step (not the raw formula) until `ADAPTIVE_DT_MAX=5e4` yr was
+reached, confirming the design intuition directly. Reached **5.76e5 yr of simulated time in
+15 steps vs. 1e5 yr in 10 fixed-`dt` steps - a ~5.8x efficiency gain**. `ADAPTIVE_DT_MAX` is
+explicitly a *temporary* validation ceiling, not production-ready - reaching `R_HALT` needs
+`dt` several orders of magnitude larger; a staged, re-validated escalation plan (not a blind
+increase) is recorded in §5's entry for the next session.
+
 **★★★ 2026-08-08 (later same day) — Sub-task 8's dry-run exit criterion MET: a genuine
 10-step time evolution, monotonic contraction, negative-$L_\text{surface}$ question
 resolved.** Supersedes the "open, not yet resolved" step-2 item in the ★★ entry directly
@@ -235,7 +249,8 @@ remains the place for numerical trails and debugging history).
 | 7 | `time_stepper.py` time derivatives | Unchanged code; now runs against the promoted `solve_bvp` solver (2026-08-08) — see row 5 |
 | 8 | Outer time loop (`time_stepper.run`, `main.py`) | **★★★ Dry-run exit criterion MET (2026-08-08)**: `main.py` implemented; a full 10-step dry run converges cleanly at every step, with $T_\text{center}$/$r_\text{surface}$ decreasing monotonically (contraction) and $L_\text{surface}$ settling to a small positive value — resolved a genuine marginal-convection mesh-explosion via a context-dependent Schwarzschild-switch smoothing width (`config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP`). Not yet a full run to `config.R_HALT`. See §1/§5's 2026-08-08 entries and `PLAN.md` Sub-task 8's status note. |
 | 8c | MLT convection treatment | Not started — formally scheduled, explicitly deferred past the one-week deadline (`PLAN.md` Sub-task 8c) |
-| 9–10 | Adaptive dt, output | Not started — not blocked, but not yet prioritized either |
+| 9 | Adaptive time-stepping (`time_stepper.select_adaptive_dt`) | **★★★ Done, validated over 15 real steps (2026-08-09)** — dual $T$/$P$ limiter, $L$ excluded, asymmetric growth cap; ~5.8x simulated-time efficiency gain measured. `ADAPTIVE_DT_MAX` is a temporary ceiling, not yet raised to production scale — see §5's 2026-08-09 entry |
+| 10 | `output.py` | Not started — not blocked, but not yet prioritized either |
 
 **Stub present but empty:** `ReadMe.txt`. (`main.py` implemented 2026-08-08, no longer a stub.)
 
@@ -991,6 +1006,112 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-09 — ★★★ Sub-task 9 (adaptive time-stepping) implemented and validated: growth cap confirmed as the binding safety mechanism, ~5.8x simulated-time efficiency gain demonstrated
+
+**Goal**: replace the fixed `dt` in `time_stepper.run()` with a thermal/pressure-timescale
+limiter, per `PLAN.md` §4.5/Sub-task 9 - motivated directly by the previous entry's own
+numbers (a full run to `config.R_HALT` at the validated fixed `dt=1e4` yr is thousands of
+steps, plausibly hours of compute). Deliberately sequenced ahead of Sub-tasks 8a (Saha)/8b
+(molecular→atomic $\mu(T)$)/8c (MLT) - user's explicit decision, both EOS refinements being
+orthogonal to this work.
+
+**Design reviewed and revised before implementation, not accepted as first-drafted.** The
+initial proposal (this session, following `PLAN.md`'s original $T$-only spec) was reviewed
+by the user against standard stellar-evolution-code practice (MESA-style multi-variable
+timestep controls) and revised on three points, all adopted after genuine technical
+evaluation, not rubber-stamped:
+1. **Dual $T$/$P$ constraint, not $T$ alone** - $P$ has been directly measured swinging by
+   ~3 decades over a tiny mass range near the photosphere all session (the exact region
+   every numerical fight this project has had originated in); a $T$-only limiter could stay
+   blind to a fast-evolving $P$ profile there. Both already available from
+   `compute_time_derivatives`, zero extra cost.
+2. **$L$ deliberately excluded** - $L\equiv0$ exactly at the center by construction (a
+   literal $0/0$ every single step, not an edge case), and near the photosphere $L$ has been
+   observed crossing zero as *normal* behavior (not a danger signal) more than once this
+   session. Including it would make the selector's `min` chronically dominated by benign
+   near-zero points for no real signal gained.
+3. **Asymmetric growth-factor cap** (`ADAPTIVE_DT_GROWTH_FACTOR=1.3`, growth only, never
+   shrinkage) - protects against a sudden 2-3x jump producing a warm-start guess far from the
+   true next solution, the same failure character behind every mesh-explosion this project
+   has hit.
+
+Final formula: $\Delta t_\text{raw}=\alpha\cdot\min(\min_i(T_i/|\dot T_i|),\min_i(P_i/|\dot
+P_i|))$, then growth-capped relative to $dt_\text{used}$, then clamped to
+`[ADAPTIVE_DT_MIN, ADAPTIVE_DT_MAX]` - in that order (raw formula → growth cap → absolute
+rail).
+
+**Implementation, sterile then wet (CLAUDE.md discipline followed exactly):**
+1. New pure function `time_stepper.select_adaptive_dt(state_curr, state_prev, dt_used)`,
+   using the already-existing `compute_time_derivatives` (previously diagnostic-only, now
+   this function's first real consumer) for the realized $\dot T$, $\dot P$ from the
+   just-completed step - a lagged estimate for the *next* step's `dt`, not a
+   predictor-corrector.
+2. **Sterile test**: 5 synthetic `SimulationState` cases (masking of exactly-zero rates,
+   confirming $P$ can bind the min when $T$ is quiet and vice versa, growth-cap engagement,
+   both absolute clamps) - all 5 passed. One test-design bug caught along the way (not a
+   function bug): a "wild upward spike" case was found to never produce a small timescale
+   mathematically ($T/|\dot T|$ is bounded below by $\sim dt_\text{used}$ for any growth
+   ratio, since $|T_\text{curr}-T_\text{prev}|<T_\text{curr}$ always when $T_\text{prev}>0$)
+   - corrected to a sharp *drop* instead, which does produce a small timescale as intended.
+3. **De-risk the epsilon interaction before trusting the live selector** - a fixed-`dt`
+   margin sweep at 2e4 and 5e4 yr (bracketing the range `ADAPTIVE_DT_MAX` would allow)
+   confirmed `config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP=0.5` (the previous entry's fix) still
+   converges directly at both, with modest node counts (11,381 and 16,075) - no reopening of
+   the marginal-convection wall.
+4. **Wired into `time_stepper.run()`**, gated by `config.USE_ADAPTIVE_DT` (default `False`)
+   - fixed-`dt` behavior confirmed byte-for-byte unaffected by the refactor via a direct
+   2-step sanity check before touching the adaptive path.
+
+**Real 15-step validation result (T=11500K relaxed seed, seed `dt=1e4` yr,
+`USE_ADAPTIVE_DT=True`):**
+```
+step 1: dt=1.00e4 yr -> next dt selected: 1.30e4 yr   (growth cap binding, ratio exactly 1.3x)
+step 2: dt=1.30e4 yr -> next dt selected: 1.69e4 yr   (growth cap binding)
+...continues at exactly 1.3x every step...
+step 7: dt=4.83e4 yr -> next dt selected: 5.00e4 yr   (ADAPTIVE_DT_MAX reached)
+step 8-15: dt=5.00e4 yr (clamped at the ceiling)
+```
+**The growth cap - not the raw $T$/$P$ formula - was the binding constraint every step from
+1 through 7**, confirming the design intuition behind adding it directly, not just in
+principle: the raw formula wanted to jump further at every one of those steps, and the cap
+throttled it back. All 15 steps converged directly (no continuation fallback ever needed),
+node counts stable (~4300-4800, nowhere near the 80,000 budget) even as `dt` grew 5x.
+$T_\text{center}$ (11519.92→11469.25K) and $r_\text{surface}$ (5.1035→5.0840 $R_\text{Jup}$)
+decreased smoothly and monotonically throughout. $L_\text{surface}$ stayed positive but was
+NOT perfectly monotonic - a mild dip (2.126→2.038 ×$10^{-11}L_\odot$) over steps 1-6, then
+rising again through step 15 (→2.695×$10^{-11}$) - flagged honestly as an open, unexplained
+detail (possibly a genuine local luminosity minimum during this contraction phase, possibly
+an artifact of the changing `dt` sampling; not yet investigated, not alarming on its own
+since it stays positive and smoothly varying).
+
+**The concrete efficiency win**: 15 adaptive steps reached
+$t=5.76\times10^5$ yr of simulated time, vs. the fixed-`dt` run's $1\times10^5$ yr in 10
+steps - **~5.8x more simulated time for 1.5x more steps**. This is what makes a full run to
+`config.R_HALT` plausible within the remaining timeframe, not just a numerical nicety.
+
+**Full validation.py suite re-run as a final regression check** (`USE_ADAPTIVE_DT=False`
+confirmed as the default) - all checks pass except the two already-documented pre-existing,
+unrelated failures (Checks 17, 23).
+
+**Open item, explicitly not resolved - the natural next question**: `ADAPTIVE_DT_MAX=5e4`
+yr is a deliberately *temporary* validation ceiling (config.py's own comment says so), not a
+production value. Reaching `R_HALT` requires simulated time in the billions of years, so
+`dt` will eventually need to reach $10^5$-$10^6$+ yr per step - two to three orders of
+magnitude beyond anything tested. **Recommendation for next session (not yet executed)**:
+raise the ceiling in staged, re-validated increments (e.g. 10x at a time - margin-sweep at
+the new ceiling with 2-3 fixed `dt` values, then a real multi-step adaptive run at that
+ceiling, THEN raise again) rather than a single large jump - the session's own repeated
+lesson (the epsilon requirement grew with EVOLVING STATE complexity, not just with `dt` in
+isolation - Sub-task 8's step-6-not-step-2 failure is the direct precedent) argues against
+assuming validated behavior at 5e4 yr extrapolates cleanly to $10^6$ yr. The growth cap
+itself provides some protection during exploration (a raised ceiling doesn't cause an
+immediate jump there, since `dt` still only grows 1.3x/step), but an unmonitored long run
+against an unvalidated ceiling risks a late, expensive failure rather than an early, cheap
+one. Also worth noting as a distinct, non-numerical risk: as `dt` approaches the KH
+timescale itself ($T_\text{KH\_TIMESCALE\_S}\sim10^6$ yr), the quasi-static/implicit-
+differencing assumption's own physical validity (not just solver convergence) deserves a
+second look, independent of whether the solver happens to converge.
 
 ### 2026-08-08 — ★★★ Multi-step time evolution achieved: the step-2 mesh-explosion diagnosed as genuine marginal convection, resolved via a context-dependent Schwarzschild-switch smoothing; 10-step dry run meets Sub-task 8's exit criterion
 

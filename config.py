@@ -173,6 +173,46 @@ SECONDS_PER_YEAR = 3.156e7   # Julian-year-ish conversion, used for time_stepper
 # adaptive stepping exists.
 T_KH_TIMESCALE_S = 1.0e6 * SECONDS_PER_YEAR   # Characteristic Kelvin-Helmholtz contraction timescale, ~1 Myr in seconds [s]
 
+# ASSUMPTION 2026-08-09 (PLAN.md Sub-task 9, PROGRESS.md has the full design discussion):
+# thermal-timescale limiter, dt_new = alpha*min(min_i(T_i/|dT_i/dt|), min_i(P_i/|dP_i/dt|)) -
+# replaces time_stepper.run()'s fixed dt once config.USE_ADAPTIVE_DT=True. A full run to
+# R_HALT at the validated fixed dt=1e4 yr is thousands of steps (hours of compute); this is
+# what makes a real production run tractable.
+#
+# DELIBERATELY dual (T AND P), not T alone: P has been directly measured swinging by ~3
+# decades over a tiny mass range near the photosphere all session (the exact region every
+# numerical fight this project has had originated in) - a T-only limiter could stay blind to
+# a fast-evolving P profile there. Both are already returned by time_stepper.
+# compute_time_derivatives, so this costs nothing extra to compute.
+#
+# DELIBERATELY excludes L: L=0 EXACTLY at the center by construction (the boundary
+# condition) and dL/dt there is also ~0 - a literal 0/0 at m=m_min on EVERY step, not an
+# edge case. Near the photosphere L has been observed crossing zero as normal, expected
+# behavior (not a danger signal) more than once this session (PROGRESS.md 2026-08-08).
+# Including L would make the selector's min chronically dominated by benign near-zero
+# points; T/P already carry the physical signal that matters.
+USE_ADAPTIVE_DT = False   # Fixed-dt path retained (PLAN.md 4.5) - flip True once Sub-task 9's wet-pass validation passes
+ADAPTIVE_DT_SAFETY_FACTOR = 0.15   # alpha - conservative starting value, to be tuned empirically against the real run [dimensionless]
+
+# ASSUMPTION: asymmetric by design - caps how fast dt can GROW step-to-step (a sudden 2-3x
+# jump would produce a warm-start guess far from the true next solution, the same failure
+# character that has caused every mesh-explosion this session), but does NOT restrict
+# shrinkage - a sharp drop in the raw formula's proposed dt is the safety mechanism working
+# as intended, not something to fight.
+ADAPTIVE_DT_GROWTH_FACTOR = 1.3   # Max dt_new/dt_used ratio per step (growth only) [dimensionless]
+
+# ASSUMPTION: ADAPTIVE_DT_MAX is a TEMPORARY, conservative rail for Sub-task 9's initial
+# validation - NOT a physically-motivated production ceiling. The real KH contraction to
+# R_HALT spans billions of years in total simulated time, so dt will eventually need to grow
+# into the hundreds-of-thousands-to-millions-of-years range in the late stages; this cap
+# exists only so the adaptive selector cannot pick a dt outside the range the
+# GRAD_EFF_SWITCH_EPSILON_TIMESTEP fix (PROGRESS.md 2026-08-08) has actually been checked
+# against, per the margin-sweep step of Sub-task 9's plan. Revisit (raise, or retire in favor
+# of a per-run adaptive ceiling) once that sweep is extended further, or once Sub-task 8c
+# (MLT) removes the underlying fragility entirely.
+ADAPTIVE_DT_MAX = 5.0e4 * SECONDS_PER_YEAR   # Absolute dt ceiling, temporary pending wider margin validation [s]
+ADAPTIVE_DT_MIN = 1.0e2 * SECONDS_PER_YEAR   # Absolute dt floor, against pathological stalling from a transient dT/dt or dP/dt spike [s]
+
 
 # ==========================================
 # SECTION: Opacity Model Flags
