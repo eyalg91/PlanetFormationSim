@@ -1,13 +1,15 @@
 # time_stepper.py — Outer Kelvin-Helmholtz contraction time loop (Sub-task 8): repeated
-# bvp_solver.solve_timestep calls from a given starting state, down to config.R_HALT. Also
-# retains compute_time_derivatives as a post-hoc finite-difference diagnostic utility (not on
-# solve_timestep's own critical path - bvp_solver._implicit_rhs_logm does its own inline
-# differencing).
+# bvp_solver.solve_timestep calls from a given starting state, down to config.R_HALT or
+# config.T_MAX_S (Sub-task 10's dual stopping condition), whichever comes first.
+# Also retains compute_time_derivatives as a post-hoc finite-difference diagnostic utility
+# (not on solve_timestep's own critical path - bvp_solver._implicit_rhs_logm does its own
+# inline differencing), now also select_adaptive_dt's own input (Sub-task 9).
 
 import numpy as np
 
 import bvp_solver
 import config
+import output
 
 # ==========================================
 # SECTION: Finite-Difference Time Derivatives (diagnostic utility)
@@ -74,12 +76,16 @@ def select_adaptive_dt(state_curr, state_prev, dt_used):
 # SECTION: Outer Time Loop (Kelvin-Helmholtz Contraction)
 # ==========================================
 
-def run(state_prev, n_steps, dt, snapshot_interval=1):
+def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
     """Advance state_prev through up to n_steps of bvp_solver.solve_timestep(state, dt),
-    halting early once the surface radius reaches config.R_HALT (Stage 3's cooling,
-    degenerate-pressure-supported contraction toward a present-day-Jupiter-like state -
-    PLAN.md "Formation Scenario and Scope"). No bootstrap/kick step of any kind - uniform
-    from the first call. state_prev should already be genuinely self-consistent with
+    halting early on whichever of TWO physically-motivated conditions triggers first (Sub-task
+    10): the surface radius reaching config.R_HALT (Stage 3's cooling, degenerate-pressure-
+    supported contraction toward a present-day-Jupiter-like state - PLAN.md "Formation
+    Scenario and Scope"), or the elapsed simulated time reaching config.T_MAX_S (a diagnostic
+    time budget, not a claim about the real planet's age - config.py has the full reasoning -
+    a backstop against an indefinitely long run if R_HALT is never reached). No bootstrap/kick
+    step of any kind - uniform from
+    the first call. state_prev should already be genuinely self-consistent with
     solve_timestep's equations (bvp_solver.relax_initial_state's output, not
     solve_static_structure's directly).
 
@@ -89,6 +95,11 @@ def run(state_prev, n_steps, dt, snapshot_interval=1):
     selection, lagged from the JUST-COMPLETED step's realized dT/dt, dP/dt - no prior real-dt
     derivative exists before step 1, hence the fixed seed there regardless of the flag.
 
+    snapshot_dir (Sub-task 10): if given, every snapshot taken is ALSO saved to disk as an
+    .npz file (output.save_snapshot) as the run proceeds, not just held in memory - lets a
+    long run's progress survive an interruption and feeds output.py's post-processing plots,
+    which are built entirely from these files (not from this function's return value).
+
     Returns the list of snapshots taken: state_prev itself, then every snapshot_interval-th
     step, always including the final step regardless of interval.
     """
@@ -96,7 +107,11 @@ def run(state_prev, n_steps, dt, snapshot_interval=1):
     mode = "ADAPTIVE (Sub-task 9)" if config.USE_ADAPTIVE_DT else "FIXED"
     print(f"time_stepper.run: starting KH-contraction loop, n_steps={n_steps}, dt_mode={mode}, "
           f"seed dt={dt / config.SECONDS_PER_YEAR:.4e} yr, "
-          f"R_HALT={config.R_HALT / config.R_JUPITER_CM:.3f} R_Jup")
+          f"R_HALT={config.R_HALT / config.R_JUPITER_CM:.3f} R_Jup, "
+          f"t_max={config.T_MAX_S / config.SECONDS_PER_YEAR:.3e} yr", flush=True)
+
+    if snapshot_dir is not None:
+        output.save_snapshot(state_prev, 0, snapshot_dir)
 
     state = state_prev
     dt_used = dt
@@ -105,27 +120,45 @@ def run(state_prev, n_steps, dt, snapshot_interval=1):
         state = bvp_solver.solve_timestep(state, dt_used)
 
         r_surface = state.r[-1]
+        T_center = state.T[0]
         t_yr = state.t / config.SECONDS_PER_YEAR
         dt_used_yr = dt_used / config.SECONDS_PER_YEAR
         L_surface_lsun = state.L[-1] / config.L_SUN_ERG_S
+
+        # Defensive: catch a corrupted state loudly and immediately, rather than letting a
+        # NaN or non-physical value silently propagate into further steps or surface as a
+        # confusing downstream failure much later - explicit request, so the terminal makes
+        # it obvious the run isn't stuck or quietly producing garbage.
+        if not (np.isfinite(r_surface) and np.isfinite(T_center) and r_surface > 0.0 and T_center > 0.0):
+            raise RuntimeError(
+                f"time_stepper.run: state corrupted at step {step} (r_surface={r_surface}, "
+                f"T_center={T_center}) - halting immediately rather than continuing on bad data"
+            )
+
         print(f"time_stepper.run: step {step}/{n_steps}, t={t_yr:.4e} yr, dt={dt_used_yr:.4e} yr, "
               f"r_surface={r_surface / config.R_JUPITER_CM:.4f} R_Jup, "
-              f"T_center={state.T[0]:.6e} K, L_surface={L_surface_lsun:.4e} L_sun")
+              f"T_center={T_center:.6e} K, L_surface={L_surface_lsun:.4e} L_sun", flush=True)
 
-        halted = r_surface <= config.R_HALT
+        halted_radius = r_surface <= config.R_HALT
+        halted_time = state.t >= config.T_MAX_S
+        halted = halted_radius or halted_time
+
         if halted or step % snapshot_interval == 0:
             history.append(state)
+            if snapshot_dir is not None:
+                output.save_snapshot(state, step, snapshot_dir)
 
         if halted:
-            print(f"time_stepper.run: R_HALT reached (r_surface="
-                  f"{r_surface / config.R_JUPITER_CM:.4f} R_Jup) at step {step}, "
-                  f"t={t_yr:.4e} yr - halting")
+            reason = "R_HALT reached" if halted_radius else "t_max (diagnostic time budget) reached"
+            print(f"time_stepper.run: {reason} (r_surface="
+                  f"{r_surface / config.R_JUPITER_CM:.4f} R_Jup, t={t_yr:.4e} yr) at step "
+                  f"{step} - halting", flush=True)
             break
 
         if config.USE_ADAPTIVE_DT:
             dt_next = select_adaptive_dt(state, state_before_step, dt_used)
             print(f"time_stepper.run: adaptive dt selected for next step: "
-                  f"{dt_next / config.SECONDS_PER_YEAR:.4e} yr (was {dt_used_yr:.4e} yr)")
+                  f"{dt_next / config.SECONDS_PER_YEAR:.4e} yr (was {dt_used_yr:.4e} yr)", flush=True)
             dt_used = dt_next
 
     return history

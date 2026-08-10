@@ -11,6 +11,75 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**★★★★★ 2026-08-10 — 10 Gyr diagnostic extension: contraction is real and continuing, but
+decelerating — not yet enough to explain the slow pace without Sub-tasks 8a-8c.** Full trail:
+§5's 2026-08-10 entry. Motivated directly by the 4.5 Gyr result below (only
+$r_\text{surface}\approx4.83\,R_\text{Jup}$ reached, from a ~5.1 $R_\text{Jup}$ start): is
+that genuinely slow Kelvin-Helmholtz contraction, or an artificial floor from missing
+physics? `config.AGE_SOLAR_SYSTEM_S` was renamed to `config.T_MAX_S` and raised to 10 Gyr
+(explicitly a diagnostic time budget, not a claim about the real planet's age), and
+`extended_run_10gyr.py` **resumed the run directly from the 4.5 Gyr run's last saved
+snapshot** (`snapshot_00077.npz`, `t=4.5215e9` yr) rather than re-solving from scratch — the
+first real production use of Sub-task 10's snapshot-resumability design, not just a recovery
+after a crash. 55 further steps converged cleanly (no continuation fallback, `dt` pinned the
+entire time at the `ADAPTIVE_DT_MAX=1e8` yr defensive ceiling) to `t=1.0022e10` yr, halting
+correctly on the new `T_MAX_S` condition. **Result: $r_\text{surface}$ contracts smoothly
+and monotonically the entire way, with no repeat of the earlier bump**, reaching
+$4.597\,R_\text{Jup}$ — genuine continued contraction, not a plateau. But the *rate* is
+clearly slowing: $|dr/dt|$ fell from $\approx0.060\,R_\text{Jup}$/Gyr just after 4.5 Gyr to
+$\approx0.041\,R_\text{Jup}$/Gyr by 9.5 Gyr (~32% slower over 5 Gyr), tracking
+$T_\text{center}$ and $L_\text{surface}$ both roughly halving over the same window. This
+smooth, gradual deceleration (not a sharp asymptote) reads as a genuinely lengthening
+$\tau_\text{KH}\sim GM^2/(RL)$ as $L$ drops, rather than a hard numerical/physics floor — but
+at this decelerating pace, reaching `R_HALT` (3.6 $R_\text{Jup}$ still to go) would take
+enormously longer than 10 Gyr, which is itself the strongest concrete argument yet for doing
+Sub-tasks 8a-8c (Saha, molecular→atomic $\mu(T)$, and especially MLT convective efficiency)
+before trusting the absolute timescale, even though the qualitative trend looks physically
+sound on its own. See `diagnostic_plots_10gyr/evolution_curves_FULL_0_to_10gyr.png` for the
+complete 0-10 Gyr trajectory (both runs' snapshots combined).
+
+**★★★★ 2026-08-09 (overnight) — First full run to `config.AGE_SOLAR_SYSTEM_S` completed;
+the earlier `r_surface` anomaly turns out to be a bounded, self-correcting bump, not a
+runaway divergence.** Full trail: §5's 2026-08-09 (overnight) entry. An unattended extended
+run (`overnight_run.py`, up to 100 steps, unchanged tuning from the sanity check) converged
+cleanly for **all 77 steps it took to reach `t=4.5215e9` yr** (the `AGE_SOLAR_SYSTEM_S` halt
+condition, essentially exactly on target) - no crash, no continuation fallback needed at any
+step, final structure profile smooth and well-resolved end to end. Plot generation crashed
+immediately afterward on a real but trivial bug (`output.py`/`diagnostics.py`'s plot
+functions never created their own output directory when it didn't already exist) - **all 78
+snapshots survived on disk regardless**; the bug is fixed (both modules now create their
+output directory defensively) and every plot was regenerated from the saved data with no
+re-solve needed. Reviewing the FULL trajectory (not just the first 15 steps seen before)
+shows $r_\text{surface}$ rises smoothly to a peak of ~5.2 $R_\text{Jup}$ around
+$t\sim3$-$5\times10^8$ yr (coincident with a smooth $L_\text{surface}$ peak,
+$\sim4.2\times10^{-10}L_\odot$), then the contraction trend **resumes and continues past the
+starting value**, ending at $r_\text{surface}\approx4.83\,R_\text{Jup}$,
+$T_\text{center}\approx10735$K by 4.5 Gyr — genuine net contraction over the full run, not a
+diverging or oscillating trajectory. Whether the bump itself is genuine thermal-relaxation
+physics or a large-`dt` resolution artifact is still open (see §5's entry) — but "does the
+overall run stay bounded and physically sensible" is now answered: yes. Also scientifically
+notable, independent of that open question: after 4.5 Gyr, the model is still at
+~4.8$\,R_\text{Jup}$, far from `R_HALT=1`$\,R_\text{Jup}$ — worth a closer look at whether
+that's expected given the input physics (no MLT, no Saha, etc.) or itself informative.
+
+**★★★ 2026-08-09 (later same day) — Sub-task 10 (`output.py`) mechanically DONE; one open
+accuracy finding surfaced before the real full run.** Full trail: §5's 2026-08-09 "Sub-task
+10" entry. `.npz` snapshot I/O, evolution-curve/profile/opacity-regime plots, live per-step
+logging (flushed), a corrupted-state guard, and a dual `R_HALT`/`AGE_SOLAR_SYSTEM_S` (4.5
+Gyr) stopping condition are all implemented and verified working end-to-end on a 15-step
+sanity run. **`ADAPTIVE_DT_MAX` was also raised** (5e4 yr → 1e8 yr, now a purely defensive
+backstop) after the user correctly identified that further fixed-`dt` margin sweeps at
+larger absolute values would be testing the wrong thing (a `dt` appropriate for a late,
+slow evolutionary phase, applied to the current early, fast one) - trusting the growth-cap
+mechanism directly instead. **That same sanity run surfaced a genuine, precisely-localized
+open question**: once `dt` grew past the previously-validated 5e4 yr (into
+~$6\times10^4$-$4\times10^5$ yr), $r_\text{surface}$ stopped decreasing and turned around,
+diverging from an otherwise-identical lower-`dt` run exactly at the first step past the old
+ceiling - a small (~0.1%) but clearly `dt`-correlated effect, with the solver itself showing
+no convergence distress at all (accuracy, not stability). Not chased further without
+explicit direction, per the user's own request to review before the real run - the real
+full run to `R_HALT`/4.5 Gyr is deliberately not yet launched.
+
 **★★★ 2026-08-09 — Sub-task 9 (adaptive time-stepping) implemented and validated.** Full
 trail: §5's 2026-08-09 entry. Short version: `time_stepper.select_adaptive_dt` (dual
 $T$/$P$ thermal-timescale limiter, $L$ deliberately excluded, asymmetric growth cap) - three
@@ -250,7 +319,7 @@ remains the place for numerical trails and debugging history).
 | 8 | Outer time loop (`time_stepper.run`, `main.py`) | **★★★ Dry-run exit criterion MET (2026-08-08)**: `main.py` implemented; a full 10-step dry run converges cleanly at every step, with $T_\text{center}$/$r_\text{surface}$ decreasing monotonically (contraction) and $L_\text{surface}$ settling to a small positive value — resolved a genuine marginal-convection mesh-explosion via a context-dependent Schwarzschild-switch smoothing width (`config.GRAD_EFF_SWITCH_EPSILON_TIMESTEP`). Not yet a full run to `config.R_HALT`. See §1/§5's 2026-08-08 entries and `PLAN.md` Sub-task 8's status note. |
 | 8c | MLT convection treatment | Not started — formally scheduled, explicitly deferred past the one-week deadline (`PLAN.md` Sub-task 8c) |
 | 9 | Adaptive time-stepping (`time_stepper.select_adaptive_dt`) | **★★★ Done, validated over 15 real steps (2026-08-09)** — dual $T$/$P$ limiter, $L$ excluded, asymmetric growth cap; ~5.8x simulated-time efficiency gain measured. `ADAPTIVE_DT_MAX` is a temporary ceiling, not yet raised to production scale — see §5's 2026-08-09 entry |
-| 10 | `output.py` | Not started — not blocked, but not yet prioritized either |
+| 10 | `output.py` | **★★★ Mechanically done (2026-08-09)** — `.npz` I/O, evolution/profile/opacity plots, all regenerate from disk alone (exit criterion met). Real full run deliberately not yet launched — a genuine, small, `dt`-correlated $r_\text{surface}$ non-monotonicity was found at `dt`>5e4 yr during the sanity check (accuracy, not stability — solver shows no distress) and flagged for review, not chased without direction. See §5's 2026-08-09 "Sub-task 10" entry. |
 
 **Stub present but empty:** `ReadMe.txt`. (`main.py` implemented 2026-08-08, no longer a stub.)
 
@@ -411,6 +480,13 @@ arc). **Sub-task 2f (2026-07-27) added** `M_E` (electron mass), `PLANCK_H` (Plan
 constant), and `MU_E=1.17` (mean molecular weight per electron, standard solar-composition
 $2/(1+X)$ estimate, $X\approx0.71$ — distinct from `MU`, the mean weight per particle used
 by the ideal-gas term; an accepted first-order inconsistency, see the `eos.py` entry below).
+**Sub-task 9 (2026-08-09) added** the Time-Stepping Parameters section:
+`USE_ADAPTIVE_DT`, `ADAPTIVE_DT_SAFETY_FACTOR`, `ADAPTIVE_DT_GROWTH_FACTOR`,
+`ADAPTIVE_DT_MIN`/`MAX` (the latter raised from a 5e4 yr validation rail to a purely
+defensive `1e8` yr backstop once the growth cap was proven self-limiting in practice — §5's
+2026-08-09 entry). `AGE_SOLAR_SYSTEM_S` was renamed to `T_MAX_S` and raised 4.5→10 Gyr
+(2026-08-10, §5) once its role shifted from "the solar system's present-day age" to "a
+diagnostic time budget for testing whether contraction asymptotes."
 
 ### `state.py` — the one mutable data object
 
@@ -854,18 +930,43 @@ compact structure (no code change needed — `opacity_regime_distribution` was a
 regime-agnostic): center sits in "Metal grains" (T=1200K), surface in "Ice grains" (T=7.5K),
 confirming the expected multi-regime spread.
 
-### `time_stepper.py` — time-derivative bridge between timesteps
+### `time_stepper.py` — outer Kelvin-Helmholtz contraction loop + adaptive `dt` selection
 
-**Unchanged in code this session** — still contains `_bootstrap_time_derivatives` and
-`compute_time_derivatives`'s `state_prev=None` dispatch exactly as originally implemented.
-This is now understood to be **obsolete** (the bootstrap it computes is no longer needed —
-§1, PLAN.md's Sub-task 7 entry) but has not yet been edited; flagged here so the gap
-between "what the code does" and "what we now believe is correct" is explicit rather than
-silently inconsistent. **Confirmed broken as of 2026-08-01** (not just obsolete):
-`_bootstrap_time_derivatives` references `config.T_KH_BOOTSTRAP_S`, which no longer exists
-(renamed to `config.T_KH_TIMESCALE_S` earlier this session) — `validation.py`'s Check 30
-(the only caller) now raises `AttributeError` if run. Confirms this is genuinely Sub-task 7's
-job, not a documentation nicety.
+**Current state (2026-08-10), substantially rewritten across Sub-tasks 8-10 since the
+paragraph below was written:**
+- `compute_time_derivatives(state_curr, state_prev, dt)` — finite-differenced $\dot T$,
+  $\dot P$ on `state_curr.m` (interpolating `state_prev` onto that grid first, in case the
+  Lagrangian grid shifted between steps). No longer only a diagnostic utility — also
+  `select_adaptive_dt`'s own input.
+- `select_adaptive_dt(state_curr, state_prev, dt_used)` (Sub-task 9, **DONE 2026-08-09**) —
+  the dual $T$/$P$ thermal-timescale limiter: $\Delta t_\text{raw}=\alpha\cdot\min(\min_i(T_i/
+  |\dot T_i|),\min_i(P_i/|\dot P_i|))$, then an asymmetric growth cap ($\Delta t_\text{new}
+  \le$ `ADAPTIVE_DT_GROWTH_FACTOR`$\times dt_\text{used}$, growth only), then clamped to
+  `[ADAPTIVE_DT_MIN, ADAPTIVE_DT_MAX]`. Deliberately excludes $L$ (structural $0/0$ at the
+  center every step; benign zero-crossings near the photosphere would otherwise chronically
+  dominate the `min`) — full design reasoning in PLAN.md §4.5.
+- `run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None)` — the production
+  loop. Seeds step 1 at the given `dt`; every step after that uses `select_adaptive_dt` if
+  `config.USE_ADAPTIVE_DT`, else stays fixed. Flushed live per-step logging (step, $t$ in
+  years, `dt`, $r_\text{surface}$, $T_\text{center}$, $L_\text{surface}$) so a long run's
+  progress is always visible, never silently stale. A **dual stopping condition**: halts on
+  $r_\text{surface}\le$ `config.R_HALT` OR $t\ge$ `config.T_MAX_S`, whichever first
+  (`T_MAX_S`, renamed from `AGE_SOLAR_SYSTEM_S` 2026-08-10, is a diagnostic time budget —
+  see its own `config.py` comment). An explicit finite/positivity guard raises immediately
+  on a corrupted state (NaN or non-positive $r_\text{surface}$/$T_\text{center}$) rather than
+  letting it propagate. If `snapshot_dir` is given, every retained step is also saved to disk
+  via `output.save_snapshot` as the run proceeds, independent of the in-memory return value.
+
+**Obsolete code removed**: `_bootstrap_time_derivatives` and `compute_time_derivatives`'s
+old `state_prev=None` dispatch (referenced the no-longer-existing `config.T_KH_BOOTSTRAP_S`,
+confirmed broken 2026-08-01) — no longer needed once Sub-task 8's real per-step derivatives
+made the bootstrap unnecessary (§1, PLAN.md's Sub-task 7 entry).
+
+**Validated against the real solver twice at full production scale**: the 2026-08-09
+overnight run (77 steps to 4.5 Gyr) and the 2026-08-10 extension (55 more steps to 10 Gyr,
+resumed directly from a saved snapshot) — both converged every step directly, no
+continuation fallback, `dt` growing smoothly under the growth cap early on and eventually
+pinning at `ADAPTIVE_DT_MAX` for the majority of both runs' later steps.
 
 ### `validation.py` — sanity checks, unit consistency, and diagnostic plots
 
@@ -896,14 +997,46 @@ pass cleanly (2026-08-01, see the `diagnostics.py` entry above for the physical 
 
 ### `main.py`
 
-**★★★ Implemented 2026-08-08** (was an empty placeholder before). Minimal orchestrator:
-`solve_static_structure()` → `relax_initial_state()` → a capped (`N_STEPS_DRY_RUN=10`)
-`time_stepper.run()` call, per PLAN.md Sub-task 8's "dry run" convention. **Runs cleanly
-end-to-end as of 2026-08-08** (later same day) - all 10 steps converge, monotonic
-contraction confirmed - after the marginal-convection mesh-explosion fix (§1/§5's 2026-08-08
-"Multi-step time evolution achieved" entry has the full trail). Not yet a full production
-run to `config.R_HALT`; no snapshot/output-file integration yet (`output.py`, Sub-task 10,
-still not started).
+**Capped SANITY-CHECK orchestrator, not the production run script** (see `overnight_run.py`/
+`extended_run_10gyr.py` below for that). `solve_static_structure()` → `relax_initial_state()`
+→ a capped (`N_STEPS_SANITY_CHECK=15`) `time_stepper.run()` call with
+`config.USE_ADAPTIVE_DT=True` and snapshot saving wired in, → `output.generate_all_plots()`.
+Its role since Sub-tasks 9-10 landed: a small, fast end-to-end smoke test of the adaptive
+loop + snapshot/plot pipeline together, before trusting either at production scale — not
+meant to be raised to a full run itself (kept deliberately small).
+
+### `output.py` — Sub-task 10, `.npz` snapshot I/O and post-processing plots
+
+**★★★★ DONE (2026-08-09), validated in production twice (2026-08-09 overnight, 2026-08-10
+extension).** Pure I/O and matplotlib helpers, no physics of its own:
+- `save_snapshot`/`load_snapshot`/`load_all_snapshots` — the full `SimulationState` (mass
+  grid + every field + $t$) plus a freshly-computed `is_convective` Schwarzschild mask
+  (center point recorded `True` by convention, since `grad_radiative` has a removable $0/0$
+  there — matches `diagnostics.py`'s own convention).
+- `plot_evolution_curves` — $r_\text{surface}(t)$, $T_\text{center}(t)$, $L_\text{surface}(t)$
+  across a sequence of snapshots; the primary Kelvin-Helmholtz contraction-track plot.
+- `plot_opacity_regime_map` — $\kappa(m)$ colored by the active Bell & Lin regime, per
+  snapshot; the one genuinely new plot type (per-snapshot structure/convective-zone plots
+  reuse `diagnostics.py`'s existing functions directly).
+- `generate_all_plots(snapshot_dir, output_dir, profile_snapshot_indices=None)` — the module's
+  own exit criterion: rebuilds every plot from `.npz` files on disk alone, no re-solve.
+  Demonstrated for real (not just in principle) when the 2026-08-09 overnight run's plotting
+  step crashed on a missing output directory *after* the physics had already finished — every
+  snapshot survived, and every plot was regenerated from disk with zero re-solve.
+
+**Real-world resumability test, 2026-08-10**: `extended_run_10gyr.py` loaded
+`snapshot_00077.npz` from a completed run and passed it straight into a fresh
+`time_stepper.run()` call to extend that same trajectory to a longer time budget — the first
+time this module's snapshots were used to *resume* a live production run rather than only to
+*recover* one after a crash or to *plot* after the fact.
+
+**Known minor debt, not yet worth fixing**: `_snapshot_path`'s zero-padded filename numbering
+restarts at 0 for each `run()` call — a resumed run's own snapshots (e.g.
+`snapshots_10gyr/snapshot_00000.npz` onward) therefore do NOT carry absolute step numbers
+consistent with the run it resumed from; only the `t` field inside each file (used by all the
+plotting functions) is authoritative. Fine for now since nothing indexes snapshots by
+filename number across a resume boundary, but worth a `step_offset` parameter if resuming
+becomes routine rather than occasional.
 
 ### `ReadMe.txt`
 
@@ -1006,6 +1139,234 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-10 — ★★★★★ 10 Gyr diagnostic extension: contraction continues but decelerates; resumed live from a saved snapshot for the first time
+
+**Context**: the 4.5 Gyr overnight run (entry below) reached only $r_\text{surface}\approx
+4.83\,R_\text{Jup}$ from a ~5.1 $R_\text{Jup}$ start — the user read this correctly as "barely
+contracted" and asked directly: is this genuinely slow Kelvin-Helmholtz physics, or is
+missing physics (MLT convective efficiency, Saha ionization, the still-atomic-only $\mu(T)$
+correction, the interim wide `GRAD_EFF_SWITCH_EPSILON_TIMESTEP`) creating an artificial
+equilibrium floor well above `R_HALT`? Chosen diagnostic: more than double the time budget
+(4.5 → 10 Gyr) and watch whether the trajectory keeps contracting, asymptotes near the same
+value, or reaches `R_HALT`.
+
+**`config.AGE_SOLAR_SYSTEM_S` renamed to `config.T_MAX_S`, value raised to 10 Gyr.** The old
+name specifically meant "the solar system's present-day age" — no longer accurate once the
+value's purpose became "a diagnostic time budget to test asymptotic behavior," so the
+constant was renamed along with its comment (which now also records the reasoning above) to
+avoid a misleading name persisting in `config.py`, the single source of truth for these
+constants. All live references (`time_stepper.py`'s halt-condition check and log messages,
+`main.py`'s docstring) were updated to match; no other module referenced the old name.
+
+**Resumed the run directly from the last saved snapshot, rather than re-solving from
+scratch** (`extended_run_10gyr.py`, new file): loaded `snapshots_overnight/snapshot_00077.npz`
+(`t=4.5215e9` yr, the exact final state of the 4.5 Gyr run) via `output.load_snapshot` and
+called `time_stepper.run()` on it directly, seeded at `dt=1e8` yr (matching the `dt` the
+original run was already pinned at for its final several steps, the physically continuous
+choice). This is the first time Sub-task 10's snapshot-resumability design was used for its
+own sake in a live production run, rather than only as a post-crash recovery mechanism (the
+overnight run's plotting-bug recovery, entry below, proved the same capability but only
+retroactively) — it also avoided redundantly re-solving the already-converged first 77 steps.
+Snapshots/plots were written to fresh `snapshots_10gyr`/`diagnostic_plots_10gyr` directories,
+preserving `snapshots_overnight`/`diagnostic_plots_overnight` untouched for direct
+before/after comparison.
+
+**Run result: 55 further steps, all converged directly, no continuation fallback, `dt`
+pinned at the `ADAPTIVE_DT_MAX=1e8` yr defensive ceiling for every one of them** (i.e. the
+raw thermal/pressure-timescale formula's own estimate stayed at or above the ceiling
+throughout this entire stretch — a further sign of a smoothly, slowly evolving state, not one
+straining against the growth cap). Halted correctly at `t=1.0022e10` yr on the `T_MAX_S`
+condition (not `R_HALT` — nowhere close, see below).
+
+**The contraction is real and continues, but is decelerating — not a hard floor, not
+unchanged either:**
+
+| $t$ (Gyr) | $r_\text{surface}$ ($R_\text{Jup}$) | $T_\text{center}$ (K) |
+|---|---|---|
+| 4.52 (resume point) | 4.866 | 10730 |
+| 5.52 | 4.806 | 10608 |
+| 6.52 | 4.751 | 10491 |
+| 7.52 | 4.702 | 10378 |
+| 8.52 | 4.657 | 10270 |
+| 9.52 | 4.616 | 10165 |
+| 10.02 (final) | 4.597 | 10114 |
+
+Local $|dr/dt|$ over successive ~1 Gyr windows: $0.060\to0.054\to0.049\to0.045\to0.041\,
+R_\text{Jup}$/Gyr — a steady, gradual slowdown (~32% over 5 Gyr), not a sudden stop. Over the
+FULL 0-10 Gyr trajectory (both runs' 133 combined snapshots,
+`diagnostic_plots_10gyr/evolution_curves_FULL_0_to_10gyr.png`): starts at 5.109
+$R_\text{Jup}$, rises to the already-characterized bump peak of 5.223 $R_\text{Jup}$ at
+$t\approx2.5\times10^8$ yr, then contracts smoothly and monotonically the entire rest of the
+way with **no repeat of the bump** — net contraction since the peak is 0.626 $R_\text{Jup}$
+over 9.77 Gyr.
+
+**Physical read, not fully settled**: the smooth, gradual character of the deceleration
+(tracking $T_\text{center}$ and $L_\text{surface}$, both roughly halving over the same 4.5-10
+Gyr window) is consistent with a genuinely lengthening Kelvin-Helmholtz timescale
+($\tau_\text{KH}\sim GM^2/(RL)$, which grows as $L$ drops) rather than an abrupt numerical or
+physics-completeness floor — a hard artificial floor would more plausibly show as a sharp
+asymptote, not a continuously-relaxing rate. That said, extrapolating the current decelerating
+pace, reaching `R_HALT` (3.6 $R_\text{Jup}$ still to go from the final state) would take far
+longer than this already-generous 10 Gyr budget — which is now the concrete, quantitative
+argument for treating Sub-tasks 8a (Saha), 8b (molecular→atomic $\mu(T)$), and especially 8c
+(MLT convective efficiency, currently the crudest approximation in the energy transport
+chain) as the natural next physics work: not because the current qualitative trend looks
+wrong, but because the model cannot yet distinguish "this pace is physically correct for a
+planet with 2026-08-09/10-era physics" from "a more complete treatment of convective
+efficiency or ionization would meaningfully speed up the energy transport and hence the
+contraction." Neither hypothesis is confirmed by this run alone; both remain open.
+
+**No code changes to the physics or the adaptive-`dt`/growth-cap tuning** — this was purely
+a time-budget extension and a resume-from-snapshot exercise, deliberately keeping every
+tuning parameter validated by Sub-task 9 unchanged so the comparison against the 4.5 Gyr run
+stays apples-to-apples.
+
+### 2026-08-09 (overnight) — ★★★★ First full run to 4.5 Gyr completed unattended; a real but trivial plotting bug found and fixed; the `r_surface` anomaly characterized as a bounded bump, not a divergence
+
+**Context**: after stopping for the night, the user asked to run something unattended so
+there would be data to work with in the morning. Rather than launching the literal, still-
+unvalidated "real" production run (risking hours of compute built entirely on the unresolved
+`dt`>5e4 yr accuracy question from the same day's earlier entry), a compromise was proposed
+and agreed in spirit: an explicitly-labeled EXTENDED DIAGNOSTIC run (`overnight_run.py`, new
+file, capped at 100 steps, same tuning as the sanity check, separate `snapshots_overnight`/
+`diagnostic_plots_overnight` directories so it wouldn't mix with the earlier sanity-check
+output) - framed as more data for the open investigation, not a trustworthy final result.
+
+**Run result: complete success on the physics side.** All 77 steps taken converged directly
+(no continuation fallback needed once), reaching `config.AGE_SOLAR_SYSTEM_S` (4.5 Gyr) almost
+exactly on target (`t=4.5215e9` yr) - the dual stopping condition's time-based branch firing
+correctly for the first time. No crash, no NaN/corruption triggering the safety guard.
+
+**Plot generation crashed immediately after - a real bug, caught and fixed, not a physics
+problem.** `output.generate_all_plots` (and the `diagnostics.py` functions it calls) never
+created their own output directory - worked by accident every previous time because
+`diagnostics.PLOT_DIR="diagnostic_plots"` already existed from earlier sessions' work; the
+overnight run's deliberately separate `diagnostic_plots_overnight` directory did not exist,
+and matplotlib's `savefig` does not create parent directories on its own. **All 78 `.npz`
+snapshots (steps 0-77) survived on disk regardless** - `save_snapshot` already created its
+own directory correctly, and the crash happened strictly after the physics loop finished.
+Fixed by adding `os.makedirs(..., exist_ok=True)` to every plot-producing function in both
+`output.py` and `diagnostics.py` (the latter had the identical latent bug, just never
+triggered) - all plots regenerated successfully from the saved snapshots afterward, with NO
+re-solve needed (confirms `output.py`'s own exit criterion works exactly as designed: real
+recovery from disk after a mid-pipeline failure, not just a demo of the happy path).
+
+**Reviewing the FULL 4.5 Gyr trajectory (not just the first 15 steps seen before) resolves
+the most pressing part of the open question from earlier the same day.** The `r_surface`
+non-monotonicity found at `dt`>5e4 yr is NOT a runaway divergence - it is a smooth, BOUNDED
+bump: $r_\text{surface}$ rises from 5.10 to a peak of ~5.2 $R_\text{Jup}$ around
+$t\sim3$-$5\times10^8$ yr, then the contraction trend resumes and continues past the
+starting value, reaching $r_\text{surface}\approx4.83\,R_\text{Jup}$ by $t=4.5$ Gyr -
+genuine net contraction across the full run. $L_\text{surface}$ shows a matching smooth
+peak ($\sim4.2\times10^{-10}L_\odot$) at the same time as the $r_\text{surface}$ peak - the
+two are plausibly linked directly via $L\propto r^2(T_\text{surf}^4-T_\text{NEB}^4)$, not
+independent anomalies. $T_\text{center}$ decreases smoothly and monotonically throughout,
+with visible acceleration in log-time, no irregularity at all. The final structure profile
+($t=4.5$ Gyr snapshot) is smooth and well-resolved center to surface across $T$, $\rho$,
+$P$ - no sign of numerical noise even at the end of the longest run yet attempted.
+
+**Still genuinely open, not resolved by this run**: WHETHER the bump itself is real
+thermal-relaxation physics (a smooth radius/luminosity bump during early cooling is not
+implausible physically - real gas-giant "hot start" evolutionary tracks can show non-trivial
+early-time behavior as the interior entropy profile relaxes) or a `dt`-resolution artifact
+that a finer step through that specific window would resolve differently. The two hypotheses
+are no longer equally likely in the way they were before this run, though: a genuine
+numerical instability would be expected to grow or destabilize further, not smoothly peak
+and reverse on its own while the solver shows zero convergence stress throughout - the
+BOUNDED, SELF-CORRECTING character of the bump is itself evidence (not proof) leaning toward
+"real behavior, coarsely resolved" over "runaway numerical error." Confirming this properly
+would mean re-running that specific time window at a deliberately smaller `dt` and checking
+whether the bump's shape/magnitude converges - not yet done, a natural next step.
+
+**Also scientifically notable, independent of the bump question**: after the full 4.5 Gyr
+(the model's own physically-motivated total-time budget), $r_\text{surface}$ has only
+reached ~4.83 $R_\text{Jup}$, far from `config.R_HALT`$=1\,R_\text{Jup}$ (today's real
+Jupiter). This is either expected given the deliberately-simplified input physics this
+session has repeatedly flagged as approximate (no MLT convection treatment, no Saha
+ionization, an atomic-composition EOS correction rather than a full temperature-dependent
+$\mu(T)$, the interim wide-epsilon Schwarzschild-switch regularization) - all of which point
+toward LESS efficient cooling/contraction than a fully physical treatment would give - or a
+sign that one of these approximations is actually the dominant discrepancy, worth
+investigating directly rather than assumed. Not chased further in this pass; recorded here
+as a concrete, thesis-relevant number to revisit once the `r_surface` bump question is
+settled.
+
+### 2026-08-09 (later same day) — ★★★ Sub-task 10 (`output.py`) implemented; `ADAPTIVE_DT_MAX` raised to a defensive backstop; a genuine large-dt accuracy finding surfaced and deliberately not chased without direction
+
+**Goal**: build `PLAN.md` Sub-task 10's snapshot I/O and plotting deliverables, and add two
+safeguards the user explicitly requested before considering the pipeline ready for the real
+full run - robust live logging, and a dual (`R_HALT` OR 4.5 Gyr) stopping condition.
+
+**1. `ADAPTIVE_DT_MAX` reconsidered before Sub-task 10's own work began.** The previous
+entry's own open item proposed a staged margin-sweep escalation (test progressively larger
+fixed `dt` values against the current state before raising the ceiling). The user identified
+a real flaw in that plan: a large fixed `dt` (e.g. 5e5 yr) tested against the CURRENT early
+state (short thermal timescale) conflates two different questions - "does the numerics hold
+at this `dt`" and "is this `dt` even appropriate for this evolutionary phase" - a failure
+wouldn't distinguish between them. Since `ADAPTIVE_DT_GROWTH_FACTOR` already self-limits how
+fast `dt` can reach any given scale (at most 1.3x/step - it cannot arrive at a large `dt`
+before the star has had many steps of real evolution to get there too), the mechanism was
+trusted directly instead: `ADAPTIVE_DT_MAX` raised from 5e4 yr to `1e8` yr, reframed in
+`config.py` as a purely defensive backstop (protects against a genuine bug, e.g. an
+unconsidered masking edge case, not a physically-motivated production ceiling) rather than a
+validation-scale rail.
+
+**2. `output.py` built**, reusing `diagnostics.py`'s existing single-state plotting
+functions (`plot_structure_profile`, `plot_convective_zones`) for per-snapshot output rather
+than duplicating them - the genuinely new pieces are `.npz` I/O
+(`save_snapshot`/`load_snapshot`/`load_all_snapshots`), multi-snapshot evolution curves
+(`plot_evolution_curves`), and an opacity-regime-colored $\kappa(m)$ map
+(`plot_opacity_regime_map`, `PLAN.md`'s one plot type nothing existing already covered).
+`generate_all_plots` regenerates everything from disk alone - verified directly (round-trip
+tested against a cached state before touching the real pipeline, then exercised end-to-end
+on the real sanity run's output).
+
+**3. `time_stepper.run()` gained the two requested safeguards**: every print statement now
+flushes explicitly (a long run's terminal output was previously subject to buffering delays
+- not acceptable for live monitoring); an explicit finite/positivity check halts immediately
+and loudly if `r_surface`/`T_center` ever go non-finite or non-positive, rather than letting
+a corrupted state propagate silently into further steps; and a new
+`config.AGE_SOLAR_SYSTEM_S=4.5\times10^9` yr halt condition applies alongside `R_HALT`,
+whichever triggers first - a physically-motivated backstop (the age of the solar system,
+matching Stage 3's own scope) against an indefinitely long run if `R_HALT` is never reached.
+`run()` also gained an optional `snapshot_dir` parameter, saving each snapshot to disk as
+the run proceeds (not just held in memory) - both for long-run resilience and to feed
+`output.py` directly.
+
+**4. Full sanity-check run (`main.py`, 15 steps, `USE_ADAPTIVE_DT=True`, the raised
+ceiling) - mechanics all verified working, but surfaced a genuine open finding.** `dt` now
+grows well past the old 5e4 yr ceiling (reaching $3.9\times10^5$ yr by step 15, still
+climbing), reaching $t=1.67\times10^6$ yr total (vs. $5.76\times10^5$ yr for the same 15
+steps under the old ceiling) - confirms the raised backstop works as intended. Every step
+converged directly (no continuation fallback), node counts stable (~4300-5100). Live
+logging, snapshot saving, and `output.generate_all_plots()` all worked correctly on the
+first real end-to-end pass.
+
+**But**: comparing this run point-by-point against the earlier 5e4-yr-capped 15-step run
+(PROGRESS.md's previous entry) shows the two are **identical through step 7** (identical
+`dt` there, since both are still below the old ceiling) and **diverge starting exactly at
+step 8** - the first step where `dt` exceeds the old 5e4 yr ceiling for the first time. From
+that point, $r_\text{surface}$ **stops decreasing and turns around**, reaching a minimum of
+5.0935 $R_\text{Jup}$ at step 10 then climbing back to 5.0988 by step 15 (~0.10% of the
+initial radius, still trending upward when the run ended). $T_\text{center}$ continues
+decreasing smoothly and monotonically throughout in both runs, unaffected. The evolution
+plot itself (`diagnostic_plots/evolution_curves.png`) shows this is a small wobble on the
+scale relevant to reaching `R_HALT` (visually near-flat against the $r$-axis needed to reach
+$1\,R_\text{Jup}$), but the correlation with `dt` is precise and reproducible, not noise -
+and the solver's own residuals/node-counts show zero sign of numerical distress at any of
+these steps, meaning this is an ACCURACY/truncation-error effect, not a
+stability/convergence one - a different class of concern than anything else this project has
+diagnosed. Working hypothesis, explicitly not confirmed: a purely-gravitational,
+degenerate-EOS Kelvin-Helmholtz contraction has no obvious mechanism for genuine radius
+re-expansion while the core keeps cooling monotonically - more likely the large implicit
+step under-resolving the true continuous trajectory, plausibly connected to
+$L_\text{surface}$'s own fractional rate of change (deliberately excluded from
+`select_adaptive_dt`'s formula, Sub-task 9, for good and still-valid reasons) growing large
+in this same `dt` range. **Deliberately not chased further without explicit direction** -
+per the user's own explicit request to review before launching the real run, this is
+reported as an open finding, not silently patched or dismissed. The real full run to
+`R_HALT`/4.5 Gyr remains un-launched pending that review.
 
 ### 2026-08-09 — ★★★ Sub-task 9 (adaptive time-stepping) implemented and validated: growth cap confirmed as the binding safety mechanism, ~5.8x simulated-time efficiency gain demonstrated
 

@@ -292,7 +292,7 @@ Returns a tuple `(grad_eff, is_convective)` where `is_convective` is a boolean n
 
 ### 4.5 Adaptive Time-Stepping
 
-$\Delta t \leq \alpha \cdot \min_i\!\left(T_i / |\dot{T}_i|\right)$ — a local thermal timescale limiter. The safety factor $\alpha$ is set in `config.py`. The fixed-dt path is retained for reproducibility and comparison. (Sub-task 9, not started — blocked behind Sub-tasks 5–8.)
+$\Delta t \leq \alpha \cdot \min_i\!\left(T_i / |\dot{T}_i|\right)$ — a local thermal timescale limiter. The safety factor $\alpha$ is set in `config.py`. The fixed-dt path is retained for reproducibility and comparison. (Sub-task 9, **DONE 2026-08-09** — see §5 for the as-built design, which extends this to a dual $T$/$P$ constraint with an asymmetric growth cap, deliberately excluding $L$.)
 
 ### 4.6 Hydrogen Dissociation Halt — Validity Limit of the Quasi-Static Assumption
 
@@ -985,19 +985,75 @@ above, tracked as a new item under Sub-task 9's own follow-up, not a separate su
 
 ---
 
-#### Sub-task 10 — `output.py` (snapshots and plots)
+#### Sub-task 10 — `output.py` (snapshots and plots) — **★★★★ DONE (2026-08-10), two full production runs completed (4.5 Gyr and 10 Gyr)**
 
 **Goal:** Reproducible data output and diagnostic visualizations.
 
-**Deliverables:**
-- Save each snapshot as `.npz` (mass grid + all fields + time + `is_convective` mask)
-- Post-processing script: $r(t)$, $L_\text{surface}(t)$, $T_\text{center}(t)$ evolution curves
-- 2-panel profile plots ($P(m)$ and $T(m)$) at selected snapshots; convective zones shaded using `is_convective` mask
-- Opacity regime plot: $\kappa(m)$ colored by regime index
+**Deliverables, all implemented and verified working:**
+- `.npz` snapshot I/O (`output.save_snapshot`/`load_snapshot`/`load_all_snapshots`) - mass
+  grid + all fields + time + `is_convective` mask (computed fresh at save time, center point
+  recorded `True` by convention per the removable center singularity). Round-trip verified
+  directly against a cached state before the real run, and again for real when
+  `extended_run_10gyr.py` (2026-08-10) resumed a live production run directly from a
+  previously-saved `.npz` file with zero loss of continuity - the strongest possible test of
+  this design.
+- `output.plot_evolution_curves`: $r_\text{surface}(t)$, $T_\text{center}(t)$,
+  $L_\text{surface}(t)$ across every saved snapshot.
+- Per-snapshot structure and convective-zone plots: reuses `diagnostics.
+  plot_structure_profile`/`plot_convective_zones` directly (already existed, 3-panel
+  T/$\rho$/P rather than the originally-specified 2-panel P/T - a deliberate reuse choice
+  over duplicating equivalent plotting logic) rather than reimplementing them.
+- `output.plot_opacity_regime_map`: $\kappa(m)$ colored by Bell & Lin regime index - the one
+  genuinely new plot type, since nothing existing covered per-point regime coloring.
+- `output.generate_all_plots`: the full exit criterion, demonstrated twice over - regenerates
+  every plot above from `.npz` files on disk alone, no re-solve (proven for real when the
+  2026-08-09 overnight run's plotting step crashed on a missing directory *after* the physics
+  had already finished - all data survived and every plot was regenerated from disk with zero
+  re-solve, see Change Log).
+- `time_stepper.run()` also gained (user's explicit request, alongside Sub-task 10):
+  flushed live per-step logging (step, $t$, `dt`, $r_\text{surface}$, $T_\text{center}$,
+  $L_\text{surface}$ - so a long run's terminal output is never silently stale), an explicit
+  finite/positivity guard that halts immediately and loudly on a corrupted state rather than
+  propagating it, and a **dual stopping condition** - halts on `R_HALT` OR `config.T_MAX_S`,
+  whichever comes first (`T_MAX_S`, renamed 2026-08-10 from `AGE_SOLAR_SYSTEM_S`, is a
+  diagnostic time budget - see its own `config.py` comment - currently 10 Gyr, not a claim
+  about the real planet's age).
 
-**Exit criterion:** All plots generated from saved `.npz` files without re-running the simulation.
+**Exit criterion: met** - `output.generate_all_plots()` regenerated every plot from disk
+alone in three separate instances now: the 15-step sanity check, the crashed-then-recovered
+overnight run, and the resumed 10 Gyr extension.
 
-**Status: Not started — blocked behind Sub-tasks 5–8.**
+**The `r_surface` non-monotonicity finding (2026-08-09) is now resolved as a bounded,
+self-correcting bump, not a runaway divergence or an accuracy failure**: viewed over the
+full 0-10 Gyr trajectory (see Change Log 2026-08-09 overnight and 2026-08-10 entries),
+$r_\text{surface}$ rises from 5.109 to a peak of 5.223 $R_\text{Jup}$ by $t\approx2.5\times
+10^8$ yr, then resumes monotonic, smooth contraction for the rest of the run with no further
+reversals through $t=10.02$ Gyr. Still open (not chased further, low priority given the bump
+is bounded and does not recur): whether the bump itself is genuine early-phase thermal
+adjustment or a coarse-`dt` truncation artifact specific to that one transition.
+
+**New finding (2026-08-10, 10 Gyr extension) - the contraction is real but decelerating, not
+floored:** extending the run from 4.5 to 10 Gyr (resumed directly from the 4.5 Gyr run's last
+snapshot, `extended_run_10gyr.py`) shows $r_\text{surface}$ continuing to contract smoothly
+the entire way, reaching 4.597 $R_\text{Jup}$ at $t=10.02$ Gyr (halted on `T_MAX_S`, not
+`R_HALT`) - i.e. NOT an artificial plateau. But the local contraction rate is clearly
+decelerating: $|dr/dt|$ fell from $\approx0.060\ R_\text{Jup}$/Gyr just after 4.5 Gyr to
+$\approx0.041\ R_\text{Jup}$/Gyr by 9.5 Gyr (a ~32% slowdown over 5 Gyr), tracking
+$T_\text{center}$'s and $L_\text{surface}$'s own steady decline (both roughly halved over
+the same window). This smooth, gradual deceleration - not a sharp asymptote - is more
+consistent with a genuinely lengthening Kelvin-Helmholtz timescale ($\tau_\text{KH}\sim
+GM^2/(RL)$, growing as $L$ drops) than with a hard artificial floor from missing physics.
+At the current decelerating pace, reaching `R_HALT` ($1\,R_\text{Jup}$, 3.6 $R_\text{Jup}$
+still to go) would take vastly longer than 10 Gyr - which itself is the strongest argument
+yet for prioritizing Sub-tasks 8a-8c (Saha ionization, molecular-to-atomic $\mu(T)$, and
+especially MLT convective efficiency) before drawing physical conclusions from the absolute
+timescale, even though the *qualitative* trend (continued, decelerating contraction) looks
+physically sound on its own.
+
+**Status: DONE.** Both the 4.5 Gyr and 10 Gyr production runs are complete, reviewed, and
+documented (Change Log). Sub-tasks 8a/8b/8c remain the natural next physics work, now
+motivated concretely by the absolute contraction timescale question above rather than only
+by EOS completeness in the abstract.
 
 ---
 

@@ -201,17 +201,43 @@ ADAPTIVE_DT_SAFETY_FACTOR = 0.15   # alpha - conservative starting value, to be 
 # as intended, not something to fight.
 ADAPTIVE_DT_GROWTH_FACTOR = 1.3   # Max dt_new/dt_used ratio per step (growth only) [dimensionless]
 
-# ASSUMPTION: ADAPTIVE_DT_MAX is a TEMPORARY, conservative rail for Sub-task 9's initial
-# validation - NOT a physically-motivated production ceiling. The real KH contraction to
-# R_HALT spans billions of years in total simulated time, so dt will eventually need to grow
-# into the hundreds-of-thousands-to-millions-of-years range in the late stages; this cap
-# exists only so the adaptive selector cannot pick a dt outside the range the
-# GRAD_EFF_SWITCH_EPSILON_TIMESTEP fix (PROGRESS.md 2026-08-08) has actually been checked
-# against, per the margin-sweep step of Sub-task 9's plan. Revisit (raise, or retire in favor
-# of a per-run adaptive ceiling) once that sweep is extended further, or once Sub-task 8c
-# (MLT) removes the underlying fragility entirely.
-ADAPTIVE_DT_MAX = 5.0e4 * SECONDS_PER_YEAR   # Absolute dt ceiling, temporary pending wider margin validation [s]
+# REVISED 2026-08-09 (session discussion, PROGRESS.md has the full reasoning): the original
+# 5e4 yr ceiling was a temporary validation rail, tied to a fixed-dt margin sweep at that
+# specific scale. Raising it further via MORE fixed-dt sweeps (e.g. at 5e5, 5e6 yr) was
+# considered and rejected as physically invalid: a large fixed dt tested against the
+# CURRENT early state (short thermal timescale) is not a fair test of whether that dt is
+# appropriate LATE in the contraction (long thermal timescale) - the two are conflated, and
+# a failure wouldn't tell us whether the numerics or the timing was at fault. The
+# ADAPTIVE_DT_GROWTH_FACTOR mechanism above already self-limits how fast dt can reach any
+# given scale (at most 1.3x/step, so it cannot reach a given ceiling before the star's own
+# evolution has had many steps to get there too) - trusted directly instead of pre-validating
+# an arbitrary large fixed dt out of context. ADAPTIVE_DT_MAX is now a generous DEFENSIVE
+# backstop only (protects against a genuine bug - e.g. a masking edge case producing a
+# nonsensical value - not a physically-motivated production ceiling), not expected to bind
+# under correct operation; monitor time_stepper.run()'s per-step log during the real run and
+# diagnose against the state AT THAT POINT if something does go wrong, rather than
+# pre-clearing every scale in advance.
+ADAPTIVE_DT_MAX = 1.0e8 * SECONDS_PER_YEAR   # Defensive backstop only - not expected to bind under correct operation [s]
 ADAPTIVE_DT_MIN = 1.0e2 * SECONDS_PER_YEAR   # Absolute dt floor, against pathological stalling from a transient dT/dt or dP/dt spike [s]
+
+# ASSUMPTION 2026-08-09 (Sub-task 10, user's explicit request): a second, physically-motivated
+# halt condition alongside R_HALT, so an indefinitely long run cannot occur if R_HALT (1 R_Jup)
+# is never reached within a physically reasonable timespan (e.g. if the contraction genuinely
+# stalls near quasi-equilibrium, or if slow numerical drift keeps the loop technically
+# progressing without real physical content).
+#
+# REVISED 2026-08-10 (user's explicit request): the first full run (4.5 Gyr, the solar
+# system's present-day age) reached only r_surface=4.83 R_Jup from a start of ~5.1 R_Jup -
+# almost no net contraction over the full budget (PROGRESS.md 2026-08-09 overnight entry).
+# Renamed from AGE_SOLAR_SYSTEM_S and doubled-plus to 10 Gyr, purely as a DIAGNOSTIC time
+# budget - not a claim that the real planet is 10 Gyr old - to distinguish two physical
+# hypotheses: (a) the contraction is genuinely this slow at this evolutionary phase (a real
+# KH-timescale result), vs (b) missing physics not yet in the model (MLT convective
+# efficiency, Saha ionization, the still-atomic-only mu(T) correction, or the interim wide
+# GRAD_EFF_SWITCH_EPSILON_TIMESTEP regularization) is creating an artificial equilibrium
+# floor well above R_HALT. Watch whether r_surface keeps decreasing past t=4.5 Gyr, or
+# asymptotes near the same ~4.8 R_Jup value.
+T_MAX_S = 10.0e9 * SECONDS_PER_YEAR   # Total-simulated-time halt condition for time_stepper.run() [s]
 
 
 # ==========================================

@@ -6,6 +6,8 @@
 # (time_stepper.py, Sub-tasks 7-8) so a physicist can see whether a solution still
 # makes physical sense, not just whether the solver reported success.
 
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -120,6 +122,7 @@ def run_diagnostics(state) -> None:
 def plot_structure_profile(state, output_path=f"{PLOT_DIR}/structure_profile.png") -> None:
     """Temperature, density, and pressure vs Lagrangian mass coordinate - the primary visual
     sanity check on a converged structure."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     x = state.m / config.M_TOTAL
     fig, axes = plt.subplots(3, 1, figsize=(7, 9), sharex=True)
 
@@ -147,6 +150,7 @@ def plot_structure_profile(state, output_path=f"{PLOT_DIR}/structure_profile.png
 def plot_mass_radius(state, output_path=f"{PLOT_DIR}/mass_radius.png") -> None:
     """Enclosed mass vs radius - shows how mass concentrates toward the center for this
     degenerate-supported structure (most of M_TOTAL sits well inside the outer radius)."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.plot(state.r / config.R_JUPITER_CM, state.m / config.M_TOTAL)
     ax.set_xlabel("r [R_Jup]")
@@ -167,6 +171,7 @@ def plot_convective_zones(state, output_path=f"{PLOT_DIR}/convective_zones.png")
     Excludes the innermost grid point: grad_radiative diverges as m->0 (removable 0/0 at the
     exact center, module docstring), and callers must not evaluate it there.
     """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     m, L, P, T, rho = state.m[1:], state.L[1:], state.P[1:], state.T[1:], state.rho[1:]
     kappa = opacity.bell_lin_opacity(rho, T)
     grad_ad = eos.grad_adiabatic(config.GAMMA)
