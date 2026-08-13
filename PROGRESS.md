@@ -9,6 +9,323 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ---
 
+## 0. Architecture Baseline — How the Simulation Works Right Now (written 2026-08-13)
+
+**Purpose of this section:** a from-the-code, ground-truth description of the current
+simulation architecture, written fresh (not from memory of past sessions) specifically as a
+troubleshooting baseline for the active Phase 1 (First Hydrostatic Core) investigation. §§1-5
+below are the historical narrative of how each piece came to be; this section is the
+snapshot of *what runs today*, in one place, with every active numerical knob named. Where
+Phase 1 and Phase 3 configurations differ, both are noted, but Phase 1's values (the
+currently active troubleshooting context) are called out explicitly.
+
+### 0.1 Physical picture
+
+The code solves a 1D, spherically symmetric, quasi-static (hydrostatic) gas envelope on a
+Lagrangian mass grid $m\in[m_\text{min}, M_\text{TOTAL}]$, using implicit (Henyey-style) time
+differencing: at each timestep, the full spatial structure is re-solved as a two-point
+boundary value problem (BVP), with the *previous* timestep's converged profile supplying the
+frozen $dT/dt$, $dP/dt$ source terms in the energy equation. There is no explicit time
+integrator in the ODE sense — time enters only through these finite-difference source terms,
+re-evaluated against a fully re-relaxed spatial structure every step. This is the standard
+technique used by production stellar-evolution codes (e.g. MESA) for exactly this reason:
+each step is unconditionally stable in time, at the cost of solving a nonlinear BVP per step.
+
+Two distinct physical regimes are modeled with the *same* code, selected entirely via
+`config.py` runtime overrides in the run script (never a code branch):
+- **Phase 3** (`run_phase3_validation.py`, `config.py`'s own persisted defaults): a hot,
+  compact, post-second-collapse protoplanet ($T_\text{center}$ starting at 11500 K, a few
+  $R_\text{Jup}$), atomic composition (`MU=1.278`, `GAMMA=5/3`), electron-degeneracy pressure
+  significant, H↔H₂ recombination physics active (`USE_H2_RECOMBINATION_PHYSICS=True`),
+  Gyr-scale timesteps. Currently PAUSED (§1).
+- **Phase 1** (`run_phase1_first_core.py` / `run_phase1_baseline_rerun.py`): a diffuse,
+  cool, fully molecular First Hydrostatic Core ($T_\text{center}$ starting at 645 K, ~500
+  $R_\text{Jup}$), constant molecular composition (`MU=2.34`, `GAMMA=1.4`), degeneracy
+  pressure negligible, H↔H₂ recombination physics deliberately OFF
+  (`USE_H2_RECOMBINATION_PHYSICS=False` — composition held strictly constant), yr-to-kyr-scale
+  timesteps. **This is the currently active investigation.**
+
+### 0.2 State representation
+
+`state.SimulationState` (`state.py`) is the one mutable container: arrays `m, r, P, L, T,
+rho` on the Lagrangian mass grid, plus scalar `t` and a `prev` back-reference (used only for
+`is_convective` bookkeeping in snapshots, not by the solver itself — the solver always takes
+an explicit `state_prev` argument). Every module is a pure function: given a state (and
+parameters), returns a new state or new arrays. No module holds its own mutable state.
+
+Internally, wherever the solver represents pressure and temperature, it always uses $\ln P$,
+$\ln T$ (never raw $P,T$) — this guarantees $P=e^{\ln P}>0$, $T=e^{\ln T}>0$ hold
+automatically through arbitrary Newton excursions, the standard Henyey/MESA convention. For
+$t>0$ solves, $r$ and $L$ are *additionally* nondimensionalized (§0.9) because their natural
+scales are wildly different from $\ln P,\ln T$'s $O(1$–$100)$ range — this is a genuine,
+measured Jacobian-conditioning fix (a raw state vector was found with $L$ 28 orders of
+magnitude larger than $\ln T$ in the same Newton system), not cosmetic.
+
+### 0.3 Building the $t=0$ initial state — `bvp_solver.solve_static_structure`
+
+The very first state is built by a **separate, simpler machinery** from everything else in
+the file: a 3-ODE ($r,\ln P,\ln T$) fully-convective adiabat (`_adiabatic_rhs_logm`), assumed
+uniform-composition and non-self-consistent in $L$ (no coupled energy equation — $T(P)$
+literally follows the adiabat $\nabla_\text{ad}=(\gamma-1)/\gamma$ by construction, and a
+diagnostic $L(m)$ is only backed out *afterward* via the marginally-efficient-convection
+closure, `gradients.marginal_convective_luminosity` — never fed back into the construction).
+This is integrated outward from a prescribed $T_\text{center}$ (`config.T_CENTER_INITIAL`,
+645 K for Phase 1) with `scipy.integrate.solve_ivp` (Radau), shooting on the one free
+parameter $P_\text{center}$ via `brentq`, until a `solve_ivp` **event**
+(`_photosphere_event_adiabatic`) locates the photosphere (Eddington $\tau=2/3$,
+`boundary_conditions.photospheric_pressure`) and the *enclosed mass at that event* is matched
+to `M_TOTAL` (not a residual at a fixed grid endpoint — a diffuse/compact structure's
+photosphere sits at a genuinely different enclosed-mass fraction, so the domain itself isn't
+known in advance).
+
+$P_\text{center}$ is bracketed, not blindly searched: an analytic Lane-Emden polytrope seed
+gives a first estimate, then the bracket is expanded geometrically (×1.03 per step, either
+direction, up to 300 steps) until `mass_error(P_center)` changes sign, and `brentq` polishes
+the root (`xtol=config.STATIC_STRUCTURE_BRENTQ_XTOL=2e-12`, `rtol=config.BVP_TOL=1e-8`).
+**Two Lane-Emden seed variants exist, dispatched by `use_ideal_gas_seed`:**
+- `_adiabatic_center_guess()` (default) — the pure $T=0$ electron-degenerate $n=1.5$
+  polytrope, a function of fundamental constants alone. Correct/proven for Phase 3's compact,
+  degeneracy-dominated regime. **Silently wrong for a diffuse molecular structure** — it
+  anchors the bracket search onto the wrong physical root entirely (verified directly, not
+  assumed: gives a plausible-looking but wrong $r_\text{surface}=3.27\,R_\text{Jup}$ if used
+  for Phase 1's composition).
+- `_adiabatic_center_guess_ideal_gas(T_center)` — thermally-set polytropic constant
+  ($n=1/(\gamma-1)$, $K=C\,T_\text{center}\,\rho_c^{-1/n}$), the seed Phase 1 uses
+  (`use_ideal_gas_seed=True`). Calibrated: $T_\text{center}=645$ K gives
+  $r_\text{surface}=500.83\,R_\text{Jup}$.
+
+The result is packaged into a `SimulationState` at `t=0`, sampled on `_build_output_grid`'s
+composite mass grid (§0.8) — but this state is **not yet a genuine solution** of the real
+4-equation system (§0.5); it only satisfies the pure-adiabat 3-ODE construction. That's what
+§0.4 fixes.
+
+### 0.4 Relaxation — `bvp_solver.relax_initial_state`
+
+Turns the $t=0$ adiabatic construction into a genuine solution of the full, coupled 4-ODE
+system (§0.5) via one or two `solve_bvp` collocation solves (§0.8) at a small **pseudo**-time
+step (`dt_relax = config.RELAX_DT_FRACTION * config.T_KH_TIMESCALE_S` — NOT real elapsed
+time; `state.t` is left unchanged throughout). Runs in up to two stages:
+
+- **Stage 1** (always runs): relaxes under `USE_H2_RECOMBINATION_PHYSICS` forced `False`
+  (constant $\mu,\gamma$) regardless of the run's real setting — this is the numerically
+  proven-convergent path. For Phase 1, since the run's real setting is *already*
+  `USE_H2_RECOMBINATION_PHYSICS=False`, stage 1 **is** the final answer and stage 2 never
+  runs (`relax_initial_state` returns `state_mid` directly — see the `if not
+  config.USE_H2_RECOMBINATION_PHYSICS: return state_mid` early exit). For Phase 1
+  specifically: `force_clamp_off_stage1=False` (soft clamp, §0.6, stays ON — Phase 1's
+  trajectory was found to crash outright, raw `np.exp()` overflow, with it off) and
+  `RELAX_DT_FRACTION` is overridden to `1e-3` (Phase 1-local; default is `0.01`).
+- **Stage 2** (Phase 3 only, since it needs `USE_H2_RECOMBINATION_PHYSICS=True`): a single
+  MICRO solve (`RELAX_RECOMBINATION_MICRO_DT_FRACTION=0.001`, smaller than stage 1's own
+  `dt_relax`) that turns the real, T-dependent $\mu(T),\gamma_\text{eff}(T)$ physics back on,
+  warm-started from stage 1's solution — lets the composition transition at the cool
+  photospheric boundary walk on gradually rather than in one Newton leap. **Not exercised
+  by Phase 1 at all** (the flag is off for the whole run, not just stage 1).
+
+Both stages use `switch_epsilon=config.GRAD_EFF_SWITCH_EPSILON` (the *narrow* Schwarzschild
+switch width, $10^{-4}$ — see §0.10's table; distinct from the wider value real timesteps
+use).
+
+### 0.5 The 4-ODE system — `odes.stellar_odes`
+
+State vector $y=[r,P,L,T]$ on mass coordinate $m$; every $t>0$ solve (relaxation and every
+real timestep alike) solves this same system:
+
+1. **Continuity**: $dr/dm = 1/(4\pi r^2\rho)$
+2. **Hydrostatic equilibrium**: $dP/dm = -Gm/(4\pi r^4)$
+3. **Energy** (Kelvin-Helmholtz contraction source, Kippenhahn & Weigert eq. 4.26):
+   $dL/dm = -c_p\,(dT/dt) + (\delta/\rho)(dP/dt)$, where $dT/dt,dP/dt$ are the **frozen**,
+   implicit time derivatives — $(T_\text{trial}-T_\text{prev})/\Delta t$,
+   $(P_\text{trial}-P_\text{prev})/\Delta t$, with $T_\text{prev},P_\text{prev}$ linearly
+   interpolated from the previous converged state onto the current trial's mass grid
+   (`_interp_state_prev`). $\delta=-(\partial\ln\rho/\partial\ln T)_P$ is the genuine,
+   EOS-dependent thermodynamic coefficient (`eos.thermodynamic_delta`; $\to 1$ for pure ideal
+   gas, $\to 0$ as degeneracy dominates — always $\approx 1$ for Phase 1, degeneracy
+   negligible there). $c_p$ is `eos.specific_heat_cp(gamma_eff, mu) +
+   eos.latent_heat_capacity(T)` — the second term is the H₂-dissociation latent-heat
+   correction, which returns identically zero when `USE_H2_RECOMBINATION_PHYSICS=False`
+   (Phase 1's case, as of the 2026-08-13 gating fix — see §5's Change Log).
+4. **Temperature structure** (Schwarzschild criterion): $dT/dm = (T/P)\,\nabla_\text{eff}\,
+   dP/dm$, where $\nabla_\text{eff}=\min(\nabla_\text{rad},\nabla_\text{ad})$ (§0.6) selects
+   radiative or (idealized, infinitely-efficient) convective transport at each point.
+
+$\mu(T)$ and $\gamma_\text{eff}(T)$ (`eos.mean_molecular_weight`, `eos.gamma_effective`) are
+evaluated fresh at every call — under `USE_H2_RECOMBINATION_PHYSICS=False` (Phase 1) both
+flatten exactly to the constants `config.MU=2.34`, `config.GAMMA=1.4` everywhere, so the
+composition is *exactly* uniform through the whole envelope for every Phase 1 solve, by
+construction.
+
+### 0.6 Closure relations feeding the ODEs
+
+- **EOS** (`eos.density`): $P=P_\text{ideal}(\rho,T)+P_\text{degenerate}(\rho)$, inverted for
+  $\rho$ via vectorized Newton-Raphson (ideal-gas-only seed). For Phase 1's density range
+  ($\rho\sim10^{-8}$–$10^{-6}\,\text{g/cm}^3$ at the wall, per the 2026-08-13 diagnostic scan)
+  the degenerate term is utterly negligible — this is functionally a pure ideal gas for Phase
+  1, even though the combined EOS is always evaluated.
+- **Opacity** (`opacity.bell_lin_opacity`): Bell & Lin (1994), 8 piecewise power-law regimes
+  in $(\rho,T)$ (Ice grains → Ice grain evaporation → Metal grains → Metal grain evaporation →
+  Molecules → H⁻ scattering → Kramers bound-free/free-free → electron scattering). With
+  `config.OPACITY_SMOOTH_TRANSITIONS=True` (always, currently), a logistic partition-of-unity
+  blend (`bell_lin_opacity_smooth`, width `OPACITY_TRANSITION_SMOOTH_WIDTH_DEX=0.005 dex`)
+  replaces the hard regime switch, eliminating a genuine $d\kappa/dT$ discontinuity at
+  boundaries (confirmed root cause of a real Phase 3 mesh explosion, 2026-08-11).
+- **Radiative gradient** (`gradients.grad_radiative`): $\nabla_\text{rad}=3\kappa L_\text{safe}
+  P/(16\pi a_\text{rad} c\, G\, m\, T^4)$, with $L_\text{safe}$ a smoothed $L\ge0$ floor
+  (hyperbolic, width `GRAD_RAD_L_FLOOR_EPSILON = 1e-9 * L_KH_SCALE_ERG_S`) — prevents a
+  temperature-inversion runaway from a transient negative-$L$ Newton trial near the
+  photosphere.
+- **Schwarzschild switch** (`gradients.effective_gradient`): $\nabla_\text{eff}=
+  \min_\text{smooth}(\nabla_\text{rad},\nabla_\text{ad})$, a smoothed minimum (same hyperbolic
+  family as the $L$-floor) replacing a hard `np.where`. **This is the single most consequential
+  smoothing parameter in the whole solver** for the current Phase 1 investigation — see §0.10.
+- **Adiabatic gradient**: $\nabla_\text{ad}=(\gamma_\text{eff}(T)-1)/\gamma_\text{eff}(T)$ —
+  a true constant, $0.2857\ldots$, for Phase 1 (since $\gamma_\text{eff}\equiv 1.4$ there,
+  flag off).
+
+### 0.7 Boundary conditions (`boundary_conditions.py`, applied via `bvp_solver.make_bc_scaled`)
+
+Two conditions at each end of the mass domain, four residuals total:
+- **Center** ($m=m_\text{min}=$ `M_MIN_FRACTION`$\times M_\text{TOTAL}=10^{-6}\,M_\text{TOTAL}$,
+  not exactly $m=0$, avoiding continuity's removable $1/r^2$ singularity there): $r(m_\text{min})$
+  is tied to the *live* trial central density via the analytic constant-density relation
+  $r=(3m_\text{min}/4\pi\rho_c)^{1/3}$ (re-evaluated every Newton iteration, not a fixed
+  pre-estimate), and $L(m_\text{min})=0$ (no core energy source).
+- **Surface** ($m=M_\text{TOTAL}$): mechanical condition is the Eddington $\tau=2/3$
+  photospheric pressure, $P_\text{photo}=(2/3)g/\kappa$ (`boundary_conditions.
+  photospheric_pressure`) — NOT a fixed ambient pressure; thermal condition is a net radiative
+  flux balance, $L=4\pi r^2\sigma_\text{SB}(T^4-T_\text{NEB}^4)$ — NOT a fixed $T=T_\text{NEB}$
+  clamp (both were revised from an earlier, simpler design that had genuine degeneracy/
+  unreachability problems — §5's older entries have the trail).
+
+### 0.8 Per-timestep solve — `bvp_solver.solve_timestep`, the collocation machinery
+
+Every real timestep (and both relaxation stages) is solved by
+`scipy.integrate.solve_bvp` — a global collocation/relaxation method (4th-order, Lobatto IIIa
+error control), the same numerical family as Henyey's implicit relaxation used in production
+stellar-evolution codes. This REPLACED an earlier shooting-method solver (root-finding via
+`scipy.optimize.root`/`fsolve` on two unknowns) in 2026-08-08, after that approach was traced
+to a structural Jacobian rank-deficiency: under the idealized, infinitely-efficient-convection
+Schwarzschild switch, a fully-convective-saturated region makes
+$d\nabla_\text{eff}/d\nabla_\text{rad}=0$ identically, decoupling $L$ from the $P$-$T$
+relation — **this is the same mechanism the 2026-08-13 diagnostic instrumentation
+(`run_scripts/diag_singular_jacobian.py`) found reappearing inside `solve_bvp`'s own
+collocation Jacobian for Phase 1's deeply-convective envelope**, not a new failure mode.
+
+Mesh and initial guess (`_build_mesh_and_guess`): a composite mass grid — log-spaced in the
+core, log-spaced-in-distance-to-surface over the outer `GRID_OUTER_MASS_FRACTION=10%` of mass
+— at `BVP_MESH_N_GRID_POINTS=2000` initial points (denser than the `N_GRID_POINTS=200`
+output/reporting grid), warm-started from the previous converged state's own $(r,\ln P,\ln
+T,L)$ profile (`warm_start_L=True` for real timesteps — the previous state's $L(m)$ is itself
+a genuine converged solution, a far better guess than any synthetic ramp).
+
+`solve_bvp` is called with `tol=config.BVP_COLLOCATION_TOL=1e-6`, `max_nodes=
+config.BVP_MAX_NODES=80000`, and **analytic** `fun_jac`/`bc_jac` (not scipy's default
+finite-difference Jacobian) — `implicit_rhs_jacobian_scaled`/`make_bc_jacobian_scaled`, hand-
+derived and cross-checked against finite differences (`validation.py`'s Jacobian-correctness
+check, `JACOBIAN_VERIFY_N_POINTS=15` random mesh points, tolerance `1e-4`) before being
+trusted. This is what the 2026-08-13 diagnostic instrumentation intercepts directly (the exact
+sparse matrix scipy factorizes each Newton iteration), not a hand-reconstruction of it.
+
+### 0.9 State-vector nondimensionalization (t>0 only)
+
+$y=[r,\ln P,L,\ln T]\to z=[\hat r,\ln P,\hat L,\ln T]$: $\hat r=r/R_\text{SCALE}$
+($R_\text{SCALE}=R_\text{Jup}$, linear), $\hat L=\text{arcsinh}(L/L_\text{SCALE})$
+($L_\text{SCALE}=$ a fixed Kelvin-Helmholtz-timescale reference luminosity, $GM_\text{TOTAL}^2/
+(R_\text{Jup}\,T_\text{KH})$ — nonlinear, sign-preserving, log-like compression). `solve_bvp`
+only ever sees $z$; `implicit_rhs_scaled`/`implicit_rhs_jacobian_scaled` wrap the physical-
+space RHS/Jacobian with the appropriate chain-rule scaling (including a genuine second-
+derivative correction term in the $(\hat L,\hat L)$ Jacobian entry, since $\hat L$'s own
+scaling factor is itself $L$-dependent).
+
+### 0.10 The soft clamp (`_safe_exp_state`) — surviving wild Newton trials
+
+Before ANY physics function sees $(P,T)$, `_safe_exp_state` passes $(\ln P,\ln T)$ through a
+smooth two-sided saturation (`_soft_clamp`, a composed softplus construction) toward bounds
+$\ln P\in[-100,100]$, $\ln T\in[0,100]$ (`LN_P_CLAMP`, `LN_T_MIN`, `LN_T_MAX`), width
+`BVP_SOFT_CLAMP_WIDTH=0.1` (natural-log units) — replacing an earlier **hard** `np.clip` that
+had exactly zero derivative once saturated (both preventing any Newton correction from ever
+pulling a wayward trial back, and making the analytic Jacobian actively *wrong*, not just
+imprecise, in the saturated region — confirmed root cause of a 2026-08-11 mesh explosion).
+The soft version is C-∞ with a strictly nonzero derivative for roughly 75 natural-log units
+past either boundary (`_soft_clamp_derivative`) — every Jacobian row that converts a
+$d/dP,d/dT$ into $d/d(\ln P),d/d(\ln T)$ must multiply by the ACTUAL clamped derivative
+(`_safe_exp_state_derivatives`), never assume $dP/d(\ln P)=P$.
+
+### 0.11 Solve orchestration — `_solve_structure_bvp`: direct attempt → continuation → retry
+
+Three nested layers, from fastest/cheapest to most defensive:
+
+1. **Direct attempt** at $\alpha=1.0$ (the real, fully Schwarzschild-selected gradient) —
+   cheap, and what every step tries first (matches the old shooting solver's behavior of not
+   re-relaxing from scratch every step).
+2. **Alpha-continuation fallback**, only if (1) fails: steps $\alpha$ through the ladder
+   `config.BVP_ALPHA_CONTINUATION_STEPS = (0.0, 0.5, 0.9, 0.99, 0.999, 0.9999,
+   BVP_ALPHA_MAX=1-1e-5)`, warm-starting each rung from the previous rung's converged dense
+   solution. $\alpha$ blends the temperature-gradient equation between the pure adiabat
+   ($\alpha=0$, no $L$-dependence at all, well-conditioned) and the real Schwarzschild-
+   selected gradient ($\alpha=1$): $d\ln T/dm = (1-\alpha)\nabla_\text{ad}\,d\ln P/dm +
+   \alpha\,(dT/dm)_\text{real}/T$. The literal endpoint $\alpha=1.0$ is deliberately never
+   used in the continuation ladder itself (only in the direct attempt) — a tiny adiabatic
+   admixture at `BVP_ALPHA_MAX` acts as a regularizer for a marginal instability confirmed in
+   the pure unblended system. **This is exactly the $\alpha=0\to0.5$ jump the 2026-08-13
+   diagnostic found failing via a genuinely singular Jacobian for Phase 1's ~1620K wall.**
+   The blend is NaN-safe (2026-08-12 fix): the real gradient's opacity-dependent computation
+   happens unconditionally regardless of $\alpha$, so a non-finite value on one extreme trial
+   point falls back per-point to the adiabatic gradient rather than corrupting the whole
+   blended result via IEEE's $0\times\text{NaN}=\text{NaN}$.
+3. **Step-retry**, one level up in `time_stepper.run` (not inside `bvp_solver` at all): if
+   layer (2) still raises `RuntimeError`, the whole step is retried at
+   `dt *= STEP_RETRY_SHRINK_FACTOR=0.5`, up to `STEP_RETRY_MAX_ATTEMPTS=6` times (so up to
+   64× smaller than the originally-proposed $dt$) before giving up and letting the exception
+   propagate — this is what actually crashes a run end-to-end when it fails.
+
+### 0.12 Outer time loop — `time_stepper.run`
+
+Fixed seed $dt$ for step 1 (`DT_SEED`, 10 yr for Phase 1); every step after, if
+`config.USE_ADAPTIVE_DT=True` (always, currently), `select_adaptive_dt` proposes
+$dt_\text{raw}=\text{ADAPTIVE\_DT\_SAFETY\_FACTOR}(0.15)\times\min(\min_i T_i/|dT_i/dt|,
+\min_i P_i/|dP_i/dt|)$ (both $T$ and $P$ timescales, deliberately excluding $L$ — $L=0$
+exactly at the center by construction, a structural $0/0$), capped to grow by at most
+`ADAPTIVE_DT_GROWTH_FACTOR=1.3`× the just-used $dt$ (shrinking is never restricted), then
+clamped to `[ADAPTIVE_DT_MIN, ADAPTIVE_DT_MAX]` (Phase 1: `[10 yr, 1e4 yr]`, both runtime
+overrides — the persisted defaults are Phase 3-scale, `[100 yr, 1e8 yr]`).
+
+Halts on whichever of three conditions triggers first: $r_\text{surface}\le$`R_HALT`
+($1\,R_\text{Jup}$), $t\ge$`T_MAX_S` (Phase 1: $10^6$ yr, a diagnostic ceiling), or
+$T_\text{center}\ge$`PHASE1_T_CENTER_HALT` ($1900$ K — a deliberate ~100 K margin below where
+H₂ dissociation would soften $\Gamma_1<4/3$ and trigger the out-of-scope Stage 2 dynamical
+collapse). Every snapshot (`snapshot_interval`-th step, plus the halting step always) is
+saved to disk immediately (`output.save_snapshot`), so a long run's progress survives an
+interruption or crash.
+
+### 0.13 All active smoothing/regularization mechanisms, at a glance
+
+| Mechanism | Function | Parameter | Current value | Purpose |
+|---|---|---|---|---|
+| P/T soft clamp | `_safe_exp_state` | `BVP_SOFT_CLAMP_WIDTH` | 0.1 (log-units); bounds $\ln P\in[-100,100]$, $\ln T\in[0,100]$ | Survive wild Newton trial excursions without a zero-derivative wall |
+| Opacity regime blend | `opacity.bell_lin_opacity_smooth` | `OPACITY_TRANSITION_SMOOTH_WIDTH_DEX` | 0.005 dex | Remove $d\kappa/dT$ discontinuity at Bell & Lin regime boundaries |
+| Radiative-$L$ floor | `gradients.grad_radiative` | `GRAD_RAD_L_FLOOR_EPSILON` | $10^{-9}\times L_\text{KH,scale}$ | Smooth $L\ge0$ floor, prevents T-inversion runaway near photosphere |
+| **Schwarzschild switch (relax)** | `gradients.effective_gradient` | `GRAD_EFF_SWITCH_EPSILON` | $10^{-4}$ (dimensionless $\nabla$ units) | Smooths $\min(\nabla_\text{rad},\nabla_\text{ad})$ — used by `relax_initial_state` only |
+| **Schwarzschild switch (real dt)** | same | `GRAD_EFF_SWITCH_EPSILON_TIMESTEP` | **2.0** | SAME switch, wider width — used by every `solve_timestep` call; tuned against Phase 3's near-unity superadiabaticity, **not yet re-validated for Phase 1's 150–355 range** (2026-08-13 finding) |
+| $\alpha$-continuation | `implicit_rhs_vectorized`/`_jacobian` | `BVP_ALPHA_CONTINUATION_STEPS` | (0.0, 0.5, 0.9, 0.99, 0.999, 0.9999, 1-1e-5) | Homotopy from pure adiabat to real Schwarzschild gradient |
+| H↔H₂ recombination (mu/gamma/latent heat) | `eos.mean_molecular_weight` etc. | `USE_H2_RECOMBINATION_PHYSICS` | **False for Phase 1**, True for Phase 3 | Molecular↔atomic composition transition — OFF means $\mu,\gamma$ are hard constants everywhere for Phase 1 |
+| Step retry | `time_stepper.run` | `STEP_RETRY_MAX_ATTEMPTS` / `STEP_RETRY_SHRINK_FACTOR` | 6 / 0.5 | Automatic shrink-and-retry on a failed step |
+| dt growth cap | `select_adaptive_dt` | `ADAPTIVE_DT_GROWTH_FACTOR` | 1.3 | Caps how fast the adaptive step can grow, asymmetric (no shrink limit) |
+
+### 0.14 What is genuinely NOT active for the current Phase 1 investigation
+
+Worth stating explicitly, since Phase 3's code paths remain in the same file and are easy to
+mistake for live: electron-degeneracy pressure (present in `eos.density` but numerically
+negligible at Phase 1's densities), H↔H₂ recombination/dissociation physics (`molecular_
+fraction`, `latent_heat_capacity`, `mean_molecular_weight_inv_derivative` — all gated off,
+returning flat constants/zeros), the degenerate Lane-Emden seed (`_adiabatic_center_guess`,
+Phase 1 uses the ideal-gas variant), and stage 2 of `relax_initial_state` (never runs when
+the flag is off). Every one of these is a `config.py` runtime override made inside the run
+script, not a permanent file-level change (hermetic isolation, confirmed by direct `git diff`
+— see §5's 2026-08-12 entry).
+
+---
+
 ## 1. Current Status
 
 **★★★★★★ 2026-08-12 — Phase 3 PAUSED (PI directive); pivoted to Phase 1 (First Hydrostatic
@@ -1289,6 +1606,154 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-13 (later) — ★★★★★★★ FIRST clean full Phase 1 run reaches PHASE1_T_CENTER_HALT (1900K) — the singular-Jacobian wall recurs twice more but is fully absorbed by the existing step-retry mechanism, not fixed
+
+**Directive**: drop the other machine's non-determinism data, run a completely fresh $t=0$
+Phase 1 baseline (`run_scripts/run_phase1_baseline_rerun.py` — identical to `run_phase1_first_
+core.py`, own output directory to avoid mixing with the earlier partial run's stale snapshots)
+under the current codebase, and report the exact crash state. **It did not crash.** Full,
+physically clean run from $t=0$ to `PHASE1_T_CENTER_HALT`: 35 steps, $t=0\to1518.6$ yr,
+$r_\text{surface}=558.6\to186.4\,R_\text{Jup}$, $T_\text{center}=654.9\to1923.7$ K (crossing the
+1900K target between steps 34 and 35). 36 snapshots + evolution/profile/convective-zone/
+opacity-regime plots generated in `outputs/diagnostic_plots/run_Phase1_baseline_rerun_20260813/`.
+This is the first time this project has crossed the Phase 1 finish line.
+
+**The wall investigated in the entry below recurred, twice, exactly as characterized there —
+and was automatically absorbed, not resolved:**
+- **Step 33** (attempting $dt=81.49$ yr from $T_\text{center}=1823.6$K): direct $\alpha=1$
+  attempt failed via "maximum mesh nodes exceeded" (235.8s, NaN residual runaway, matching the
+  earlier iteration-21-onward signature). Alpha-continuation's $\alpha=0$ rung converged cleanly
+  (10 iter, 5236 nodes). $\alpha=0.5$ failed on its very first Newton iteration: **"Singular
+  Jacobian encountered when solving the collocation system on iteration 1"** (max relative
+  residual reported as `nan`/large, elapsed 1.8s). `time_stepper.run`'s step-retry caught the
+  resulting `RuntimeError`, halved $dt\to40.75$ yr, and the retry converged directly (13
+  iterations, 3902 nodes, no continuation needed) — step 33 final: $T_\text{center}=1853.6$K.
+- **Step 35** (attempting $dt=68.86$ yr from $T_\text{center}=1890.4$K): identical signature —
+  direct $\alpha=1$ failed the same way (65 iterations, node count run away to 78,057, "Number
+  of nodes is exceeded"), $\alpha=0$ converged cleanly (10 iter, 5425 nodes), $\alpha=0.5$ failed
+  with the same exact message on iteration 1 (elapsed 1.9s). Step-retry halved
+  $dt\to34.43$ yr; the retry converged directly (12 iterations, 3865 nodes) at
+  $T_\text{center}=1923.684$K — which crossed `PHASE1_T_CENTER_HALT=1900.0` and ended the run.
+
+Both failures show the same diagnostic footprint as the 2026-08-13 instrumentation below: before
+the singular-Jacobian message, `implicit_rhs_vectorized`'s own diagnostic print shows the
+$\alpha=0.5$ trial's extreme/non-finite $(P,T)$ values spreading from a few scattered mesh
+points to **the entire mesh** ($m/M_\text{TOTAL}\in[10^{-6},1.0]$, all ~5400 points) across
+successive internal trial evaluations, with $\ln P,\ln T$ reaching $\sim10^{19}$–$10^{20}$ —
+smaller in magnitude than the earlier instrumentation's $\sim10^{134}$–$10^{136}$ figures, but
+the same qualitative runaway-then-singular pattern, now confirmed at a different $T_\text{center}$.
+
+**What this means, stated plainly:** the $\alpha=0\to0.5$ Jacobian singularity identified in the
+entry below is real, reproducible, and now confirmed to recur at multiple, DIFFERENT
+$T_\text{center}$ values (not one fixed threshold) as the star heats through this range — but in
+this run, the existing `STEP_RETRY_MAX_ATTEMPTS`/`STEP_RETRY_SHRINK_FACTOR` safety net (built
+2026-08-12 for a different, unrelated class of transient failure) happened to be sufficient to
+route around it every time, succeeding on the very first retry (dt halved once) in both cases.
+This is NOT the same as the underlying Jacobian issue being fixed — it is being silently
+absorbed by a mechanism that was not designed for it. No speculative fix was applied here, per
+explicit instruction; this is a clean data point for the ongoing discussion, not a resolution.
+
+### 2026-08-13 — ★★★★★ The 1561K wall's real cause found (parallel session) and confirmed live; a NEW ~1620-1660K wall instrumented, root mechanism identified as near-global convective saturation, not a local defect
+
+**Context**: this entry picks up directly from 2026-08-12's honest "wall not yet diagnosed" close.
+Two things happened in parallel: a second Claude session on the user's other machine kept
+working the same repo independently (own commits, reconciled here via `git log`/`git show`
+rather than assumed), and this session ran three targeted fix attempts of its own against the
+1561K wall. Both threads are recorded here so the reasoning isn't lost.
+
+**This session's three fix attempts against the 1561K wall (all tested in isolation against the
+exact failing (state, dt) before being judged, per the project's sterile-before-wet discipline)**:
+1. NaN-safe alpha-blend (`implicit_rhs_vectorized`/`implicit_rhs_jacobian`): traced the failure
+   to IEEE float pathology, not a physics bug - `dT_dm_real` (needing opacity/`grad_rad` via
+   `odes.stellar_odes`) was computed *unconditionally* regardless of `alpha`, so a NaN/inf real-
+   gradient value survived multiplication by `alpha=0` (`0.0*nan=nan` in IEEE754, not `0.0`),
+   corrupting the pure-adiabat fallback that was supposed to be immune to it. Fixed with an
+   explicit `np.where(np.isfinite(...), ...)` fallback in both the residual and its Jacobian
+   (verified against finite differences to 1.16e-10, zero validation regression). **Necessary
+   general-correctness fix, kept - but alone did not resolve the wall**: confirmed dt-independent
+   (5.0/2.5/1.25 yr all failed identically), ruling out NaN-corruption as this wall's primary
+   cause.
+2. Opacity transition width widening (`OPACITY_TRANSITION_SMOOTH_WIDTH_DEX`): failed *worse* -
+   singular Jacobian, residuals to 1e35-1e86, non-finite values spread across nearly the whole
+   star. **Rejected.**
+3. Outer mesh refinement: residual *grew* across iterations even on a 2x denser/wider mesh - the
+   signature of genuine non-convergence, not under-resolution. **Rejected.**
+
+**The parallel session's fix (commit `8531c5f`) - confirmed today as the actual root cause of the
+1561K wall.** `eos.latent_heat_capacity` and `eos.mean_molecular_weight_inv_derivative` (plus
+`bvp_solver._h2_transition_derivatives`) were injecting the full H2-dissociation latent-heat
+logistic spike (up to ~16x nominal $c_p$ near T=2500K) into the energy equation *even with
+`USE_H2_RECOMBINATION_PHYSICS=False`* - Phase 1's whole point is to stay strictly molecular, and
+this flag was supposed to disable that physics track entirely but didn't. Fixed by gating all
+three functions on the flag (return zero derivative contributions when off). Verified today, live,
+in this environment (not just trusted from the other machine's report): resuming from the
+T_center=1560.89K snapshot, the exact step that used to explode as "maximum mesh nodes exceeded"
+(>80,000 nodes) at every alpha rung now converges cleanly in 13 iterations / 3664 nodes, and a
+second step converges equally cleanly to T_center=1594.02K. **The 1561K wall is closed.**
+
+Also merged from the same commit and confirmed present: `boundary_conditions.py`'s stale,
+unsynced module-level `boundary_conditions()` wrapper (hardcoded `config.MU` instead of
+`eos.mean_molecular_weight(T)`) removed; `validation.py`'s Check 19 updated to a live
+`_live_boundary_residual` using the real solver physics; `_safe_solve_bvp`'s exception handling
+narrowed from bare `except Exception` to `(AssertionError, FloatingPointError,
+np.linalg.LinAlgError)`; repo reorganized (`outputs/` consolidated and gitignored, run scripts
+moved to `run_scripts/`, dead files `PLAN_BVP.md`/`bvp_experiment.py`/
+`bvp_solver_shooting_archive.py` deleted).
+
+**A new wall appeared one step later, ~T_center=1620-1660K.** Wrote an instrumentation script,
+`run_scripts/diag_singular_jacobian.py`, that monkey-patches `scipy.integrate._bvp.prepare_sys`
+to intercept the *exact* sparse collocation Jacobian `solve_bvp`'s own Newton iteration
+factorizes on every call (not a hand-reconstruction of it), run against the real failing
+(state=`Phase1_deep_diag/snapshot_00002.npz`, T_center=1594.02K; dt=6.05yr, the real next
+adaptive step). Findings:
+
+- **Non-determinism: not reproduced here.** Two identical runs in this environment produced
+  bit-for-bit identical first-iteration Jacobians (`max|J1-J2|=0.0`). The 4th/5th-decimal
+  differences reported from the other machine are real but likely environment-specific (BLAS
+  backend, thread count, or scipy version divergence between the two machines) rather than a
+  property of the physics/solver itself - worth a `np.show_config()`/`scipy.__version__` diff
+  between the two machines before treating non-determinism as a structural clue.
+- **Signature confirmed, but with a precursor the report didn't mention.** The direct alpha=1
+  attempt does *not* fail via singular Jacobian - it converges steadily for 20 iterations then
+  goes to `nan` residual at iteration 21 and runs away in mesh refinement (up to 77,516 nodes)
+  until the node cap aborts it. *Then*, the alpha-continuation fallback's alpha=0 (pure adiabat)
+  rung converges cleanly (11 iterations, 2794 nodes - notably clean, unlike the old 1561K wall
+  where alpha=0 also failed). The reported "Singular Jacobian encountered ... iteration 1" is the
+  *next* rung, alpha=0.5, confirmed exactly: `splu` on the captured matrix itself throws "Factor
+  is exactly singular" - a genuine, not just ill-conditioned, matrix.
+- **Location: not localized to m/M≈0.75.** Direct measurement of $d(\nabla_\text{eff})/
+  d(\nabla_\text{rad})$ (the smoothed-Schwarzschild-switch derivative) across four windows
+  (m/M∈[0.17,0.33], [0.42,0.58], [0.67,0.83], [0.82,0.98]) on the alpha=0 solution shows the
+  *same* signature everywhere: $\nabla_\text{rad}$ exceeds $\nabla_\text{ad}$ by 2-3 orders of
+  magnitude (150-355 vs. ~0.286) at every point sampled, pinning $d(\nabla_\text{eff})/
+  d(\nabla_\text{rad})$ to ~1e-5-1e-3 (deep convective saturation - $\nabla_\text{eff}\approx
+  \nabla_\text{ad}$, essentially decoupled from $L$) across the *entire* envelope, not a local
+  pocket. This is the same rank-deficiency mechanism this project's own shooting-method era
+  documented ("100% convective saturation ... decoupling L from the P-T relation"), but
+  generalized: Phase 1's diffuse, cool, low-opacity envelope is nearly fully convective almost
+  everywhere (physically expected for a First Hydrostatic Core), not marginally convective at
+  one radius.
+- **Mechanism at the actual failure.** At alpha=0.5's first Newton attempt (Jacobian assembled
+  at the alpha=0 solution), scipy's internal trial-step evaluations already show catastrophic
+  blowups (trial $|\ln P|$ reaching ~$10^{134}$) at scattered mass coordinates (m/M≈0.30, 0.57,
+  0.87, and the near-surface 0.999-1.0 band) before the factorization itself is declared
+  singular. Read together with the location finding: introducing the real (alpha>0) $L$-$T$
+  coupling for the first time, on top of a structure where that coupling's derivative is
+  legitimately ~1e-5 almost everywhere, appears to leave the discrete system too weakly
+  conditioned in the $L$ direction for a single 0.5-sized continuation jump to survive - not
+  disproven, but not yet confirmed as *the* mechanism either.
+
+**Not yet decided - three options identified for joint review, none implemented:** (a) a finer
+alpha ladder through the 0→0.5 jump specifically, since the $L$-$T$ coupling only exists for
+alpha>0; (b) `GRAD_EFF_SWITCH_EPSILON_TIMESTEP=2.0` was tuned for Phase 3's near-unity
+superadiabaticity and may simply be the wrong scale for Phase 1's 150-355 magnitude range
+(Phase-1-local runtime override only, not a `config.py` default change - Phase 3's tuned value
+stays untouched); (c) a longer-term architectural option - treat the deeply convective interior
+with $\nabla_\text{eff}=\nabla_\text{ad}$ directly rather than blending everywhere, matching how
+real stellar-structure codes detect the radiative-convective boundary explicitly instead of
+smoothing across the whole star. Deliberately not executed pending discussion, per explicit
+instruction to gather data and decide together rather than fix unilaterally.
 
 ### 2026-08-12 — ★★★★★★ Phase 3 paused; pivot to Phase 1 (First Hydrostatic Core) - a real, physically clean contraction achieved to ~73% of the T_center target, honest account of the remaining wall
 
