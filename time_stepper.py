@@ -78,13 +78,16 @@ def select_adaptive_dt(state_curr, state_prev, dt_used):
 
 def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
     """Advance state_prev through up to n_steps of bvp_solver.solve_timestep(state, dt),
-    halting early on whichever of TWO physically-motivated conditions triggers first (Sub-task
-    10): the surface radius reaching config.R_HALT (Stage 3's cooling, degenerate-pressure-
-    supported contraction toward a present-day-Jupiter-like state - PLAN.md "Formation
-    Scenario and Scope"), or the elapsed simulated time reaching config.T_MAX_S (a diagnostic
-    time budget, not a claim about the real planet's age - config.py has the full reasoning -
-    a backstop against an indefinitely long run if R_HALT is never reached). No bootstrap/kick
-    step of any kind - uniform from
+    halting early on whichever of THREE physically-motivated conditions triggers first: the
+    surface radius reaching config.R_HALT (Stage 3's cooling, degenerate-pressure-supported
+    contraction toward a present-day-Jupiter-like state - PLAN.md "Formation Scenario and
+    Scope"), the elapsed simulated time reaching config.T_MAX_S (a diagnostic time budget, not
+    a claim about the real planet's age - config.py has the full reasoning - a backstop against
+    an indefinitely long run if R_HALT is never reached), or (2026-08-12, Phase 1 / First
+    Hydrostatic Core pivot) the central temperature reaching config.PHASE1_T_CENTER_HALT - a
+    deliberate stop just below where H2 dissociation would soften Gamma_1 below 4/3 and trigger
+    the out-of-scope Stage 2 dynamical collapse, before that physical singularity reaches this
+    quasi-static solver. No bootstrap/kick step of any kind - uniform from
     the first call. state_prev should already be genuinely self-consistent with
     solve_timestep's equations (bvp_solver.relax_initial_state's output, not
     solve_static_structure's directly).
@@ -108,7 +111,8 @@ def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
     print(f"time_stepper.run: starting KH-contraction loop, n_steps={n_steps}, dt_mode={mode}, "
           f"seed dt={dt / config.SECONDS_PER_YEAR:.4e} yr, "
           f"R_HALT={config.R_HALT / config.R_JUPITER_CM:.3f} R_Jup, "
-          f"t_max={config.T_MAX_S / config.SECONDS_PER_YEAR:.3e} yr", flush=True)
+          f"t_max={config.T_MAX_S / config.SECONDS_PER_YEAR:.3e} yr, "
+          f"PHASE1_T_CENTER_HALT={config.PHASE1_T_CENTER_HALT:.1f} K", flush=True)
 
     if snapshot_dir is not None:
         output.save_snapshot(state_prev, 0, snapshot_dir)
@@ -117,7 +121,26 @@ def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
     dt_used = dt
     for step in range(1, n_steps + 1):
         state_before_step = state
-        state = bvp_solver.solve_timestep(state, dt_used)
+
+        # Step-retry (2026-08-12, Phase 1 pivot - PROGRESS.md has the full report): a failed
+        # solve_timestep is retried with a shrunken dt (config.STEP_RETRY_SHRINK_FACTOR) up to
+        # config.STEP_RETRY_MAX_ATTEMPTS times before giving up - standard adaptive-integrator
+        # step-rejection practice. dt_used is updated to whatever dt actually succeeded, so the
+        # NEXT step's growth-capped selection grows from the successful value, not the
+        # originally-proposed (failed) one.
+        dt_attempt = dt_used
+        for retry in range(config.STEP_RETRY_MAX_ATTEMPTS + 1):
+            try:
+                state = bvp_solver.solve_timestep(state_before_step, dt_attempt)
+                dt_used = dt_attempt
+                break
+            except RuntimeError as exc:
+                if retry == config.STEP_RETRY_MAX_ATTEMPTS:
+                    raise
+                dt_attempt *= config.STEP_RETRY_SHRINK_FACTOR
+                print(f"time_stepper.run: step {step} failed at dt={dt_attempt / config.STEP_RETRY_SHRINK_FACTOR / config.SECONDS_PER_YEAR:.4e} yr "
+                      f"({exc}) - retrying at dt={dt_attempt / config.SECONDS_PER_YEAR:.4e} yr "
+                      f"(attempt {retry + 1}/{config.STEP_RETRY_MAX_ATTEMPTS}) ...", flush=True)
 
         r_surface = state.r[-1]
         T_center = state.T[0]
@@ -141,7 +164,8 @@ def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
 
         halted_radius = r_surface <= config.R_HALT
         halted_time = state.t >= config.T_MAX_S
-        halted = halted_radius or halted_time
+        halted_T_center = T_center >= config.PHASE1_T_CENTER_HALT
+        halted = halted_radius or halted_time or halted_T_center
 
         if halted or step % snapshot_interval == 0:
             history.append(state)
@@ -149,10 +173,12 @@ def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
                 output.save_snapshot(state, step, snapshot_dir)
 
         if halted:
-            reason = "R_HALT reached" if halted_radius else "t_max (diagnostic time budget) reached"
+            reason = ("R_HALT reached" if halted_radius
+                      else "t_max (diagnostic time budget) reached" if halted_time
+                      else "PHASE1_T_CENTER_HALT reached (H2-dissociation onset)")
             print(f"time_stepper.run: {reason} (r_surface="
-                  f"{r_surface / config.R_JUPITER_CM:.4f} R_Jup, t={t_yr:.4e} yr) at step "
-                  f"{step} - halting", flush=True)
+                  f"{r_surface / config.R_JUPITER_CM:.4f} R_Jup, T_center={T_center:.4e} K, "
+                  f"t={t_yr:.4e} yr) at step {step} - halting", flush=True)
             break
 
         if config.USE_ADAPTIVE_DT:

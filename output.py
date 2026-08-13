@@ -22,6 +22,23 @@ import state
 SNAPSHOT_DIR = "snapshots"   # relative to wherever the run is launched from, matching diagnostics.PLOT_DIR's own convention
 
 # ==========================================
+# SECTION: Per-Run Output Directory Convention
+# ==========================================
+
+def run_output_dirs(run_name):
+    """(snapshot_dir, plot_dir) for a named production run.
+
+    HOUSEKEEPING 2026-08-10: named runs' plots now NEST under diagnostics.PLOT_DIR as
+    diagnostic_plots/run_<run_name>/, instead of sitting as a sibling diagnostic_plots_
+    <run_name>/ directory in the project root - the earlier overnight/10gyr runs did the
+    latter and cluttered the root. Snapshot directories keep their existing flat
+    snapshots_<run_name>/ convention unchanged (not part of this cleanup - a much smaller
+    number of directories, one per run, not one PNG per snapshot/profile/check).
+    """
+    return f"snapshots_{run_name}", f"{diagnostics.PLOT_DIR}/run_{run_name}"
+
+
+# ==========================================
 # SECTION: Snapshot I/O (.npz)
 # ==========================================
 

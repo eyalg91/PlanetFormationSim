@@ -3,6 +3,7 @@
 # (CLAUDE.md Architecture Rules).
 
 import numpy as np
+from scipy.special import expit
 
 import config
 
@@ -81,7 +82,7 @@ def density(P, T, mu, mu_e):
 # SECTION: Energy-Equation Thermodynamic Coefficient
 # ==========================================
 
-def thermodynamic_delta(rho, T, mu, mu_e):
+def thermodynamic_delta(rho, T, mu, mu_e, d_inv_mu_dT=0.0):
     """delta = -(d ln rho / d ln T)_P for the combined ideal+degenerate EOS (Kippenhahn &
     Weigert eq. 4.26's energy-equation coefficient: dL/dm = -c_p*dT/dt + (delta/rho)*dP/dt).
 
@@ -99,13 +100,21 @@ def thermodynamic_delta(rho, T, mu, mu_e):
     Limiting-case check: delta -> 1 exactly as P_deg -> 0 (pure ideal gas, dP_ideal_drho/D ->
     1); delta -> 0 as P_deg dominates (fully degenerate limit - degenerate pressure is
     ~T-independent, so density stops responding to T at fixed P, exactly as expected).
+
+    EXTENDED (Sub-task 8b): d_inv_mu_dT = d(1/mu)/dT accounts for mu ITSELF varying with T
+    (the H<->H2 recombination transition, mean_molecular_weight_inv_derivative below) via the
+    same implicit-differentiation method - differentiating P=P_ideal(rho,T,mu(T))+P_deg(rho)
+    with mu(T) now T-dependent (chain rule) adds a rho*K_B*T^2*d(1/mu)/dT/M_H term to the
+    numerator (same M_H as dP_ideal_drho below - P_ideal=rho*K_B*T/(mu*M_H) throughout).
+    Reduces EXACTLY to the original formula when d_inv_mu_dT=0 (mu held fixed), preserving
+    every existing caller's behavior unchanged (default value).
     """
     dP_ideal_drho = config.K_B * T / (mu * config.M_H)
     P_ideal = rho * dP_ideal_drho
     P_deg = degenerate_pressure(rho, mu_e)
     dP_deg_drho = (5.0 / 3.0) * P_deg / rho
     D = dP_ideal_drho + dP_deg_drho
-    return P_ideal / (rho * D)
+    return (P_ideal + rho * config.K_B * T**2 * d_inv_mu_dT / config.M_H) / (rho * D)
 
 
 # ==========================================
@@ -121,5 +130,101 @@ def specific_heat_cp(gamma, mu):
 def grad_adiabatic(gamma):
     """Adiabatic temperature gradient (dlnT/dlnP at constant entropy) for an ideal gas."""
     # nabla_ad = (gamma - 1) / gamma  [dimensionless]
-    # ASSUMPTION: constant gamma ideal gas — invalid once H2 dissociation begins to lower gamma_eff
+    # ASSUMPTION: constant gamma ideal gas within a single call - callers needing the
+    # H2-dissociation-softened gamma_eff(T) (Sub-task 8b, RESOLVED 2026-08-10) pass
+    # gamma_effective(T) here explicitly rather than the old fixed config.GAMMA.
     return (gamma - 1.0) / gamma
+
+
+# ==========================================
+# SECTION: H<->H2 Recombination Equilibrium (Sub-task 8b)
+# ==========================================
+# JUSTIFIED 2026-08-10 by validation.check_outer_envelope_recombination_sensitivity (Check 38:
+# Delta r_surface=-3.1% from a static mu(T) proxy, ~5x its own control floor). Also the shared
+# physical mechanism expected to end Phase 1 (First Core collapse) once T_center approaches
+# ~2000K and Gamma_1 softens below 4/3 (PROGRESS.md/PLAN.md 2026-08-10 have the full
+# derivation) - built once, generally in T, not as a Phase-3-only patch.
+#
+# ASSUMPTION: T-only (no rho dependence) - a real H2 dissociation equilibrium constant depends
+# on density too; this proxy is validated only against Phase 3's outer-envelope density regime
+# (Check 38) and must be re-checked before being trusted as Phase 1's core collapse trigger.
+
+def molecular_fraction(T):
+    """chi(T): molecular H2 fraction (1=fully molecular/cold, 0=fully atomic/hot), a smooth
+    logistic proxy for the true density-dependent H/H2 mass-action equilibrium - see this
+    section's own ASSUMPTION above. Deliberately WIDE (config.T_H2_TRANSITION_WIDTH=180K), not
+    sharp, per this project's own hard-won lesson from GRAD_EFF_SWITCH_EPSILON (a narrow
+    transition risks reintroducing exactly the solver stiffness that smoothing was meant to
+    avoid there).
+
+    Uses scipy.special.expit (a numerically stable sigmoid, avoiding np.exp overflow at large
+    positive arguments - encountered directly during validation.py's Check 17/19 edge-case
+    sweeps, which probe T far outside this project's physical range) rather than a bare
+    1/(1+exp(x)): chi(T) = expit(-(T-T_MID)/WIDTH), mathematically identical, ->0 or ->1
+    cleanly at either extreme instead of via an intermediate inf.
+    """
+    return expit(-(T - config.T_H2_TRANSITION_MID) / config.T_H2_TRANSITION_WIDTH)
+
+
+def molecular_fraction_derivative(T):
+    """d(chi)/dT [K^-1] - analytic logistic derivative (standard identity: d(sigmoid)/dx =
+    -sigmoid*(1-sigmoid)/width for this sign convention). Feeds mean_molecular_weight_inv_
+    derivative (thermodynamic_delta's mu(T) correction) and latent_heat_capacity (the energy
+    equation's extra effective heat capacity) below."""
+    chi = molecular_fraction(T)
+    return -chi * (1.0 - chi) / config.T_H2_TRANSITION_WIDTH
+
+
+def mean_molecular_weight(T):
+    """mu(T): mean molecular weight, interpolated LINEARLY IN 1/mu (exact for a two-state
+    H/H2 + atomic He mixture - 1/mu = X*(1+f_atomic)/2 + Y/4, PROGRESS.md 2026-08-10 has the
+    derivation) between the atomic limit config.MU (T->high, chi->0) and the molecular limit
+    (T->low, chi->1). Reduces EXACTLY to config.MU as T->high, matching every existing call
+    site's previous hardcoded behavior in that hot limit.
+
+    config.USE_H2_RECOMBINATION_PHYSICS=False falls back to the constant config.MU everywhere -
+    an internal escape hatch for bvp_solver.relax_initial_state's two-stage warm-start, not a
+    user-facing physics option (config.py's own comment has the full reasoning).
+    """
+    if not config.USE_H2_RECOMBINATION_PHYSICS:
+        return np.full_like(np.asarray(T, dtype=float), config.MU)
+    chi = molecular_fraction(T)
+    inv_mu = 1.0 / config.MU - (config.X_HYDROGEN / 2.0) * chi
+    return 1.0 / inv_mu
+
+
+def mean_molecular_weight_inv_derivative(T):
+    """d(1/mu)/dT [K^-1] - feeds thermodynamic_delta's implicit-differentiation correction
+    when mu=mu(T) (Sub-task 8b). 1/mu is LINEAR in chi(T) (mean_molecular_weight's own
+    derivation), so this is a simple chain-rule multiply, not a fresh derivation."""
+    return -(config.X_HYDROGEN / 2.0) * molecular_fraction_derivative(T)
+
+
+def gamma_effective(T):
+    """gamma_eff(T): adiabatic index, interpolated with the SAME chi(T) as mean_molecular_
+    weight between the atomic (monatomic, config.GAMMA=5/3) and molecular (diatomic,
+    config.GAMMA_MOLECULAR=7/5) limits - one shared transition function for both, not two
+    independently-tuned ones. Reduces EXACTLY to config.GAMMA as T->high.
+
+    config.USE_H2_RECOMBINATION_PHYSICS=False falls back to the constant config.GAMMA
+    everywhere - see mean_molecular_weight's own docstring for the full reasoning.
+    """
+    if not config.USE_H2_RECOMBINATION_PHYSICS:
+        return np.full_like(np.asarray(T, dtype=float), config.GAMMA)
+    chi = molecular_fraction(T)
+    return config.GAMMA + (config.GAMMA_MOLECULAR - config.GAMMA) * chi
+
+
+def latent_heat_capacity(T):
+    """Extra effective specific heat [erg g^-1 K^-1] from H2 recombination/dissociation
+    latent heat, to be ADDED to specific_heat_cp(gamma_effective(T), mean_molecular_weight(T))
+    in the energy equation - NOT a standalone c_p replacement.
+
+    u_chem(chi) = -chi*EPSILON_D_H2 [erg/g] (molecular bonds are the LOWER-energy state, atomic
+    chi=0 is the zero reference): d(u_chem)/dT = -EPSILON_D_H2*d(chi)/dT. As T rises, chi falls
+    (dissociating, endothermic), so this term is POSITIVE - heating drives dissociation, which
+    absorbs extra energy beyond simple translational heating (quantified in config.py's
+    EPSILON_D_H2 comment: 3-16x the local thermal energy content across T=1000-5000K - the
+    DOMINANT term in c_p_eff, not a minor correction).
+    """
+    return -config.EPSILON_D_H2 * molecular_fraction_derivative(T)

@@ -3,8 +3,12 @@
 # and testing logic lives here, never inside operational physics or solver
 # modules (odes.py, bvp_solver.py, time_stepper.py, etc.).
 
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.interpolate import PchipInterpolator
 from scipy.optimize import brentq
 
 import boundary_conditions
@@ -15,6 +19,7 @@ import eos
 import gradients
 import odes
 import opacity
+import output
 import state
 import time_stepper
 
@@ -1230,6 +1235,22 @@ def check_bvp_jacobian_matches_finite_differences() -> None:
     rng = np.random.default_rng(0)
     test_idx = rng.choice(len(x), size=min(config.JACOBIAN_VERIFY_N_POINTS, len(x)), replace=False)
 
+    # EXTENDED (Sub-task 8b, 2026-08-10): explicitly force coverage of the H<->H2 transition
+    # window (config.T_H2_TRANSITION_MID +/- a few WIDTHs) rather than trusting the random
+    # sample above to land there by chance - it's a small fraction of the mesh (T=2000-3000K
+    # spans ~4% of state_0's ~2000 points), and this is exactly where the NEW Jacobian terms
+    # (d(grad_ad)/dT, d(c_p_eff)/dT, the mu(T) correction to drho/dT and delta) are active; a
+    # bug in any of them could pass silently if never actually exercised by this check.
+    _r_pts, _lnP_pts, _L_pts, lnT_pts = bvp_solver._to_physical(z_guess)
+    T_pts = np.exp(lnT_pts)
+    in_transition = np.where(np.abs(T_pts - config.T_H2_TRANSITION_MID) < 3.0 * config.T_H2_TRANSITION_WIDTH)[0]
+    assert in_transition.size > 0, (
+        "Check 37: state_0's mesh does not cross the H<->H2 transition window at all - "
+        "cannot verify the Sub-task 8b Jacobian terms without at least one such point"
+    )
+    transition_idx = rng.choice(in_transition, size=min(5, in_transition.size), replace=False)
+    test_idx = np.unique(np.concatenate([test_idx, transition_idx]))
+
     def fun_single(x_pt, z_pt):
         return bvp_solver.implicit_rhs_scaled(np.array([x_pt]), z_pt.reshape(4, 1), state_0, dt, 1.0)[:, 0]
 
@@ -1250,6 +1271,41 @@ def check_bvp_jacobian_matches_finite_differences() -> None:
         rel_err = np.abs(J_analytic - J_fd) / row_scale[:, np.newaxis]
         max_rel_err_fun = max(max_rel_err_fun, np.max(rel_err))
     print(f"  max row-normalized relative error (fun_jac, {len(test_idx)} points) = {max_rel_err_fun:.4e}")
+
+    # EXTENDED (2026-08-11, soft-clamp course correction): explicitly force coverage of the
+    # _safe_exp_state saturation region - the real converged mesh above never goes anywhere
+    # near config.LN_P_CLAMP/LN_T_MIN/LN_T_MAX by construction (that's the whole point of the
+    # clamp), so it can never exercise implicit_rhs_jacobian/make_bc_jacobian_scaled's
+    # dP_dlnP/dT_dlnT terms - exactly the region where the OLD hard clamp's Jacobian went
+    # silently wrong (PROGRESS.md has the full report). Synthetic z vectors, lnP/lnT
+    # deliberately displaced 0.3 natural-log units past each saturation boundary - firmly
+    # inside the transition itself (not deep in the flat plateau, where a plain FD probe loses
+    # precision - validation.py Check 40b found and characterized that floor directly).
+    z_template = z_guess[:, len(x) // 2].copy()
+    x_mid = x[len(x) // 2]
+    saturation_offsets = [
+        (1, config.LN_P_CLAMP + 0.3),     # lnP just past the upper bound
+        (1, -config.LN_P_CLAMP - 0.3),    # lnP just past the lower bound
+        (3, config.LN_T_MAX + 0.3),       # lnT just past the upper bound
+        (3, config.LN_T_MIN - 0.3),       # lnT just past the lower bound
+    ]
+    max_rel_err_saturation = 0.0
+    for j_component, value in saturation_offsets:
+        z_sat = z_template.copy()
+        z_sat[j_component] = value
+        J_analytic = bvp_solver.implicit_rhs_jacobian_scaled(np.array([x_mid]), z_sat.reshape(4, 1), state_0, dt, 1.0)[:, :, 0]
+        J_fd = np.zeros((4, 4))
+        for j in range(4):
+            step = config.JACOBIAN_VERIFY_REL_STEP * max(abs(z_sat[j]), 1.0)
+            z_plus, z_minus = z_sat.copy(), z_sat.copy()
+            z_plus[j] += step
+            z_minus[j] -= step
+            J_fd[:, j] = (fun_single(x_mid, z_plus) - fun_single(x_mid, z_minus)) / (2.0 * step)
+        row_scale = np.maximum(np.max(np.abs(J_analytic), axis=1), np.max(np.abs(J_fd), axis=1))
+        row_scale = np.maximum(row_scale, 1.0e-30)
+        rel_err = np.abs(J_analytic - J_fd) / row_scale[:, np.newaxis]
+        max_rel_err_saturation = max(max_rel_err_saturation, np.max(rel_err))
+    print(f"  max row-normalized relative error (fun_jac, saturation region, {len(saturation_offsets)} synthetic points) = {max_rel_err_saturation:.4e}")
 
     m_min = config.M_MIN_FRACTION * config.M_TOTAL
     bc = bvp_solver.make_bc_scaled(m_min)
@@ -1276,12 +1332,463 @@ def check_bvp_jacobian_matches_finite_differences() -> None:
                           np.max(np.abs(dbc_dzb_analytic - dbc_dzb_fd) / row_scale_b[:, np.newaxis]))
     print(f"  max row-normalized relative error (bc_jac) = {max_rel_err_bc:.4e}")
 
+    # bc_jac saturation coverage - same idea, applied to the two boundary points (za's T_a,
+    # zb's P_b - the two channels make_bc_jacobian_scaled actually differentiates through the
+    # clamp for, per its own docstring).
+    za_sat = z_a.copy()
+    za_sat[3] = config.LN_T_MIN - 0.3      # T_a pushed just past its lower saturation bound
+    zb_sat = z_b.copy()
+    zb_sat[1] = config.LN_P_CLAMP + 0.3    # P_b pushed just past its upper saturation bound
+    dbc_dza_sat_analytic, _ = bc_jac(za_sat, z_b)
+    _, dbc_dzb_sat_analytic = bc_jac(z_a, zb_sat)
+    dbc_dza_sat_fd, dbc_dzb_sat_fd = np.zeros((4, 4)), np.zeros((4, 4))
+    for j in range(4):
+        step = config.JACOBIAN_VERIFY_REL_STEP * max(abs(za_sat[j]), 1.0)
+        za_plus, za_minus = za_sat.copy(), za_sat.copy()
+        za_plus[j] += step
+        za_minus[j] -= step
+        dbc_dza_sat_fd[:, j] = (np.asarray(bc(za_plus, z_b)) - np.asarray(bc(za_minus, z_b))) / (2.0 * step)
+        step = config.JACOBIAN_VERIFY_REL_STEP * max(abs(zb_sat[j]), 1.0)
+        zb_plus, zb_minus = zb_sat.copy(), zb_sat.copy()
+        zb_plus[j] += step
+        zb_minus[j] -= step
+        dbc_dzb_sat_fd[:, j] = (np.asarray(bc(z_a, zb_plus)) - np.asarray(bc(z_a, zb_minus))) / (2.0 * step)
+    row_scale_za_sat = np.maximum(np.max(np.abs(dbc_dza_sat_analytic), axis=1), np.max(np.abs(dbc_dza_sat_fd), axis=1))
+    row_scale_za_sat = np.maximum(row_scale_za_sat, 1.0e-30)
+    row_scale_zb_sat = np.maximum(np.max(np.abs(dbc_dzb_sat_analytic), axis=1), np.max(np.abs(dbc_dzb_sat_fd), axis=1))
+    row_scale_zb_sat = np.maximum(row_scale_zb_sat, 1.0e-30)
+    max_rel_err_bc_saturation = max(
+        np.max(np.abs(dbc_dza_sat_analytic - dbc_dza_sat_fd) / row_scale_za_sat[:, np.newaxis]),
+        np.max(np.abs(dbc_dzb_sat_analytic - dbc_dzb_sat_fd) / row_scale_zb_sat[:, np.newaxis]),
+    )
+    print(f"  max row-normalized relative error (bc_jac, saturation region) = {max_rel_err_bc_saturation:.4e}")
+
     assert max_rel_err_fun < config.JACOBIAN_VERIFY_TOL, (
         f"bvp_solver fun_jac disagrees with finite differences ({max_rel_err_fun:.3e} >= "
         f"config.JACOBIAN_VERIFY_TOL={config.JACOBIAN_VERIFY_TOL:.1e})")
     assert max_rel_err_bc < config.JACOBIAN_VERIFY_TOL, (
         f"bvp_solver bc_jac disagrees with finite differences ({max_rel_err_bc:.3e} >= "
         f"config.JACOBIAN_VERIFY_TOL={config.JACOBIAN_VERIFY_TOL:.1e})")
+    assert max_rel_err_saturation < config.JACOBIAN_VERIFY_TOL, (
+        f"bvp_solver fun_jac disagrees with finite differences in the soft-clamp saturation "
+        f"region ({max_rel_err_saturation:.3e} >= config.JACOBIAN_VERIFY_TOL={config.JACOBIAN_VERIFY_TOL:.1e})")
+    assert max_rel_err_bc_saturation < config.JACOBIAN_VERIFY_TOL, (
+        f"bvp_solver bc_jac disagrees with finite differences in the soft-clamp saturation "
+        f"region ({max_rel_err_bc_saturation:.3e} >= config.JACOBIAN_VERIFY_TOL={config.JACOBIAN_VERIFY_TOL:.1e})")
+
+
+# ==========================================
+# SECTION: Outer-Envelope H/H2 Recombination Sensitivity (rescoped Sub-task 8b)
+# ==========================================
+# Sterile diagnostic (CLAUDE.md "sterile before wet"): does letting mu rise back toward the
+# molecular value in the cooling outer envelope (T < ~3000 K) move r_surface by enough to
+# justify implementing the real, latent-heat-consistent recombination physics in eos.py/
+# odes.py? Uses a CACHED, already-converged state (the 10 Gyr production run's final
+# snapshot) - no new physics wired into any operational module, no re-solve of relax_
+# initial_state/solve_bvp. PROGRESS.md 2026-08-10 has the full physical motivation:
+# config.MU is already the ATOMIC value (corrected 2026-08-07, confirmed appropriate in the
+# hot interior), and the newly-identified gap is the OPPOSITE direction, in the cool outer
+# layers where H should be recombining back into H2 as the envelope cools over Gyr timescales.
+
+_RECOMBINATION_CHECK_SNAPSHOT = "snapshots_10gyr/snapshot_00055.npz"   # t=10.02 Gyr, the most evolved (coolest, most affected) state on disk
+
+
+def _mu_proxy_atomic_molecular(T):
+    """Provisional logistic proxy mu(T) for the atomic<->molecular H recombination
+    transition - NOT the production EOS (a real fix would be a two-state H/H2 mass-action
+    equilibrium, density-dependent, with a matching latent-heat term in the energy equation -
+    deferred pending this check's result). Used only by the sensitivity check below.
+
+    Interpolates 1/mu LINEARLY in atomic fraction f(T) - exact for a two-state H/H2 + atomic
+    He mixture: 1/mu = X*(1+f)/2 + Y/4, f=0 (T low) fully molecular, f=1 (T high) fully
+    atomic. Both limits anchored to config.py's own values, not independent literals: the
+    atomic limit reduces EXACTLY to config.MU, and X is backed out of config.MU_E's own
+    mu_e=2/(1+X) definition (self-consistency check: this gives mu_atomic~1.279 via X,Y
+    directly, matching config.MU=1.278 to 3 decimals - confirms the two constants share a
+    common X).
+
+    f(T) = logistic(T; T_MID=2500 K, WIDTH=180 K) - deliberately WIDE, not sharp, per this
+    project's own hard-won lesson from GRAD_EFF_SWITCH_EPSILON (a narrow transition risks
+    reintroducing exactly the solver stiffness that smoothing was meant to avoid there). Puts
+    T=2000 K at f~0.06 and T=3000 K at f~0.94, bracketing PROGRESS.md's target range.
+    """
+    T_MID = 2500.0   # Logistic transition midpoint [K] - between molecular and atomic H
+    WIDTH = 180.0     # Logistic width [K] - wide by design, see docstring
+    f_atomic = 1.0 / (1.0 + np.exp(-(T - T_MID) / WIDTH))   # 0=molecular, 1=atomic [dimensionless]
+
+    inv_mu_atomic = 1.0 / config.MU
+    X = 2.0 / config.MU_E - 1.0   # Hydrogen mass fraction, inverting config.MU_E's mu_e=2/(1+X)
+    inv_mu_molecular = inv_mu_atomic - X / 2.0   # H2 pairing halves H's particle count at fixed mass
+
+    inv_mu = inv_mu_molecular + (inv_mu_atomic - inv_mu_molecular) * f_atomic
+    return 1.0 / inv_mu
+
+
+def _reintegrate_radius(m, rho, r_inner):
+    """Re-integrate dr/dm = 1/(4*pi*r^2*rho) [odes.py's continuity equation] from r_inner via
+    a monotone cubic (PCHIP) interpolant of rho(m) - a completely independent numerical
+    method from the adaptive BVP mesh that produced the cached profile, used here only to
+    measure how r_surface RESPONDS to a perturbed rho(m), not to re-derive it from scratch.
+    """
+    rho_interp = PchipInterpolator(m, rho)
+
+    def dr_dm(m_val, r_val):
+        return 1.0 / (4.0 * np.pi * r_val**2 * rho_interp(m_val))
+
+    sol = solve_ivp(dr_dm, [m[0], m[-1]], [r_inner], t_eval=m, method="RK45", rtol=1.0e-10, atol=1.0e-2)
+    assert sol.success, f"outer-envelope sensitivity check: re-integration failed - {sol.message}"
+    return sol.y[0]
+
+
+def check_outer_envelope_recombination_sensitivity() -> None:
+    """Sensitivity test (NOT a pass/fail correctness check - PROGRESS.md 2026-08-10 has the
+    full physical motivation): quantifies how much r_surface would shift if the cool outer
+    envelope (T < ~3000 K) had the physically-correct, partly-molecular mu instead of the
+    constant atomic config.MU used everywhere in odes.py today - the cheapest possible test
+    of whether the missing H/H2 recombination physics is worth implementing for real.
+
+    Method: load the 10 Gyr production run's final snapshot (already self-consistently
+    converged under constant atomic mu). Re-evaluate rho at the SAME (P, T) via eos.density
+    with the proxy mu(T) instead of config.MU, then re-integrate r(m) via the same continuity
+    equation odes.py uses, holding P(m), T(m) fixed - isolating the EOS/pressure-support
+    effect without touching the energy equation or re-solving the coupled BVP.
+
+    A CONTROL run (re-integrating with the ORIGINAL rho, same method/tolerances) is used as
+    the baseline instead of the raw cached r_surface, so the comparison cancels out the
+    method's own discretization error: the saved snapshot is a config.N_GRID_POINTS=200
+    resample of solve_bvp's actual ~4900-node adaptive mesh, and PCHIP reproduces the cached
+    profile to ~1e-5 relative accuracy everywhere except the single outermost boundary
+    segment (the output grid's fixed endpoint spacing is coarser than its geometrically-
+    refined neighbors there) - a real, understood resolution artifact, not a bug, and exactly
+    why this differenced comparison is used instead of a raw before/after diff against the
+    cached r_surface directly.
+    """
+    s, _is_convective = output.load_snapshot(_RECOMBINATION_CHECK_SNAPSHOT)
+
+    mu_new = _mu_proxy_atomic_molecular(s.T)
+    rho_new = eos.density(s.P, s.T, mu_new, config.MU_E)
+
+    r_control = _reintegrate_radius(s.m, s.rho, s.r[0])      # same method, ORIGINAL rho - isolates method error
+    r_perturbed = _reintegrate_radius(s.m, rho_new, s.r[0])  # same method, NEW rho - the actual test
+
+    r_surface_control = r_control[-1]
+    r_surface_perturbed = r_perturbed[-1]
+    delta_r = r_surface_perturbed - r_surface_control
+    delta_r_pct = delta_r / r_surface_control * 100.0
+
+    control_floor_pct = abs(r_surface_control - s.r[-1]) / s.r[-1] * 100.0
+
+    x = s.m / config.M_TOTAL
+    outer = x > 0.90   # Focus region: where T < ~3000 K and mu_new meaningfully departs from config.MU
+    mu_shift_max = (mu_new[outer] / config.MU).max()
+
+    print("Check 38 - Outer-envelope H/H2 recombination sensitivity (mu proxy, cached 10 Gyr state)")
+    print(f"  snapshot: t=10.02 Gyr, r_surface (cached)   = {s.r[-1] / config.R_JUPITER_CM:.6f} R_Jup")
+    print(f"  re-integration control floor (method error) = {control_floor_pct:.4f}% of r_surface")
+    print(f"  max mu_new/config.MU in outer region (m/M_tot>0.9) = {mu_shift_max:.3f}x")
+    print(f"  r_surface: control = {r_surface_control / config.R_JUPITER_CM:.6f} R_Jup, "
+          f"perturbed = {r_surface_perturbed / config.R_JUPITER_CM:.6f} R_Jup")
+    print(f"  Delta r_surface = {delta_r / config.R_JUPITER_CM:+.6f} R_Jup ({delta_r_pct:+.4f}%)")
+
+    if abs(delta_r_pct) >= 1.0:
+        verdict = "SIGNIFICANT (>=1% of r_surface, well above the control floor) - worth implementing the real physics"
+    elif abs(delta_r_pct) >= 3.0 * control_floor_pct:
+        verdict = "MARGINAL - above the method's own noise floor but below the 1% action threshold - worth a closer look"
+    else:
+        verdict = "NEGLIGIBLE (within ~3x the control floor) - not a priority right now"
+    print(f"  Verdict: {verdict}")
+
+    assert control_floor_pct < 2.0, (
+        "re-integration method error unexpectedly large - check the PCHIP/solve_ivp setup "
+        "before trusting Delta r_surface"
+    )
+
+
+# ==========================================
+# SECTION: Visual Check — Outer-Envelope Recombination Sensitivity
+# ==========================================
+
+def plot_outer_envelope_recombination_sensitivity(
+    output_path=f"{diagnostics.PLOT_DIR}/outer_envelope_recombination_sensitivity.png",
+) -> None:
+    """Visualize the mu(T) proxy, the resulting rho perturbation, and the r(m) shift it
+    produces - focused on the outer ~10% of mass (m/M_TOTAL>0.9) where the effect
+    concentrates (CLAUDE.md: a visible check over a print-only one, for a diagnostic that
+    naturally has a profile to look at)."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    s, _is_convective = output.load_snapshot(_RECOMBINATION_CHECK_SNAPSHOT)
+
+    mu_new = _mu_proxy_atomic_molecular(s.T)
+    rho_new = eos.density(s.P, s.T, mu_new, config.MU_E)
+    r_control = _reintegrate_radius(s.m, s.rho, s.r[0])
+    r_perturbed = _reintegrate_radius(s.m, rho_new, s.r[0])
+
+    x = s.m / config.M_TOTAL
+    outer = x > 0.90
+
+    fig, axes = plt.subplots(3, 1, figsize=(7, 9), sharex=True)
+
+    axes[0].plot(x[outer], mu_new[outer], label="mu(T) proxy")
+    axes[0].axhline(config.MU, color="k", linestyle="--", label="config.MU (constant, current)")
+    axes[0].set_ylabel("mu [dimensionless]")
+    axes[0].legend()
+    axes[0].set_title("Outer-envelope H/H2 recombination sensitivity (t=10.02 Gyr cached state)")
+
+    axes[1].plot(x[outer], rho_new[outer] / s.rho[outer])
+    axes[1].axhline(1.0, color="k", linestyle="--", linewidth=0.8)
+    axes[1].set_ylabel("rho_new / rho_old")
+
+    axes[2].plot(x[outer], (r_perturbed[outer] - r_control[outer]) / config.R_JUPITER_CM)
+    axes[2].axhline(0.0, color="k", linestyle="--", linewidth=0.8)
+    axes[2].set_ylabel("r_perturbed - r_control [R_Jup]")
+    axes[2].set_xlabel("m / M_TOTAL")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved outer-envelope recombination sensitivity plot to {output_path}")
+
+
+# ==========================================
+# SECTION: Bell & Lin Opacity Smoothing (RESOLVED 2026-08-11)
+# ==========================================
+# kappa(rho,T) is continuous at regime boundaries by construction, but d(kappa)/dT is not -
+# flagged as the leading unconfirmed suspect for a "third wall" back in the shooting-method
+# era (2026-08-06, PLAN_BVP.md) and never resolved; directly confirmed 2026-08-11 as the cause
+# of a real solve_timestep mesh explosion (>1300x node-density concentration within 1e-5 of
+# the Metal grains<->Ice grain evaporation<->Ice grains boundaries - PROGRESS.md has the full
+# diagnostic trail). opacity.bell_lin_opacity_smooth (config.OPACITY_SMOOTH_TRANSITIONS)
+# replaces the hard np.where dispatch with a smooth partition-of-unity blend.
+
+def check_opacity_smooth_transitions_match_hard_switch_away_from_boundaries() -> None:
+    """Confirm bell_lin_opacity_smooth agrees with the hard-switch bell_lin_opacity far from
+    any regime transition (tight tolerance - smoothing should touch nothing there), and
+    remains close (loose tolerance) even at a transition's own center - by construction, NOT
+    an assertion of correctness for the blend itself (Check 39b's plot is the visible check
+    for the blend's shape)."""
+    # T chosen per-density to sit comfortably (>10x the smoothing width) between that
+    # density's OWN transition temperatures (opacity.transition_temperature depends on rho,
+    # so a T "far from transitions" at one density can land close to a shifted transition at
+    # another - verified explicitly, not assumed, after an earlier version of this test picked
+    # T=5000K at rho=1e-6 and landed only ~3.5% from that density's Molecules<->H- boundary).
+    rho = np.array([1e-10, 1e-6, 4e-3, 4e-3, 0.01, 1.0])
+    T = np.array([100.0, 3000.0, 5000.0, 1858.6, 20000.0, 50000.0])   # T[3] deliberately AT the Metal grain evaporation regime's own center
+
+    config.OPACITY_SMOOTH_TRANSITIONS = True
+    kappa_smooth = opacity.bell_lin_opacity(rho, T)
+    config.OPACITY_SMOOTH_TRANSITIONS = False
+    kappa_hard = opacity.bell_lin_opacity(rho, T)
+    config.OPACITY_SMOOTH_TRANSITIONS = True   # restore - this check runs with smoothing ON as the project default
+
+    rel_err = np.abs(kappa_smooth - kappa_hard) / np.abs(kappa_hard)
+    print("Check 39 - Bell & Lin smoothed opacity vs hard switch")
+    print(f"  points away from any transition: rel_err = {rel_err[[0,1,2,4,5]].max():.3e} (expect << 1)")
+    print(f"  point AT the Metal grain evaporation center (T={T[3]}K): rel_err = {rel_err[3]:.3e} (expect O(1-10%), by construction)")
+
+    weights_sum = opacity._regime_weights(rho, T).sum(axis=-1)
+    print(f"  regime weights sum to 1 at every point: max deviation = {np.abs(weights_sum-1.0).max():.3e}")
+
+    assert rel_err[[0,1,2,4,5]].max() < 1.0e-3, "smoothed opacity disagrees with the hard switch far from any transition - smoothing width may be too wide"
+    assert np.abs(weights_sum - 1.0).max() < 1.0e-10, "regime weights do not sum to 1 - partition-of-unity construction is broken"
+
+
+# ==========================================
+# SECTION: BVP Soft-Clamp (RESOLVED 2026-08-11)
+# ==========================================
+# bvp_solver._safe_exp_state's original hard np.clip on (lnP, lnT) had EXACTLY ZERO
+# derivative once saturated - the reason a wayward Newton trial could never be pulled back,
+# AND the reason implicit_rhs_jacobian/make_bc_jacobian_scaled's chain-rule factors (which
+# multiply by the bare P, T value, implicitly assuming d(exp(lnX))/d(lnX)=1 always) went
+# actively WRONG in the saturated region - directly confirmed as the root cause of a step-4
+# mesh explosion (a center-point trial state collapsing to T_a=P_a=0, r_analytic~rho_c^-1/3
+# diverging to ~4.2e40 cm, with a genuinely singular collocation Jacobian - PROGRESS.md has
+# the full report). bvp_solver._soft_clamp replaces the hard clip with a smooth, strictly
+# monotonic softplus-based saturation (config.BVP_SOFT_CLAMP_WIDTH).
+
+def check_bvp_soft_clamp_reproduces_identity_and_stays_bounded() -> None:
+    """Sterile check of the soft clamp itself, in isolation, before it feeds into any
+    Jacobian: (1) matches raw exp() to float64 precision across this problem's real (lnP,lnT)
+    operating range - confirms the fix distorts no genuine physics; (2) never overflows/goes
+    non-finite/non-positive across the full extreme range _safe_exp_state must survive,
+    including the exact extreme trial values logged during the 2026-08-11 solve_bvp failures;
+    (3) the derivative stays comfortably nonzero far past either boundary, unlike the old hard
+    clamp's immediate zero. An earlier width choice (2.0) FAILED test (1) outright (T
+    distorted 87% near the T_NEB floor, only ~2 widths of margin there) - caught here, not
+    assumed away; config.BVP_SOFT_CLAMP_WIDTH's own comment has the corrected derivation.
+    """
+    rng = np.random.default_rng(0)
+
+    # (1) Real-range identity match. T_NEB=50K (lnT=3.91) is the tightest margin to LN_T_MIN=0
+    # in the whole problem (config.py's own comment) - sampled down to lnT=3.5 (T~33K) to allow
+    # some slack for not-yet-converged trial values without dipping below the physical floor.
+    lnP_real = rng.uniform(-20.0, 35.0, 100_000)
+    lnT_real = rng.uniform(3.5, 14.0, 100_000)
+    P_raw, T_raw = np.exp(lnP_real), np.exp(lnT_real)
+    P_soft, T_soft = bvp_solver._safe_exp_state(lnP_real, lnT_real)
+    rel_err_P = np.max(np.abs(P_soft - P_raw) / P_raw)
+    rel_err_T = np.max(np.abs(T_soft - T_raw) / T_raw)
+
+    # (2) Boundedness across the full extreme range, including logged real failure values.
+    extreme_vals = np.concatenate([
+        rng.uniform(-1.0e8, 1.0e8, 100_000),
+        np.array([2.435e7, -3.528e6, 1.0e300, -1.0e300]),
+    ])
+    P_ext, T_ext = bvp_solver._safe_exp_state(extreme_vals, extreme_vals)
+    n_bad = np.sum(~np.isfinite(P_ext)) + np.sum(~np.isfinite(T_ext))
+    n_nonpos = np.sum(P_ext <= 0) + np.sum(T_ext <= 0)
+
+    # (3) Derivative stays nonzero far past the boundary (old hard clamp: zero at distance 0).
+    lo, hi, w = config.LN_T_MIN, config.LN_T_MAX, config.BVP_SOFT_CLAMP_WIDTH
+    probe = np.linspace(-3000.0, 0.0, 100_001)
+    deriv = bvp_solver._soft_clamp_derivative(probe, lo, hi, w)
+    widths_to_first_zero = np.inf if not np.any(deriv == 0.0) else \
+        (lo - probe[np.argmax(deriv == 0.0)]) / w
+
+    print("Check 40 - BVP soft-clamp: identity match, boundedness, restoring gradient")
+    print(f"  real-range exact match: max rel err P={rel_err_P:.3e}, T={rel_err_T:.3e} (expect << 1e-12)")
+    print(f"  extreme-range sweep ({extreme_vals.size} points): non-finite={n_bad}, non-positive={n_nonpos} (expect 0)")
+    print(f"  derivative reaches exact float64 zero at {widths_to_first_zero:.0f} widths past the boundary (expect >> 1)")
+
+    assert rel_err_P < 1.0e-12, "soft clamp measurably distorts P within the real operating range"
+    assert rel_err_T < 1.0e-12, "soft clamp measurably distorts T within the real operating range"
+    assert n_bad == 0, "soft clamp still allows overflow/NaN in the extreme range"
+    assert n_nonpos == 0, "soft clamp allows P or T <= 0 somewhere (breaks P=exp>0, T=exp>0 invariant)"
+    assert widths_to_first_zero > 100.0, "derivative underflows to exact 0.0 too close to the boundary - BVP_SOFT_CLAMP_WIDTH may be too narrow"
+
+
+def check_bvp_soft_clamp_derivative_matches_finite_differences() -> None:
+    """Cross-checks bvp_solver._soft_clamp_derivative against central finite differences of
+    _soft_clamp itself (well-conditioned - _soft_clamp's own output never leaves O(100) even
+    deep in saturation, unlike exp() of it), and _safe_exp_state_derivatives (the composed
+    dP/d(lnP), dT/d(lnT) the analytic Jacobian actually uses) against finite differences of
+    _safe_exp_state, restricted to within a few widths of the saturation boundary - deeper
+    than that, exp() of the saturated value loses the absolute precision FD needs to resolve
+    (found by direct investigation: ~2 log-units past the boundary already broke this
+    comparison with ~80% spurious error, traced to _soft_clamp's own ~1e-14 absolute
+    precision floor near |lo|~100, not a defect in the derivative - not assumed away).
+    """
+    rng = np.random.default_rng(1)
+    lo, hi, w = -config.LN_P_CLAMP, config.LN_P_CLAMP, config.BVP_SOFT_CLAMP_WIDTH
+
+    x = rng.uniform(-300.0, 300.0, 20_000)
+    h = 1.0e-5
+    fd = (bvp_solver._soft_clamp(x + h, lo, hi, w) - bvp_solver._soft_clamp(x - h, lo, hi, w)) / (2 * h)
+    analytic = bvp_solver._soft_clamp_derivative(x, lo, hi, w)
+    max_abs_err_clamp = np.max(np.abs(fd - analytic))
+
+    lnP_probe = rng.uniform(-100.5, 100.5, 20_000)
+    lnT_probe = rng.uniform(-0.5, 100.5, 20_000)
+    dP_dlnP_analytic, dT_dlnT_analytic = bvp_solver._safe_exp_state_derivatives(lnP_probe, lnT_probe)
+    P_plus, _ = bvp_solver._safe_exp_state(lnP_probe + h, lnT_probe)
+    P_minus, _ = bvp_solver._safe_exp_state(lnP_probe - h, lnT_probe)
+    _, T_plus = bvp_solver._safe_exp_state(lnP_probe, lnT_probe + h)
+    _, T_minus = bvp_solver._safe_exp_state(lnP_probe, lnT_probe - h)
+    dP_dlnP_fd = (P_plus - P_minus) / (2 * h)
+    dT_dlnT_fd = (T_plus - T_minus) / (2 * h)
+    max_rel_err_P = np.max(np.abs(dP_dlnP_analytic - dP_dlnP_fd) / np.maximum(np.abs(dP_dlnP_fd), 1.0e-300))
+    max_rel_err_T = np.max(np.abs(dT_dlnT_analytic - dT_dlnT_fd) / np.maximum(np.abs(dT_dlnT_fd), 1.0e-300))
+
+    print("Check 40b - BVP soft-clamp derivative vs finite differences")
+    print(f"  _soft_clamp_derivative vs FD of _soft_clamp: max abs err = {max_abs_err_clamp:.3e}")
+    print(f"  _safe_exp_state_derivatives vs FD of _safe_exp_state: max rel err dP/dlnP={max_rel_err_P:.3e}, dT/dlnT={max_rel_err_T:.3e}")
+
+    assert max_abs_err_clamp < 1.0e-6, "_soft_clamp_derivative disagrees with finite differences"
+    assert max_rel_err_P < 1.0e-4, "_safe_exp_state_derivatives' P-derivative disagrees with finite differences"
+    assert max_rel_err_T < 1.0e-4, "_safe_exp_state_derivatives' T-derivative disagrees with finite differences"
+
+
+def check_opacity_smooth_derivative_matches_finite_differences() -> None:
+    """Cross-checks opacity.bell_lin_opacity_smooth_derivatives against central finite
+    differences at a handful of representative points - deep inside four different regimes
+    (should reduce close to that regime's own single-power-law derivative) and at the Metal
+    grain evaporation transition center (regime weights genuinely comparable there).
+
+    Needed because bvp_solver._opacity_derivatives previously computed the HARD-switch
+    derivative unconditionally, even when config.OPACITY_SMOOTH_TRANSITIONS=True made the
+    RESIDUAL use the smoothed kappa instead - the same class of Jacobian/residual mismatch as
+    the P/T soft-clamp fix, just narrower in reach (PROGRESS.md has the full report).
+
+    A wide BLIND random (rho,T) sweep was tried FIRST (development-only, not this check) and
+    found large apparent mismatches - traced directly (not assumed) to two distinct FD-
+    methodology artifacts, not math bugs: (1) far from any transition, comparing the FULL
+    composed derivative against FD-of-the-total-sum can bury a correct sub-dominant
+    contribution under a dominant term's own float64 precision floor; (2) at rho below this
+    problem's real ~1e-8 g/cm^3 floor, d(weight)/d(rho) legitimately spans huge dynamic range
+    (confirmed via a direct step-size sweep: FD converges cleanly to the analytic value for
+    h_rel>=1e-5, then diverges from round-off as h shrinks further) - no single fixed FD step
+    resolves it. This check instead uses a small set of well-conditioned points (same
+    philosophy as Check 39's own point selection) with an absolute tolerance scaled to the
+    local kappa itself (np.isclose's combined form) - meaningful because a derivative many
+    orders of magnitude below kappa's own scale cannot matter to any real Jacobian entry,
+    regardless of its FD-measured relative error.
+    """
+    points = [
+        ("Ice grains interior",            1.0e-6, 80.0),      # a=0 (no rho-dependence): dkappa/drho should be ~0
+        ("Metal grains interior",          1.0e-3, 900.0),      # a=0 as well
+        ("Kramers interior",               1.0e-2, 8000.0),
+        ("Electron scattering-ish interior", 1.0,   60000.0),
+        ("Metal grain evaporation center", 4.0e-3, 1858.6),     # regime weights genuinely comparable here
+    ]
+    h_rel = 1.0e-4
+    print("Check 41 - smoothed opacity derivative vs finite differences")
+    all_close = True
+    for name, rho0, T0 in points:
+        rho, T = np.array([rho0]), np.array([T0])
+        h_rho, h_T = h_rel * rho, h_rel * T
+        dkr_fd = (opacity.bell_lin_opacity_smooth(rho + h_rho, T) - opacity.bell_lin_opacity_smooth(rho - h_rho, T)) / (2 * h_rho)
+        dkt_fd = (opacity.bell_lin_opacity_smooth(rho, T + h_T) - opacity.bell_lin_opacity_smooth(rho, T - h_T)) / (2 * h_T)
+        dkr_an, dkt_an = opacity.bell_lin_opacity_smooth_derivatives(rho, T)
+        kappa = opacity.bell_lin_opacity_smooth(rho, T)
+        close_r = np.isclose(dkr_an[0], dkr_fd[0], rtol=1.0e-4, atol=1.0e-6 * kappa[0])
+        close_t = np.isclose(dkt_an[0], dkt_fd[0], rtol=1.0e-4, atol=1.0e-6 * kappa[0])
+        all_close = all_close and close_r and close_t
+        print(f"  {name:38s} kappa={kappa[0]:.3e}  drho match={bool(close_r)}  dT match={bool(close_t)}")
+    assert all_close, "bell_lin_opacity_smooth_derivatives disagrees with finite differences at a representative point"
+
+
+def plot_opacity_hard_vs_smooth_metal_grain_evaporation(
+    output_path=f"{diagnostics.PLOT_DIR}/opacity_hard_vs_smooth_metal_grain_evaporation.png",
+) -> None:
+    """Visible check (CLAUDE.md): kappa(T) and its NUMERICAL derivative d(kappa)/dT, hard vs
+    smooth, zoomed into the Metal grain evaporation window (~1820-1897K at the density probed
+    2026-08-11) - kappa itself looks smooth in BOTH cases (it's continuous by construction
+    either way), so the derivative panel is where the actual fix is visible: a real jump for
+    the hard switch, a smooth curve for the blended version."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    rho_fixed = 4.0e-3   # g/cm^3, matches the density probed in the 2026-08-11 mesh-explosion diagnosis
+    T = np.linspace(1600.0, 2100.0, 2000)
+    rho = np.full_like(T, rho_fixed)
+
+    config.OPACITY_SMOOTH_TRANSITIONS = True
+    kappa_smooth = opacity.bell_lin_opacity(rho, T)
+    config.OPACITY_SMOOTH_TRANSITIONS = False
+    kappa_hard = opacity.bell_lin_opacity(rho, T)
+    config.OPACITY_SMOOTH_TRANSITIONS = True   # restore project default
+
+    dkappa_dT_hard = np.gradient(kappa_hard, T)
+    dkappa_dT_smooth = np.gradient(kappa_smooth, T)
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+
+    axes[0].plot(T, kappa_hard, label="hard switch", color="tab:red", alpha=0.7)
+    axes[0].plot(T, kappa_smooth, label="smoothed", color="tab:blue", linestyle="--")
+    axes[0].axvspan(1820.6, 1896.6, color="gray", alpha=0.15, label="Metal grain evaporation regime")
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("kappa [cm^2 g^-1]")
+    axes[0].legend()
+    axes[0].set_title(f"Bell & Lin opacity, hard vs smooth (rho={rho_fixed:.1e} g/cm^3)")
+
+    axes[1].plot(T, dkappa_dT_hard, label="hard switch (d(kappa)/dT)", color="tab:red", alpha=0.7)
+    axes[1].plot(T, dkappa_dT_smooth, label="smoothed (d(kappa)/dT)", color="tab:blue", linestyle="--")
+    axes[1].axvspan(1820.6, 1896.6, color="gray", alpha=0.15)
+    axes[1].set_ylabel("d(kappa)/dT [cm^2 g^-1 K^-1]")
+    axes[1].set_xlabel("T [K]")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved opacity hard-vs-smooth (Metal grain evaporation) plot to {output_path}")
 
 
 # ==========================================
@@ -1361,4 +1868,11 @@ if __name__ == "__main__":
     plot_mass_reconstruction_error()
     check_finite_difference_time_derivatives_and_interpolation()
     check_bvp_jacobian_matches_finite_differences()
+    check_outer_envelope_recombination_sensitivity()
+    plot_outer_envelope_recombination_sensitivity()
+    check_opacity_smooth_transitions_match_hard_switch_away_from_boundaries()
+    plot_opacity_hard_vs_smooth_metal_grain_evaporation()
+    check_bvp_soft_clamp_reproduces_identity_and_stays_bounded()
+    check_bvp_soft_clamp_derivative_matches_finite_differences()
+    check_opacity_smooth_derivative_matches_finite_differences()
     print("\nAll CGS unit-consistency and Sub-task 1, 2a-2e, 3, 4, 5, 6, 7 checks passed.")

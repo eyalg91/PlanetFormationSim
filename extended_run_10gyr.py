@@ -41,7 +41,7 @@ N_STEPS_MAX = 200   # generous cap - see module docstring; the dual halt conditi
                      # the 1e8 yr ADAPTIVE_DT_MAX ceiling throughout - 200 leaves generous
                      # margin in case dt ever drops back down as the structure evolves further.
 SNAPSHOT_DIR = "snapshots_10gyr"
-PLOT_DIR = "diagnostic_plots_10gyr"
+PLOT_DIR = "diagnostic_plots/run_10gyr"   # HOUSEKEEPING 2026-08-10: moved under diagnostic_plots/ to stop cluttering the project root
 DT_SEED = config.ADAPTIVE_DT_MAX   # matches the last dt actually used to reach step 77 (see module docstring)
 
 

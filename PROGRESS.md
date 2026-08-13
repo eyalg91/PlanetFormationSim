@@ -11,6 +11,106 @@ For the target physics, the full 4-ODE formulation, and the sub-task roadmap, se
 
 ## 1. Current Status
 
+**★★★★★★ 2026-08-12 — Phase 3 PAUSED (PI directive); pivoted to Phase 1 (First Hydrostatic
+Core) - a real, physically clean contraction achieved, ~73% of the T_center target, honest
+open wall remaining.** Phase 3: brief note only, per explicit instruction to keep it short -
+the resumed run's step 2 (original step 5) failed one step past the 2026-08-11 fixes, raw
+pre-clamp `lnP`/`lnT` escaping to `~3.3e15`/`~-7e14`, same "max mesh nodes exceeded" signature,
+a NOT YET diagnosed mechanism (full detail in §5's 2026-08-11 entry's closing note). Not
+chased further; Phase 3 stops here until revisited.
+
+**Phase 1**: a genuine architectural gap was found and fixed (the Lane-Emden seed used to
+bracket `solve_static_structure`'s root-find was hard-coded to the compact/degenerate branch,
+independent of composition - silently gave the WRONG structure, not a crash), plus a real,
+shared, dimensionally-wrong `brentq` tolerance bug (fixed for both phases). Calibrated
+`T_CENTER_INITIAL=645K` for the requested R~500 R_Jup. The resulting run produced 33 real,
+physically clean, monotonic snapshots: **r_surface 500.83 -> 238.75 R_Jup, T_center 654.99 ->
+1560.89 K** (~73% of the way to the `PHASE1_T_CENTER_HALT=1900K` target) before hitting a
+persistent wall that did NOT resolve via either of the two well-motivated levers tried (`dt`
+shrinking down to 28 days; `GRAD_EFF_SWITCH_EPSILON_TIMESTEP` widened to 5-10) - genuinely
+different from the several smaller, transient pockets recovered along the way (which motivated
+a real, general addition: `time_stepper.run` now auto-retries a failed step with a shrinking
+`dt`, standard step-rejection practice). Hermetic isolation from Phase 3 directly verified
+(`config.py`'s own file-level defaults confirmed byte-for-byte unchanged), not just designed
+for. Full account, all numbers, and the honest state of the remaining wall: §5's 2026-08-12
+entry.
+
+---
+
+**★★★★★★★ 2026-08-11 — Solver architecture course correction: soft-clamp replaces the hard
+P/T clamp, its (and the smoothed opacity's) analytic Jacobian fixed, and the ACTUAL Phase 3
+step-4 failure that triggered this whole investigation now converges.** Full trail: §5's
+2026-08-11 "Soft-clamp course correction" entry. Prompted by a PI review: the day's sequence of
+reactive fixes (a hard `np.clip` P/T clamp, then a tiered clamp-on/off + analytic/numerical-
+Jacobian workaround around it) was diagnosed as fighting the solver rather than doing physics.
+Root cause, confirmed by direct code inspection: `_safe_exp_state`'s clamp had EXACTLY ZERO
+derivative once saturated, so `implicit_rhs_jacobian`/`make_bc_jacobian_scaled` (which
+multiplied by the bare `P`/`T` value as a stand-in for `d(exp(lnX))/d(lnX)`) went silently
+WRONG in that region rather than just losing sensitivity - directly explaining a step-4
+mesh explosion where the center's trial state collapsed to `T=P=0`, `r~4.2e40 cm`. Replaced
+with a smooth softplus-based saturation (`bvp_solver._soft_clamp`, `config.
+BVP_SOFT_CLAMP_WIDTH`) whose derivative is threaded through the Jacobian everywhere; the SAME
+class of bug was independently found and fixed in the smoothed Bell & Lin opacity's own
+derivative. Both verified via finite differences (new Checks 40/40b/41, extended Check 37) -
+**full regression: 42/44 pass, the only 2 failures are the same pre-existing Checks 17/23
+this project has tracked since 2026-08-08, unrelated to any of this work.** Re-attempting the
+exact reconstructed step-4 (state, dt) now converges cleanly via the real production
+`solve_timestep` API (2.8s, 9094 nodes). One further, non-obvious finding along the way:
+`GRAD_EFF_SWITCH_EPSILON_TIMESTEP` needed WIDENING (0.5->2.0), not narrowing as hoped - direct
+evidence the marginal-convection band is real physics, strengthening the case for PLAN.md's
+already-scoped Sub-task 8c (mixing-length theory) rather than continuing to chase this value.
+
+---
+
+**★★★★★★★ 2026-08-10 (evening) — Sub-task 8b IMPLEMENTED: H<->H2 recombination physics live
+in the production solver, Delta r_surface=-5.05% on a real solve_timestep.** Full trail: §5's
+2026-08-10 "Sub-task 8b implementation" entry. Following the roadmap pivot toward modeling
+Phase 1 (First Core collapse) - where the SAME chi(T)/mu(T)/gamma_eff(T) mechanism is expected
+to formally trigger Phase 2 once Gamma_1 softens below 4/3 - the physics justified by Check 38
+was implemented for real, not just in a diagnostic proxy. Planning surfaced a critical scope
+correction: `odes.py`'s `stellar_odes` is NOT the live solver path - `bvp_solver.py` has its
+own separate RHS and **analytic Jacobian** (`implicit_rhs_jacobian`, `make_bc_jacobian_scaled`)
+duplicating this physics inline, and the Jacobian needed real new derivative terms (not just
+`config.MU`->`mu(T)` substitution) since `T` now couples to the system through channels that
+did not exist under constant-`gamma`/`mu` physics: `grad_ad(T)` softening (row 3) and
+`c_p_eff(T)`'s own T-derivative (row 2). Staged per plan: RHS-only with scipy's numerical
+Jacobian first (converged cleanly, `Delta r_surface=-5.09%`, confirming the physics before
+trusting any hand-derived math), then the analytic Jacobian, which **Check 37 caught a real
+bug in on the first attempt** (a dropped `/M_H` factor in three places, `eos.thermodynamic_
+delta` and two `bvp_solver.py` Jacobian helpers) - fixed, Check 37 then passed to 6.5e-7,
+including explicit new coverage of the 2000-3000K transition window itself. Full regression
+suite run end-to-end: **zero new failures** - the only two failing checks are the exact same
+two pre-existing, already-documented failures from 2026-08-08 (confirmed by matching error
+magnitudes), unrelated to this work. Final production result, corrected analytic Jacobian,
+9 iterations, 1.55s: **r_surface 4.5966 -> 4.3642 R_Jup (-5.05%) for one real 1e8 yr timestep**
+from the 10 Gyr cached state - a substantially larger effect than Check 38's static,
+energy-equation-decoupled proxy predicted (-3.1%), as expected once the full 4-ODE system
+(T, L, and r all responding self-consistently, not just rho at fixed P,T) is actually solved.
+
+**★★★★★★ 2026-08-10 (later same day) — Outer-envelope H/H2 recombination sensitivity check: SIGNIFICANT (-3.1% r_surface), justifies real implementation.** Full trail: §5's
+2026-08-10 "recombination sensitivity" entry. Direct follow-up to the 10 Gyr extension below:
+that run's own physics review corrected the user's original diagnosis (`config.MU` is
+already the ATOMIC value, not molecular - fixed 2026-08-07) and identified the real gap in
+the OPPOSITE region: the cool outer envelope (T<~3000 K, 8.5-26% of the mass by 10 Gyr)
+should have H recombining back into H2 (mu rising toward ~2.34) as it cools, but `odes.py`
+uses the constant atomic `config.MU=1.278` everywhere. A cheap, sterile sensitivity check
+(`validation.check_outer_envelope_recombination_sensitivity`, new Check 38) - a logistic
+`mu(T)` proxy applied to the cached 10 Gyr snapshot's ALREADY-CONVERGED $P(m)$, $T(m)$, with
+$r(m)$ independently re-integrated via the same continuity equation and compared against a
+control run (isolating the perturbation from the re-integration method's own ~0.6% error
+floor) - found **$\Delta r_\text{surface}=-0.144\,R_\text{Jup}$ (-3.1%)**, roughly 5x the
+control floor and 3x the pre-agreed 1% "worth implementing" threshold. Direction makes sense
+locally: raising $\mu$ at fixed $(P,T)$ raises the implied $\rho$ ($\rho=P\mu m_H/k_BT$),
+which locally compresses those outer mass shells ($dr/dm=1/(4\pi r^2\rho)$ shrinks) - a
+different (and here, opposite-signed) effect from the earlier global virial argument, since
+this test holds the full $P(m)$/$T(m)$ profile fixed rather than re-equilibrating the whole
+star. Caveat: a meaningful share of the -3.1% comes from the single least-resolved grid
+segment at the very photosphere, so the magnitude is an order-of-magnitude estimate, not a
+precise prediction - but the verdict (real, not negligible) looks robust. **Next: plan the
+actual implementation** - the properly-scoped physics (two-state $\chi(T)$ threaded into
+`eos.py`'s four `mu`/`gamma`-dependent functions, plus the matching latent-heat term in the
+energy equation) that this check was built to justify, not yet started.
+
 **★★★★★ 2026-08-10 — 10 Gyr diagnostic extension: contraction is real and continuing, but
 decelerating — not yet enough to explain the slow pace without Sub-tasks 8a-8c.** Full trail:
 §5's 2026-08-10 entry. Motivated directly by the 4.5 Gyr result below (only
@@ -535,7 +635,23 @@ entry below.
 
 ### `opacity.py` — Bell & Lin (1994) 8-regime piecewise opacity
 
-Unchanged.
+**★★★★★★ 2026-08-11: smoothed regime blending (`bell_lin_opacity_smooth`,
+`config.OPACITY_SMOOTH_TRANSITIONS`, default True) replaces the hard `np.where` regime switch**
+- kappa(rho,T) was already continuous at each transition by construction, but `d(kappa)/dT`
+genuinely jumped (different power-law exponents either side), confirmed as the cause of a real
+mesh explosion. Partition-of-unity logistic blend (`_regime_weights`,
+`config.OPACITY_TRANSITION_SMOOTH_WIDTH_DEX`), verified against the hard switch away from
+transitions and visually (Check 39, `opacity_hard_vs_smooth_metal_grain_evaporation.png`).
+**Same day, its own analytic derivative added** (`bell_lin_opacity_smooth_derivatives`,
+`_regime_weights_derivatives`) after `bvp_solver._opacity_derivatives` was found still
+computing the HARD-switch derivative even when the residual used this smoothed value - the
+same Jacobian/residual mismatch class as the P/T soft clamp (§5's 2026-08-11 entry has the
+full derivation and the FD-verification-methodology detour it took to confirm). One
+documented gap, not silently assumed away: the derivative differentiates the RAW per-pair
+`transition_temperature`, not `monotonic_transition_temperatures`' own `np.maximum.accumulate`
+clamp (relevant only where regime ordering gets reshuffled at unusual densities) -
+`_regime_weights_derivatives`'s own docstring has the reasoning; Check 37's real-mesh coverage
+is the safety net if this gap is ever actually reached in practice.
 
 ### `gradients.py` — Schwarzschild criterion + new diagnostic helper
 
@@ -584,6 +700,19 @@ reasoning for why). The mechanical residual (`P_b - P_neb`) and both center resi
 place this session to match the new (nonlinear in $T_b$) formula.
 
 ### `bvp_solver.py` — $t=0$ shooting seed + $t>0$ `solve_bvp` collocation solver
+
+**★★★★★★★ 2026-08-11: `_safe_exp_state`'s hard `np.clip` replaced by a smooth softplus-based
+`_soft_clamp` (`config.BVP_SOFT_CLAMP_WIDTH`); its derivative (`_safe_exp_state_derivatives`)
+now correctly threaded through `implicit_rhs_jacobian`/`make_bc_jacobian_scaled` everywhere -
+the old hard clamp's zero derivative in saturation was BOTH why Newton had no restoring force
+there AND why those Jacobians silently went wrong (they multiplied by the bare `P`/`T` value,
+correct only where the clamp's true derivative is 1). `relax_initial_state`'s stage 2 now uses
+the fast analytic Jacobian throughout (previously forced to scipy's numerical Jacobian to
+sidestep this bug); stage 1 still needs the clamp forced off, confirmed independent of this
+fix (a separate, genuine numerical property of that stage's own trajectory). See §5's
+2026-08-11 entry for the full diagnosis, fix, and verification (Checks 37/40/40b).**
+
+---
 
 **★★ 2026-08-08: PROMOTED to `solve_bvp`, replacing this file's own `relax_initial_state`/
 `solve_timestep` in place.** The 2026-08-06 pivot below is no longer conditional — it's
@@ -970,6 +1099,27 @@ pinning at `ADAPTIVE_DT_MAX` for the majority of both runs' later steps.
 
 ### `validation.py` — sanity checks, unit consistency, and diagnostic plots
 
+**★★★★★ 2026-08-11 update**: Check 37 extended to sample synthetic points inside the P/T
+soft-clamp's saturation region (it never did before - exactly how the clamp-Jacobian bug
+stayed invisible). New Check 39 (opacity smoothing vs. hard switch, plus its visible plot),
+Check 40/40b (soft-clamp identity/boundedness/derivative vs. finite differences), Check 41
+(smoothed-opacity derivative vs. finite differences) - 44 checks total. **Running the full
+suite**: `python validation.py` still stops at the long-standing Check 17 crash (pre-existing,
+unrelated - §4/§5 have the history); the per-check-isolated sweep this project has used since
+2026-08-08 to see past it remains the way to get the complete picture (42/44 pass, only
+Checks 17/23 fail, both pre-existing).
+
+**★★ 2026-08-10 update**: new Check 38 (`check_outer_envelope_recombination_sensitivity`,
+plus `plot_outer_envelope_recombination_sensitivity`) — a sterile sensitivity test (§5 has
+the full derivation) that found the missing outer-envelope H/H2 recombination physics moves
+`r_surface` by -3.1%, well above the pre-agreed 1% action threshold, justifying real
+implementation. Introduced two small private helpers local to this file
+(`_mu_proxy_atomic_molecular`, `_reintegrate_radius`) rather than duplicating the mu-proxy/
+re-integration logic between the check and its plot function - the first private helpers in
+`validation.py`; also the first use of `output.py` from `validation.py` (loading a cached
+production snapshot rather than a live solve) and the first use of `scipy.interpolate.
+PchipInterpolator`/`scipy.integrate.solve_ivp` here.
+
 See §4 below. **★ 2026-08-08 update**: Check 19 (`check_boundary_conditions_residuals`) and
 Check 24 (`check_static_structure_isothermal_and_monotonic`) — both flagged stale in the
 paragraph below and left unfixed for a long time — were finally revised while promoting
@@ -1139,6 +1289,513 @@ Entries below marked **[SUPERSEDED]** describe conclusions that later investigat
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-12 — ★★★★★★ Phase 3 paused; pivot to Phase 1 (First Hydrostatic Core) - a real, physically clean contraction achieved to ~73% of the T_center target, honest account of the remaining wall
+
+**PI directive, explicit and immediate**: stop debugging Phase 3's step-5 wall (see §1's brief
+note above and §5's 2026-08-11 entry closing note - not repeated here), pivot to Phase 1 to
+guarantee a working, physically accurate deliverable before the thesis deadline. PLAN.md
+already scopes Phase 1 exactly (§"Formation Scenario and Scope": diffuse, fully molecular
+first core, $R\sim10^2$-$10^3\,R_\text{Jup}$, ends at $T_\text{center}\sim2000$K where H2
+dissociation triggers the out-of-scope Stage 2 dynamical collapse).
+
+**Architectural gap found and fixed, not routed around**: `bvp_solver._adiabatic_center_guess`'s
+Lane-Emden seed is hard-coded to the $T=0$ electron-degenerate $n=1.5$ polytrope - a pure
+function of fundamental constants, independent of `T_CENTER_INITIAL`/`MU`/`GAMMA`. Verified
+directly: running `solve_static_structure()` with molecular `MU=2.34`/`GAMMA=1.4` does not
+fail - it SILENTLY converges to the wrong physical branch (`r_surface=3.27 R_Jup`, a
+plausible-looking `3.6e-3` residual), because the geometric-expansion bracket search starts
+essentially on top of the compact/degenerate root and finds it within 5 iterations, 5-6
+decades from the true diffuse root also present in `mass_error(P_center)`. Fixed with a new
+`_adiabatic_center_guess_ideal_gas(T_center)` (thermally-set polytropic constant
+$K=C T_\text{center}\rho_c^{-1/n}$ instead of the fixed degenerate $K_1$ - re-derives the same
+$\alpha^2\propto\rho_c^{-1}$ collapse for ANY $n$, not just $n=1.5$; self-consistency verified
+analytically AND numerically exact: $P_\text{center}$ reduces identically to the plain ideal
+gas law at the seed's own $(\rho_c,T_\text{center})$). `solve_static_structure(use_ideal_gas_
+seed=True)` selects it; default `False` keeps Phase 3's proven path byte-for-byte unchanged.
+
+**A second, genuine, dimensionally-wrong bug found during calibration**: `solve_static_
+structure`'s `brentq` call used `xtol=config.M_TOTAL*1e-12` (~1.9e18) as an absolute tolerance
+on `P_center` (a pressure) - astronomically larger than `P_center` in EITHER regime (~1e4
+diffuse, ~1e11-1e12 compact), so `brentq`'s stopping criterion was always dominated by this
+oversized `xtol`, causing premature convergence after ~1-2 bisections regardless of how tight
+`rtol=BVP_TOL` was set. Fixed with `config.STATIC_STRUCTURE_BRENTQ_XTOL=2e-12` (a genuinely
+negligible absolute floor, scipy's own default order of magnitude), letting `rtol` do the real
+work. Residuals dropped from marginal ~1e-2 (right at `STATIC_STRUCTURE_RESIDUAL_TOL`'s edge)
+to ~1e-10/1e-11 (essentially exact) at EVERY `T_center` tested, **including Phase 3's own
+T_CENTER_INITIAL=11500K case** - a shared, strictly-beneficial fix, not something narrow to
+Phase 1.
+
+**Calibration**: swept `T_CENTER_INITIAL` directly (cheap - `solve_static_structure` alone, no
+relax needed) rather than trust the one available historical anchor point (1200K -> ~300
+R_Jup) by extrapolation alone. Found **645K -> r_surface=500.83 R_Jup** - the requested R~500
+R_Jup target, essentially exact.
+
+**Timescale** (PI directive, Larson 1969: First Core phase ~$10^4$-$10^5$ yr, not Phase 3's
+Gyr scale): `config.T_KH_TIMESCALE_S=1$ Myr would give a seed `dt`~1e4 yr (comparable to the
+WHOLE expected process) and `ADAPTIVE_DT_MAX=1e8 yr` is 1,000-10,000x it - both overridden
+(runtime-only, hermetically isolated) to timescales appropriate to this phase.
+
+**Hermetic isolation (PI directive), directly verified, not just designed-for**: every Phase-1
+value (composition, `T_CENTER_INITIAL`, timescales) is a runtime override local to
+`run_phase1_first_core.py`'s own process, exactly matching `run_phase3_validation.py`'s
+existing `T_MAX_S` pattern. Confirmed after the fact by direct inspection: `config.py`'s own
+file-level `MU`, `GAMMA`, `USE_H2_RECOMBINATION_PHYSICS`, `T_CENTER_INITIAL`, `T_MAX_S`,
+`ADAPTIVE_DT_MAX/MIN/GROWTH_FACTOR`, `RELAX_DT_FRACTION` are ALL exactly their pre-existing
+Phase 3 values - zero permanent trace of any Phase-1-specific run left in the file.
+
+**Sterile validation (Step 6, before the long run) surfaced two more genuine, fixed issues,
+not assumed away**:
+- `relax_initial_state`'s stage 1, under its DEFAULT settings (clamp forced off, `dt_relax`=
+  `RELAX_DT_FRACTION*T_KH_TIMESCALE_S`=1e4 yr - both tuned for Phase 3), crashed outright for
+  this diffuse structure (a raw `np.exp()` overflow reaching `eos.density` uncaught, clamp
+  off). Direct, isolated tests found BOTH a smaller relax pseudo-timestep (1000 yr, via a new
+  `force_clamp_off_stage1=True` default parameter added to `relax_initial_state` - defaults
+  True, preserving Phase 3's exact proven behavior; Phase 1 passes `False`) AND leaving the
+  clamp ON (its global default, already fixed/verified 2026-08-11) independently necessary -
+  together, first-attempt convergence, no continuation fallback.
+- The very first real `solve_timestep` call ALSO needed a gentler seed than the naive 100 yr
+  guess (mesh-exploded; 10 yr converged directly) - and `config.ADAPTIVE_DT_MIN=100yr`
+  (inherited, unchanged) sat ABOVE that 10 yr seed, forcibly clamping step 2 straight back up
+  to the value that just failed, defeating the fix on the very next step - overridden to 10yr.
+
+A clean 10-step sterile run (relax + 10 real steps) then passed with zero failures - the gate
+for "push straight through" (PI directive).
+
+**The actual run - genuine progress, then an honest, not-yet-diagnosed wall.** The full run
+(`run_phase1_first_core.py`) produced 18 clean, physically beautiful steps (R: 556.8 -> 310.4
+R_Jup, T_center: 669 -> 1234K, monotonic, dt growing smoothly under the 1.3x growth cap) before
+crashing at step 19 - the raw pre-clamp trial state reached literal `inf` (a linear-solve
+overflow, not something the soft clamp's pointwise saturation alone can prevent). **Resumed
+three times**, each recovering with a smaller `dt` at the exact failing (state, dt) - verified
+directly each time before relaunching, not guessed: 1000 yr (relax) -> 10 yr (first real step)
+-> 5-10 yr (recurring pocket near T~1300K, twice) -> 5 yr (pocket near T~1500K). This
+recurring "growth-capped dt fails, several-times-smaller dt at the SAME state succeeds every
+time" pattern (confirmed 3+ times, not a one-off) motivated a genuine, general robustness
+addition rather than continued manual firefighting: **`time_stepper.run` now automatically
+retries a failed step with a shrunken `dt`** (`config.STEP_RETRY_MAX_ATTEMPTS=6`,
+`STEP_RETRY_SHRINK_FACTOR=0.5` - standard adaptive-integrator step-rejection practice, strictly
+additive - a step that already succeeds on its first attempt is completely unaffected). This
+DID recover one further step automatically (T_center 1530->1561K) before hitting a
+**qualitatively different, persistent wall** at T_center~1561K, r~238 R_Jup: unlike every prior
+pocket, this one did NOT resolve even after shrinking `dt` all the way down to 0.078 yr (~28
+days, the full 6-retry budget exhausted) or after independently widening
+`GRAD_EFF_SWITCH_EPSILON_TIMESTEP` to 5.0 and 10.0 (both still failed, notably even at
+`alpha=0` - the pure adiabat blend, before the Schwarzschild-selected gradient is even
+involved - pointing away from the convective-switch smoothing as the primary cause, toward
+something else not yet identified, possibly the opacity-regime risk flagged before this run
+even started: Phase 1's entire envelope, not just Phase 3's thin surface skin, traverses the
+historically fragile Metal/Ice-grain-evaporation transitions).
+
+**Final result, honestly reported**: 33 real, physically clean, monotonic snapshots merged
+into one continuous trajectory (`diagnostic_plots/run_Phase1_first_core/evolution_curves_
+FULL.png`) spanning t=0 to 536 yr, **r_surface: 500.83 -> 238.75 R_Jup, T_center: 654.99 ->
+1560.89 K** - genuine Kelvin-Helmholtz contraction, ~73% of the way from start to the 1900K
+target (in $T_\text{center}$ terms), R more than halved. **Not yet reached**: the
+`PHASE1_T_CENTER_HALT=1900K` halt condition itself - the run stops short at the wall described
+above. Given the deadline, this wall was NOT chased further today (two well-motivated levers
+tried and directly ruled out - `dt` and `GRAD_EFF_SWITCH_EPSILON_TIMESTEP` - rather than one
+more guess); flagged here, honestly, as the concrete next step, not silently left unmentioned.
+
+**Files added**: `bvp_solver._adiabatic_center_guess_ideal_gas`, `solve_static_structure(use_
+ideal_gas_seed=...)`, `relax_initial_state(..., force_clamp_off_stage1=...)`;
+`config.STATIC_STRUCTURE_BRENTQ_XTOL`, `PHASE1_T_CENTER_HALT`, `STEP_RETRY_MAX_ATTEMPTS`,
+`STEP_RETRY_SHRINK_FACTOR`; `time_stepper.run`'s automatic step-retry; `run_phase1_first_
+core.py` and three `resume_phase1_from_step*.py` scripts (mirroring `resume_phase3_from_
+step3.py`'s established pattern - each resume writes to its own new snapshot directory,
+`snapshots_Phase1_first_core[_resumedN]`, so no run's surviving snapshots were ever
+overwritten).
+
+**Context.** Launching the full Phase 3 validation run (4.5 Gyr / R_HALT, Sub-task 8b physics
+live throughout) crashed immediately: `relax_initial_state` had never been run from a fresh
+t=0 state under the new mu(T)/gamma_eff(T) physics before. A same-day investigation (not all
+individually logged here - the trail is in this session's history) diagnosed and fixed, in
+sequence: (1) a `P=inf` overflow crash in `eos.density`, patched with a hard `np.clip` on the
+solver's trial `(lnP, lnT)` before exponentiating (`bvp_solver._safe_exp_state`); (2) the clamp
+then caused a NEW failure (singular collocation Jacobian), diagnosed (at the user's explicit
+request, framed as an external Senior Numerical Analyst review) as a Jacobian/residual
+mismatch - the clamp changes the residual near its boundary but the analytic Jacobian was
+never updated to match - fixed with a tiered workaround (`relax_initial_state`'s stage 1 with
+the clamp forced OFF, stage 2 with the clamp ON but `fun_jac=None`, forcing scipy's own
+numerical Jacobian); (3) the real production run then hit a DIFFERENT failure at step 4 (mesh
+explosion, not a crash); (4) cross-referencing the failure location against the Bell & Lin
+opacity table's transition temperatures (the user's own hypothesis) found a genuine, unfixed
+C1 discontinuity - `kappa(rho,T)` is continuous at each regime boundary by construction, but
+`d(kappa)/dT` genuinely jumps (different power-law exponents either side) - fixed with a
+smooth partition-of-unity blend (`opacity.bell_lin_opacity_smooth`,
+`config.OPACITY_SMOOTH_TRANSITIONS`), which measurably reduced but did not eliminate step 4's
+mesh explosion at any tested smoothing width.
+
+**The PI's assessment, verbatim in spirit**: this sequence looked like stacking band-aids on
+top of band-aids - fighting `solve_bvp` instead of doing physics - and directed a pause for an
+architectural review before any more patches, with two specific priorities: (1) fix the clamp
+itself so it never has zero derivative (a proper soft clamp), since a zero-derivative region
+gives Newton no restoring force and lets a bad trial wander into nonsense; (2) re-examine
+whether `GRAD_EFF_SWITCH_EPSILON_TIMESTEP=0.5` (a documented, deliberately wide numerical
+expedient for the Schwarzschild-switch kink, PLAN.md Sub-task 8c) could now shrink, given the
+opacity kink - a plausible contributor to the same photospheric region's difficulty - was
+fixed.
+
+**Review finding, confirmed by reading the code directly, not from memory**: the clamp-
+Jacobian mismatch diagnosed in step (2) above was real, but the TIERED WORKAROUND papered over
+it rather than fixing it - `implicit_rhs_jacobian`/`make_bc_jacobian_scaled` still multiplied
+by the bare `P`/`T` value everywhere as a stand-in for `d(exp(lnX))/d(lnX)`, correct only
+where the clamp's true derivative is exactly 1 (deep inside the safe range). Wherever a trial
+point saturated the clamp - exactly the production configuration (`relax_initial_state` stage
+2, every `solve_timestep` call) - the Jacobian reported a nonzero sensitivity the residual no
+longer had: not just "no restoring force," an ACTIVELY WRONG gradient. This single mechanism
+unifies two things that had looked like separate leads: the general step-4 singular-Jacobian
+failures, and a specific diagnostic where the center's trial state collapsed to
+`T_a=P_a=0, r_analytic~rho_c^(-1/3)` diverging to `~4.2e40 cm` - once a variable crosses the
+clamp boundary, the false "still sensitive" signal lets Newton keep pushing it with nothing
+pulling it back.
+
+**Fix 1 - the soft clamp** (`bvp_solver.py`, `config.py`). Replaced `_safe_exp_state`'s hard
+`np.clip` with a smooth, C-infinity, strictly-monotonic two-sided saturation
+(`_soft_clamp`/`_soft_clamp_derivative`), built from the standard numerically-stable softplus
+identity (`max(u,0)+log1p(exp(-|u|))`), composed as smooth_max then smooth_min. Same
+saturation CENTERS as the old hard clamp (`config.LN_P_CLAMP`/`LN_T_MIN`/`LN_T_MAX`, moved
+here from bare `bvp_solver.py` literals - a pre-existing CLAUDE.md gap, fixed in passing), plus
+a new width (`config.BVP_SOFT_CLAMP_WIDTH`). **Sterile-verified BEFORE touching any Jacobian**
+(new Checks 40/40b): an initial width guess (2.0) FAILED its own identity-match check
+immediately - `T_NEB=50K` sits only ~2 widths from `LN_T_MIN=0`, nowhere near the "tens of
+widths" margin assumed - corrected to 0.1 (`config.py`'s own comment has the full margin
+derivation). Verified: exact match to raw `exp()` across the real operating range
+(`rel_err~2e-14`), bounded across the full extreme range including the actual logged failure
+values, and the derivative stays meaningfully nonzero for ~30,000 widths past the boundary
+(vs. exactly zero at distance 0 for the old hard clamp).
+
+**Fix 2 - propagate the derivative through the Jacobian** (`bvp_solver.py`). Added
+`_safe_exp_state_derivatives` (returns `dP/d(lnP), dT/d(lnT)` through the actual clamp) and
+threaded it through every chain-rule factor in `implicit_rhs_jacobian`/`make_bc_jacobian_scaled`
+that previously multiplied by the bare `P`/`T` value - `J[0,1]`, `J[0,3]`, `J[2,1]`, `J[2,3]`,
+`J[3,1]`, `J[3,3]`, `dbc_dza[0,1]`, `dbc_dza[0,3]`, `dbc_dzb[2,1]`, `dbc_dzb[2,3]`,
+`dbc_dzb[3,3]` - plus one site the initial derivation missed and only caught by re-deriving
+`J[1,1]` by hand (`f1=dP_dm/P`'s own `d/d(lnP)`, previously the bare `-f1`, correct only when
+unclamped). **The exact same class of bug was independently found in the smoothed opacity's
+own Jacobian contribution**: `_opacity_derivatives` still computed the HARD-switch regime's
+derivative unconditionally even though the residual used the smoothed `kappa` when
+`config.OPACITY_SMOOTH_TRANSITIONS=True` - derived and implemented the smoothed blend's true
+derivative (`opacity.bell_lin_opacity_smooth_derivatives`, product rule through the
+partition-of-unity weights' own derivatives, `opacity._regime_weights_derivatives`) and wired
+`_opacity_derivatives` to dispatch on the flag. **Extended Check 37** (the standing
+finite-difference Jacobian cross-check) to explicitly sample synthetic points inside the
+clamp's saturation zone (it never did before - exactly how this bug stayed invisible); **new
+Check 41** verifies the opacity derivative fix at a handful of representative points. Both
+pass (Check 37's saturation-region entries: `1.7e-6`/`2.5e-9`, well under
+`config.JACOBIAN_VERIFY_TOL=1e-4`).
+
+*A genuine numerical-analysis detour, worth recording*: a first, blind 20,000-point random
+`(rho,T)` sweep to verify the opacity derivative produced apparent errors up to `1e299` -
+investigated directly rather than dismissed, and traced every single time to an FD-
+VERIFICATION-methodology artifact, never a math bug: (a) comparing the FULL composed
+derivative against finite differences of the total weighted sum can bury a correct but
+sub-dominant regime's contribution under a dominant term's own float64 precision floor
+(confirmed by isolating that one regime's weight against FD of ITS OWN value alone - matched
+to `4e-9`); (b) at `rho` below this problem's real ~1e-8 g/cm^3 floor, `d(weight)/d(rho)`
+spans such extreme dynamic range that no single fixed FD step size is well-conditioned
+everywhere (confirmed via a direct step-size convergence sweep at one such point - FD
+converged cleanly to the analytic value for `h_rel>=1e-5`, then diverged from round-off as `h`
+shrank further). The permanent Check 41 instead uses a handful of well-chosen points (mirrors
+Check 39's own methodology) rather than a blind sweep - the sweep was a development tool, not
+something worth enshrining as a check that fails on its own methodology's edge cases.
+
+**Fix 3 - `relax_initial_state`'s tiered clamp/Jacobian staging, re-tested not just
+simplified.** With the Jacobian now consistent everywhere, tested whether the composition-jump
+problem that originally motivated the two-stage structure was itself just the clamp bug in
+disguise: a single-stage attempt (real physics, clamp on, analytic Jacobian, from a fresh
+`solve_static_structure()` output) still fails the same way (singular Jacobian) - genuinely
+separate difficulty, two-stage structure stays. But re-tested each stage's OWN special-casing
+against the fixed solver rather than assuming: stage 1 (old constant-mu physics) with the
+clamp forced ON now REGRESSES even with the correct Jacobian (a single bad Newton step can
+still outrun any finite-width clamp's restoring gradient, ~75 log-units out for
+`BVP_SOFT_CLAMP_WIDTH=0.1`, not infinitely) - confirmed genuinely independent of today's fix,
+stage 1 keeps clamp OFF. Stage 2 (already clamp ON) now converges with the FAST analytic
+Jacobian instead of the forced-numerical workaround - verified directly against the numerical-
+Jacobian baseline (same 9 iterations, same `r_surface=4.9313 R_Jup`, 4442 vs 4445 nodes, a
+trivial mesh-path difference) before trusting the switch. Full `relax_initial_state()` re-run
+end-to-end successfully (137s total).
+
+**The actual target: Phase 3 step 4.** Reconstructed the EXACT failing `(state, dt)` from the
+saved snapshots (`snapshots_Phase3_recombination/snapshot_00003.npz`, chaining
+`time_stepper.select_adaptive_dt` forward through the recorded `t` values to recover
+`dt=3.6616e11 s` - verified exactly reproducing each intermediate snapshot's own `t`). Retried
+sterile-first (numerical Jacobian): the failure mode CHANGED from "singular Jacobian" to
+"maximum mesh nodes exceeded" - direct confirmation the clamp fix eliminated its own failure
+class, and what remains is the separate, already-documented `GRAD_EFF_SWITCH_EPSILON_TIMESTEP`
+marginal-convection-band issue (PLAN.md Sub-task 8c). Swept that epsilon against this exact
+step: **0.5 (unchanged) still fails; 1.0 is actively pathological (43 MINUTES for the direct
+attempt alone before also failing - a red flag of real fragility, not just insufficient
+smoothing); 2.0 converges directly, fast, cleanly (2.9s, 9068 nodes); 5.0 also succeeds.**
+Adopted `GRAD_EFF_SWITCH_EPSILON_TIMESTEP=2.0` (smallest cleanly-converging value found,
+same margin-sweep discipline as everywhere else in this project). **Stated plainly: this is
+the OPPOSITE of what fixing the opacity kink was hoped to enable** - the marginal band needed
+WIDENING, not narrowing, once the clamp/opacity kinks were cleared, which is itself evidence
+this band is real physics (a genuinely marginal `nabla_rad~nabla_ad` region), not a numerical
+artifact those fixes were expected to shrink - strengthening, not weakening, the case for
+PLAN.md's already-scoped Sub-task 8c (mixing-length theory) as the eventual complete fix,
+rather than continuing to chase this value step by step. Step 4 now converges via the real
+production `bvp_solver.solve_timestep` API: 2.8s, 9094 nodes, `r_surface=4.9337 R_Jup`
+(status=0, residual `9.96e-7`).
+
+**Full regression**: `validation.py`'s 44 checks run individually (the standard practice for
+seeing past the long-standing Check 17 crash-on-first-failure - PROGRESS.md's own 2026-08-08
+entry) - **42/44 pass; the only 2 failures are the exact same pre-existing Checks 17
+(`stellar_odes` vs. constant-density analytic profile) and 23 (`solve_static_structure`
+Eulerian hydrostatic balance) this project has tracked and re-confirmed unrelated at every
+regression pass since 2026-08-08.** Zero new failures.
+
+**Still open**: PLAN.md Sub-task 8c (mixing-length theory) - not started, now more clearly
+justified than before this session. `GRAD_EFF_SWITCH_EPSILON_TIMESTEP=2.0` is validated
+against step 4 specifically, not a longer chain - the original 0.5 value's own "only validated
+for 10 real steps, no proof the marginal band's demands plateau" limitation applies here too,
+unresolved.
+
+**Immediately after this entry was written**: `resume_phase3_from_step3.py` launched the
+actual continuation (from `snapshot_00003.npz`, the same reconstructed `dt`). Step 1 of the
+resume (= the original step 4) converged exactly as verified above (`snapshot_00001.npz` in
+the new `snapshots_Phase3_recombination_resumed/` dir). `select_adaptive_dt` then chose a
+sharply smaller next `dt` (11,602 -> 945 yr, ~12x drop) and THAT step failed - same "max mesh
+nodes exceeded" signature as step 4's original failure, but with a new, more extreme detail:
+the diagnostic print showed the raw (pre-clamp) trial `lnP`/`lnT` reaching `~3.3e15`/`~-7e14` -
+many orders of magnitude past even the soft clamp's own extended "still has a meaningful
+restoring gradient" reach (~75-175 log-units, config.BVP_SOFT_CLAMP_WIDTH's own comment). This
+is consistent with, and sharpens, the mechanism already suspected for `relax_initial_state`
+stage 1's own clamp-on regression this same session: the soft clamp guarantees the PHYSICAL
+output (P, T) stays bounded and the JACOBIAN stays honest, but does nothing to stop the RAW
+log-state Newton variable itself from being driven arbitrarily far by a single large step -
+once that raw variable is astronomically deep in the saturated region, the (now-honest)
+gradient there is so close to zero that recovery isn't guaranteed even though nothing is lying
+to the solver anymore. A genuinely new, not-yet-investigated failure, one step further than
+where this session's fixes got the run to - not chased further today given the length of this
+session; flagged here for the next session rather than patched blindly.
+
+### 2026-08-10 (evening) — ★★★★★★★ Sub-task 8b implemented: H<->H2 recombination physics live in the production solver
+
+**Context**: after Check 38 justified the physics, the user shared a roadmap pivot from the
+PI: the immediate next goal is modeling Phase 1 (First Core collapse, 300-1000 R_Jup down to
+T_center~2000K triggering the dynamical Phase 2 collapse), with Phase 2 bridged to a revised,
+hotter Phase 3 start (possibly ~40,000K instead of the current 13,000K placeholder) via a
+future energy-conservation calculation. Sub-task 8b was reframed as dual-purpose: the SAME
+chi(T)/mu(T)/gamma_eff(T)/latent-heat mechanism fixing Phase 3's outer envelope is also the
+physical trigger (Gamma_1 softening below 4/3) expected to formally end Phase 1. Pushback
+given before implementing (agreed, with refinements, not blocking): (1) "formally end Phase 1"
+needs an EXPLICIT Gamma_1-averaged halt condition once `gamma_eff(T)` exists, not reliance on
+`solve_bvp` failing to converge as an implicit signal - deferred to when the Phase 1 driver is
+actually built, not this sub-task. (2) The T-only, fixed-threshold (2000-3000K) chi(T) proxy
+is validated ONLY against Phase 3's tenuous outer-envelope density regime (Check 38); Phase
+1's core at the point of dissociation is much denser, and a real dissociation equilibrium
+constant depends on rho too - flagged as an open risk to re-check once Phase 1 modeling
+begins, not assumed to transfer. (3) MLT deferral endorsed, with a refinement: not because the
+cloud is "transparent" per se, but because MLT only refines superadiabaticity in an ALREADY-
+convective zone (the Schwarzschild criterion already handles convective-vs-radiative without
+it) - the newly-relevant feature (a persistent radiative zone, found in the 10 Gyr run) is
+genuinely radiative, where MLT doesn't directly apply. (4) Saha (8a) agreed irrelevant for
+Phase 1 (ionization energy scale argument), but a future 40,000K Phase 3 needs a FRESH Saha
+check against the actual bridged density, not an assumption from T alone - Milestone-0's own
+check found ionization negligible at 13,000K specifically because of density suppression.
+
+**Formal plan** (`EnterPlanMode`/`ExitPlanMode`, matching Sub-task 9's precedent) surfaced a
+critical scope correction during exploration, before any code was written: **`odes.py`'s
+`stellar_odes` is not the live t>0 solver path.** `bvp_solver.py` has its own separate,
+hand-derived RHS (`implicit_rhs_vectorized`) and analytic Jacobian (`implicit_rhs_jacobian`,
+`make_bc_jacobian_scaled`) that duplicate this physics inline with `config.MU`/`config.GAMMA`
+hardcoded throughout - threading `mu(T)`/`gamma_eff(T)` through `odes.py` alone would have
+changed nothing about real solver output. This reshaped the plan into a two-step, staged
+implementation (physics first via scipy's numerical Jacobian, analytic Jacobian second, gated
+by Check 37) specifically to decouple "does the new physics converge and behave sensibly" from
+"is the hand-derived Jacobian correct" - the same de-risking discipline this project has used
+successfully before (margin sweeps, sterile tests before wiring in).
+
+**Physics implemented** (`config.py`, `eos.py`): a shared logistic `chi(T)` (molecular
+fraction, `T_MID=2500K`, `WIDTH=180K`, wide by design per the `GRAD_EFF_SWITCH_EPSILON`
+lesson) feeds `mu(T)` (linear interpolation of `1/mu` in `chi` - exact two-state H/H2+He
+mixing, anchored to `config.MU` at the atomic limit and a molecular limit derived from
+`config.MU_E`'s own `X`, not new independent literals) and `gamma_eff(T)` (same `chi`,
+interpolating `config.GAMMA=5/3` to a new `config.GAMMA_MOLECULAR=7/5`). Latent heat
+(`config.EPSILON_D_H2`, derived from `D0_H2=4.478 eV` and `config.M_H`) injected as
+`latent_heat_capacity(T) = -EPSILON_D_H2*d(chi)/dT`, added to `specific_heat_cp(gamma_eff(T),
+mu(T))` in the energy equation. `eos.thermodynamic_delta` extended with an optional
+`d_inv_mu_dT` parameter (default 0.0, exactly reproducing prior behavior for any caller that
+doesn't pass it) for the mu(T) correction to the EOS's implicit differentiation.
+
+**Step 1 (RHS + boundary conditions, numerical Jacobian)**: `odes.stellar_odes` (4 call sites),
+`bvp_solver.implicit_rhs_vectorized`'s own direct `grad_adiabatic` call, `make_bc_scaled`
+(center + photospheric `mu`), and `_bvp_solution_to_state` (the OUTPUT `rho` field, which
+would otherwise have silently disagreed with the physics actually used during the solve) all
+updated. Validated with a real `solve_timestep` call from the cached 10 Gyr snapshot, `fun_jac=
+None` (scipy's own finite-difference Jacobian) - converged in 10 iterations, 1.9s,
+`Delta r_surface=-5.09%`, same direction and order of magnitude as Check 38's static proxy
+(-3.1%), larger as expected since the full system (T, L, r all responding) captures more than
+a fixed-(P,T) density perturbation.
+
+**Step 2 (analytic Jacobian) - Check 37 caught a real bug on the first pass, exactly as this
+staging was meant to allow.** `_eos_density_derivatives` and `_thermodynamic_delta_derivatives`
+extended with the mu(T) correction terms (derived by hand: an extra `rho*K_B*T*d_inv_mu_dT/M_H`
+channel in `dF/dT`, and `thermodynamic_delta`'s own numerator gaining a
+`rho*K_B*T^2*d_inv_mu_dT/M_H` term, needing chi's SECOND derivative for `_thermodynamic_delta_
+derivatives`'s own T-derivative). `implicit_rhs_jacobian` threaded `mu(T)`/`gamma_eff(T)`
+through every remaining `config.MU`/`config.GAMMA` reference, plus two genuinely NEW coupling
+terms found by tracing the derivation rather than assumed: `d(grad_ad)/dT` contributing to
+`J[3,3]` (grad_ad was a true constant before, so this term was correctly absent) and
+`-dT_dt*d(c_p_eff)/dT` contributing to `J[2,3]` (same reasoning - c_p was T-independent).
+`_effective_gradient_derivative` also needed extending to return BOTH `d(grad_eff)/d(grad_rad)`
+and the previously-nonexistent `d(grad_eff)/d(grad_ad)` channel (grad_ad is no longer a true
+constant, so `grad_eff`'s OTHER argument now has a real derivative too - the two channels sum
+to exactly 1.0, a useful sanity identity confirmed directly). First Check 37 run: **64% relative
+error** - a real, decisive failure, not noise. Traced to a dropped `/config.M_H` factor: `P_
+ideal = rho*K_B*T/(mu*M_H)`, so its T-derivative's mu(T) term needs `/M_H` too, consistently
+missed in THREE places (`eos.thermodynamic_delta`'s own formula, plus its two mirrors in
+`bvp_solver.py`'s Jacobian helpers) since all three were derived from the same (flawed) mental
+math. Fixed in all three; Check 37 re-run passed at 6.5e-7 (both `fun_jac` and `bc_jac`),
+including new test points explicitly forced inside the 2000-3000K transition window (added to
+Check 37 itself - the existing random mesh-point sample had only a ~3.6%-per-point chance of
+covering that region at all, not a reliable guarantee the new terms would ever be exercised).
+
+**Regression check: zero new failures.** Full `validation.py` suite run end-to-end (skipping
+only the already-known-broken Check 17, confirmed unrelated below) - every other check passes,
+including one NEW failure surfaced (`check_static_structure_hydrostatic_balance`, Check 23,
+1.78e-2 relative error) that turned out to be, on inspection, the EXACT SAME pre-existing,
+already-documented failure from the 2026-08-08 `solve_bvp` promotion entry (matching error
+magnitude to 3 significant figures) - `solve_static_structure()`'s own adiabatic seed
+construction is deliberately untouched by this sub-task (a coarse Newton-iteration starting
+guess only, immediately corrected by `relax_initial_state`'s real 4-ODE solve), so its output
+is byte-identical to before; this check simply had not been re-run since 2026-08-08 and was
+already broken then. Check 17 similarly confirmed unrelated (its own docstring already
+describes the failure mode: a test-construction gap, using `config.MU` to invert a target
+density that no longer matches `stellar_odes`'s new `mu(T)`-based EOS - compounding the SAME
+pre-existing category of staleness the check already had, not a new bug class).
+
+**Also fixed**: `eos.molecular_fraction` used a bare `1/(1+exp(x))`, which overflows (`Runtime
+Warning`) at extreme T values reachable by validation.py's own edge-case stress tests -
+switched to `scipy.special.expit` (a numerically stable sigmoid), mathematically identical,
+silent at every T.
+
+**Final production result** (corrected analytic Jacobian, real `solve_timestep` from the
+cached 10 Gyr snapshot, 1e8 yr step): converged in 9 iterations, 1.55s (faster than the
+numerical-Jacobian test, as expected). **$r_\text{surface}$: 4.5966 -> 4.3642 $R_\text{Jup}$
+($\Delta=-5.05\%$)** for one real timestep - noticeably larger than Check 38's simplified
+static proxy (-3.1%), confirming the full self-consistent solve captures a bigger effect than
+the pressure/density-only sensitivity test could see. This is the first real evidence that the
+outer-envelope recombination physics meaningfully changes the production trajectory, not just
+a diagnostic prediction - the natural next step is a full multi-step re-run (comparable to the
+existing 10 Gyr trajectory) to see the cumulative effect over the whole simulated history, not
+yet done in this pass.
+
+### 2026-08-10 (later same day) — ★★★★★★ Outer-envelope H/H2 recombination sensitivity check: SIGNIFICANT, real implementation now justified
+
+**Context**: reviewing the 10 Gyr run's plots (entry below), the user's own read was that the
+model's slow contraction pace implied "the EOS is providing incorrect support" via a
+molecular-vs-atomic `mu` error in the hot interior - a direct, testable physical claim. Before
+agreeing, `config.py` was checked directly: `MU=1.278` (atomic) and `GAMMA=5/3` (monatomic)
+are ALREADY in use, corrected on 2026-08-07 specifically because Stage 3 starts well past H2
+dissociation (documented in `config.py`'s own comment history), and a prior Milestone-0 Saha
+calculation had already found ionization negligible (peak x~5.9e-4) - so neither the original
+diagnosis (still molecular) nor the natural alternative (under-ionized) matched the code.
+
+**The real gap, found by inspecting the actual T(m) profile at t=10 Gyr**: mass-weighted,
+8.5% of the envelope is below 2000 K, 26% below 3000 K, 45% below 5000 K - a substantial and
+*growing* fraction as the whole structure cools further. Hydrogen there should be recombining
+back into H2 (mu rising toward the molecular value ~2.34), but `odes.py` calls
+`eos.density`/`grad_adiabatic`/`specific_heat_cp`/`thermodynamic_delta` with the constant
+`config.MU`/`config.GAMMA` everywhere - the opposite-direction, opposite-region correction
+from what was originally proposed. This region also coincides almost exactly with the
+persistent radiative zone found by directly checking the `is_convective` mask across the
+overnight run's snapshots (m/M_tot in [0.9548, 1.0], present from shortly before the earlier
+`r_surface` "bump" through nearly the entire 4.5 Gyr run) - a genuine, non-trivial temporal
+correlation, though the radiative zone clearly outlives the bump itself (open through most of
+the subsequent, unremarkable contraction phase too), so a clean "convection breaks, causes the
+bump, reopens, contraction resumes" story is too tidy; what the data actually shows is a
+longer-lived structural feature coincident with the bump's onset.
+
+**Quantitative case for doing this properly, not as a bare `mu(T)` lookup**: H2's
+dissociation/recombination energy (~1.5e12 erg/g of H, computed from D0=4.478 eV/molecule and
+`config.M_H`) is **3-16x LARGER than the local thermal energy content** across T=1000-5000K
+(computed directly, not estimated). A `mu(T)` fix touching only the pressure/density relation,
+without a matching latent-heat term in the energy equation's effective heat capacity, would be
+thermodynamically incomplete enough to plausibly bias the result in the wrong direction, not
+just omit a minor correction.
+
+**The user's counter-proposal**: rather than a full two-state mass-action equilibrium solver
+(root-finding at every BVP node - stiff, and this project has been burned before by exactly
+this kind of near-marginal switch, see `GRAD_EFF_SWITCH_EPSILON`'s saga), use an explicit,
+smooth logistic `chi(T)` for the molecular fraction, with an analytic `d(chi)/dT` injected as
+a latent-heat term in `c_p`. **Reviewed and endorsed, with three additions found necessary
+for full self-consistency** by checking `eos.py`/`odes.py` directly (all four EOS calls in
+`odes.py` currently use the global constant `config.MU`/`config.GAMMA`, not a per-point
+value):
+1. `specific_heat_cp` already takes `mu` as a parameter - call it with the local `mu(T)`.
+   This captures a real but secondary effect (the "frozen-composition" cp shift from mu(T)
+   itself), quantified at ~10-15% the size of the latent-heat term across 2000-3000K -
+   smaller than the user's dominant term, but not free to skip once dchi/dT is already
+   being computed for the latent-heat piece.
+2. **`grad_adiabatic` needs to become gamma_eff(T)-dependent too** - its own docstring
+   already flags this gap ("invalid once H2 dissociation begins to lower gamma_eff"). This is
+   likely the single most important piece for the specific "floor" question, since softening
+   Γ1 in the transition zone is the textbook mechanism for destabilizing a radiative zone
+   toward convection - and that zone is exactly where the persistent radiative layer above
+   sits. Recommended: share ONE logistic transition between `mu(T)` and `gamma_eff(T)` rather
+   than two independently-tuned functions.
+3. `thermodynamic_delta`'s implicit-differentiation formula (delta = -(d ln rho/d ln T)_P)
+   currently assumes mu fixed when differentiating the EOS; derived the needed correction
+   term (`+ k_B*T^2*d(1/mu)/dT / D`, same `D` the Newton solve already uses) for when it's
+   actually implemented.
+
+MLT (Sub-task 8c) was also discussed and deprioritized for this specific question: the newly-
+identified persistent feature is a genuinely RADIATIVE zone (grad_rad<grad_ad already, per the
+Schwarzschild criterion), where MLT's superadiabatic-excess correction doesn't directly apply
+- MLT would matter more for the deep convective interior, which looks close to adiabatic
+already.
+
+**The sensitivity check, implemented as agreed**
+(`validation.check_outer_envelope_recombination_sensitivity`, new `Check 38`, plus
+`plot_outer_envelope_recombination_sensitivity`): entirely sterile - a provisional
+`_mu_proxy_atomic_molecular(T)` logistic (`T_MID=2500 K`, `WIDTH=180 K`, deliberately wide
+per the `GRAD_EFF_SWITCH_EPSILON` lesson) defined LOCALLY in `validation.py`, not touching
+`eos.py`/`odes.py`. Both limits anchored to `config.py`'s existing values rather than new
+literals: the atomic limit reduces exactly to `config.MU`, and the molecular limit is derived
+from X backed out of `config.MU_E`'s own `mu_e=2/(1+X)` definition (a nice internal
+consistency check in itself - this independently reproduces `mu_atomic~1.279`, matching
+`config.MU=1.278` to 3 decimals). Loads the 10 Gyr run's final snapshot (already
+self-consistently converged under constant atomic `mu`), re-evaluates `rho` at the SAME
+`(P,T)` via `eos.density` with the proxy `mu(T)`, and re-integrates `r(m)` via the same
+continuity equation `odes.py` uses (`dr/dm=1/(4*pi*r^2*rho)`, independently, via a PCHIP
+interpolant of `rho(m)` fed to `scipy.integrate.solve_ivp`) - holding `P(m)`, `T(m)` fixed,
+isolating the pressure-support effect without touching the energy equation or re-solving the
+coupled BVP.
+
+A **control run** (re-integrating with the ORIGINAL `rho`, identical method) is used as the
+baseline rather than the raw cached `r_surface`, specifically to cancel the method's own
+discretization error: the saved snapshot is a `config.N_GRID_POINTS=200` resample of
+`solve_bvp`'s actual ~4900-node adaptive mesh, and PCHIP reproduces the cached profile to
+~1e-5 relative accuracy everywhere except the single outermost boundary segment (the fixed
+output grid's endpoint spacing is coarser than its geometrically-refined neighbors there) -
+found empirically while prototyping (plain linear interpolation gave ~1% control error, plain
+log-interpolation made it *worse*, ~15%, by badly extrapolating across that one segment's
+~300x density drop; PCHIP got it down to ~0.6%, concentrated entirely in that one point).
+
+**Result: SIGNIFICANT.** `Delta r_surface = -0.144 R_Jup (-3.1%)`, control floor `0.63%`
+(effect is ~5x the floor), against the pre-agreed `>=1%` "worth implementing" threshold.
+Direction makes physical sense at the local level: raising `mu` at fixed `(P,T)` raises the
+implied `rho` (`rho=P*mu*m_H/(k_B*T)`), which compresses those outer shells
+(`dr/dm=1/(4*pi*r^2*rho)` shrinks) - the opposite sign from the earlier GLOBAL virial argument
+used when first evaluating the user's original claim, because that argument held the whole
+star's average T fixed and let mass/energy re-equilibrate, while this test holds the exact
+`P(m)`, `T(m)` profile fixed and only perturbs the local EOS closure - a different, and here
+oppositely-signed, thought experiment; both are physically legitimate, they just answer
+different questions. The visual check (3-panel plot, `mu(T)` proxy / `rho_new/rho_old` /
+`r_perturbed - r_control`, all vs `m/M_TOTAL` over the outer 10%) shows a smooth, monotonic
+effect building through the outer envelope, though a meaningful share of the total -3.1% is
+concentrated in the single least-resolved final grid segment - the magnitude should be read as
+an order-of-magnitude estimate, not a precise prediction, but the qualitative verdict (real,
+not negligible) looks robust to that caveat.
+
+**Not yet done**: the real implementation (threading a shared `chi(T)`-based `mu(T)`/
+`gamma_eff(T)` through all four `eos.py` call sites in `odes.py`, plus the latent-heat term in
+the energy equation and the `thermodynamic_delta` correction derived above) - this check's
+purpose was specifically to justify that work before investing in it, not to replace it.
+`validation.py` gained `import os`, `scipy.integrate.solve_ivp`, `scipy.interpolate.
+PchipInterpolator`, and `import output` (previously unused there) to support this.
 
 ### 2026-08-10 — ★★★★★ 10 Gyr diagnostic extension: contraction continues but decelerates; resumed live from a saved snapshot for the first time
 

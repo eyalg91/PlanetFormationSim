@@ -21,7 +21,7 @@ import time_stepper
 
 N_STEPS_MAX = 100   # generous cap, not "no limit" - the dual halt condition is the primary expected stop
 SNAPSHOT_DIR = "snapshots_overnight"
-PLOT_DIR = "diagnostic_plots_overnight"
+PLOT_DIR = "diagnostic_plots/run_overnight"   # HOUSEKEEPING 2026-08-10: moved under diagnostic_plots/ to stop cluttering the project root
 DT_SEED = config.RELAX_DT_FRACTION * config.T_KH_TIMESCALE_S
 
 

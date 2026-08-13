@@ -872,6 +872,108 @@ honestly-tuned `dt`/`atol`/`rtol` — not a workaround that masks non-convergenc
 
 ---
 
+#### Sub-task 8b — Outer-Envelope H/H2 Recombination Physics — **★★★ DONE (2026-08-10 evening), Delta r_surface=-5.05% confirmed on the real production solver**
+
+**Goal:** replace `odes.py`'s constant atomic `config.MU`/`config.GAMMA` with a smooth,
+temperature-dependent `mu(T)`/`gamma_eff(T)` in the envelope's cool outer layers
+($T\lesssim3000$ K), where H should be recombining back into H2 as the structure cools —
+**not** the molecular→atomic correction (already done, 2026-08-07, `config.MU=1.278`); this
+is the opposite-direction, opposite-region gap, found by directly inspecting the $T(m)$
+profile at $t=10$ Gyr (8.5%/26%/45% of the mass below 2000/3000/5000 K respectively, and
+growing as the envelope cools further). PROGRESS.md 2026-08-10 has the full physical
+motivation and the sensitivity check's derivation.
+
+**Design** (agreed 2026-08-10, an explicit alternative to a full two-state mass-action
+equilibrium root-solve at every BVP node — deliberately avoiding that stiffness risk given
+this project's history with narrow near-marginal switches, `GRAD_EFF_SWITCH_EPSILON`):
+- A single smooth logistic $\chi(T)$ (molecular fraction), analytic and with an analytic
+  derivative, shared between $\mu(T)$ and $\gamma_\text{eff}(T)$ — not two independently-tuned
+  transition functions. Wide by design (~150–200 K), not sharp.
+- $\mu(T)$ threaded through **all four** `mu`/`gamma`-dependent calls currently hardcoded to
+  `config.MU`/`config.GAMMA` in `odes.py`: `eos.density`, `eos.grad_adiabatic`, `eos.
+  specific_heat_cp`, `eos.thermodynamic_delta`.
+- Latent heat of H2 dissociation/recombination ($\approx1.5\times10^{12}$ erg/g of H — 3–16x
+  the local thermal energy content across 1000–5000 K, computed directly, not estimated)
+  injected as an explicit `latent_heat * d(chi)/dT` term in the energy equation's effective
+  heat capacity — this is the dominant physics; without it, a bare `mu(T)` pressure fix would
+  be thermodynamically incomplete enough to plausibly bias the result in the wrong direction.
+- Two smaller, but derived and necessary, companion corrections: (a) `specific_heat_cp`
+  evaluated at the local `mu(T)` itself (not just the extra latent-heat term) — quantified at
+  ~10–15% the size of the latent-heat term; (b) `thermodynamic_delta`'s implicit-
+  differentiation formula gains a `+ k_B*T^2*d(1/mu)/dT / D` correction (derived, not yet
+  implemented) since it currently assumes `mu` fixed when differentiating the EOS.
+- `grad_adiabatic` becoming $\gamma_\text{eff}(T)$-dependent is expected to be the single most
+  consequential piece for the specific "floor" question this sub-task grew out of: softening
+  $\Gamma_1$ in the transition zone is the textbook mechanism for destabilizing a radiative
+  zone toward convection, and that zone coincides almost exactly with the persistent
+  radiative layer found in the 10 Gyr run's snapshots (m/M_tot $\in[0.9548,1.0]$).
+
+**Sterile pre-check (done, DECISIVE)**: `validation.check_outer_envelope_recombination_
+sensitivity` (Check 38) — a provisional logistic `mu(T)` proxy applied to the cached 10 Gyr
+snapshot's already-converged $P(m)$, $T(m)$, with $r(m)$ independently re-integrated and
+compared against a control run (isolating the perturbation from the re-integration method's
+own ~0.6% error floor). Result: **$\Delta r_\text{surface}=-3.1\%$**, ~5x the control floor
+and 3x the pre-agreed 1% "worth implementing" threshold — real physics module changes now
+justified, not merely plausible.
+
+**Explicitly deferred**: density dependence in $\chi$ (a real H2 dissociation equilibrium
+constant depends on $\rho$ too, not just $T$ — the current proxy's fixed 2000–3000 K threshold
+is a documented `# ASSUMPTION`, validated only against Phase 3's tenuous outer-envelope
+density regime; flagged as a real, not-yet-checked risk before trusting it as Phase 1's core
+collapse trigger, per the roadmap-pivot discussion 2026-08-10); an explicit $\Gamma_1$-averaged
+dynamical-instability halt condition (needs `gamma_eff(T)` to exist first, which it now does —
+wire it when the Phase 1 driver is actually built); `solve_static_structure`'s adiabatic t=0
+seed construction (deliberately left on constant `config.MU`/`GAMMA` — a coarse Newton-
+iteration starting guess only, immediately corrected by `relax_initial_state`'s real 4-ODE
+solve, which does use the new physics).
+
+**Implementation (2026-08-10 evening) — critical scope correction found during planning,
+before any code was written**: `odes.py`'s `stellar_odes` is **not** the live t>0 solver path.
+`bvp_solver.py` has its own separate, hand-derived RHS (`implicit_rhs_vectorized`) and
+**analytic Jacobian** (`implicit_rhs_jacobian`, `make_bc_jacobian_scaled`) that duplicate this
+physics inline with `config.MU`/`config.GAMMA` hardcoded throughout — threading `mu(T)`/
+`gamma_eff(T)` through `odes.py` alone would have changed nothing about real solver output.
+Staged in two steps to decouple physics correctness from Jacobian correctness:
+
+1. **RHS + boundary conditions, scipy's numerical Jacobian.** All `config.MU`/`config.GAMMA`
+   references in the t>0 solve path (`odes.stellar_odes`, `implicit_rhs_vectorized`'s own
+   direct `grad_adiabatic` call, `make_bc_scaled`, `_bvp_solution_to_state`'s output `rho`)
+   replaced with `mu(T)`/`gamma_eff(T)`. A real `solve_timestep` from the cached 10 Gyr
+   snapshot with `fun_jac=None` converged in 10 iterations, 1.9s: $\Delta r_\text{surface}=
+   -5.09\%$ — confirmed the physics itself before trusting any hand-derived Jacobian math.
+2. **Analytic Jacobian, gated by Check 37 — which caught a real bug on the first attempt,
+   exactly as this staging was meant to allow.** `_eos_density_derivatives`/`_thermodynamic_
+   delta_derivatives` extended with the `mu(T)` correction terms; `implicit_rhs_jacobian`
+   threaded `mu(T)`/`gamma_eff(T)` through every remaining reference, plus **two genuinely
+   new coupling terms** that don't exist under the old constant-$\gamma$/$\mu$ physics:
+   $d(\nabla_\text{ad})/dT$ in row 3 (`J[3,3]`) and $-\dot T\cdot d(c_{p,\text{eff}})/dT$ in
+   row 2 (`J[2,3]`) — `_effective_gradient_derivative` also needed extending to return the
+   previously-nonexistent $d(\nabla_\text{eff})/d(\nabla_\text{ad})$ channel. First Check 37
+   run: 64% relative error — traced to a dropped `/M_H` factor, consistently missed in three
+   places derived from the same flawed mental math (`eos.thermodynamic_delta` and its two
+   mirrors in `bvp_solver.py`). Fixed; Check 37 re-run passed at 6.5e-7, including new forced
+   test-point coverage of the 2000-3000 K transition window itself (the prior random sampling
+   had only a ~3.6%-per-point chance of ever exercising the new terms).
+
+**Regression check: zero new failures.** Full `validation.py` suite, end-to-end — the only two
+failing checks (17, 23) are confirmed to be the exact same pre-existing, already-documented
+failures from the 2026-08-08 `solve_bvp` promotion (matching error magnitudes precisely), not
+new regressions. Also fixed in passing: `eos.molecular_fraction`'s bare `1/(1+exp(x))`
+overflowed at extreme T (`scipy.special.expit` instead — numerically stable, mathematically
+identical).
+
+**Final production result**: real `solve_timestep` from the cached 10 Gyr snapshot, corrected
+analytic Jacobian, 9 iterations, 1.55s — $r_\text{surface}$: 4.5966 → 4.3642 $R_\text{Jup}$
+($\Delta=-5.05\%$) for one real 1e8 yr timestep, noticeably larger than Check 38's simplified
+static (P,T)-fixed proxy (-3.1%), as expected once the full 4-ODE system (T, L, r all
+responding self-consistently) is actually solved rather than approximated.
+
+**Status: DONE.** A full multi-step re-run (comparable to the existing 10 Gyr trajectory, to
+see the cumulative effect over the whole simulated history) is the natural next step, not yet
+done in this pass.
+
+---
+
 #### Sub-task 8c — Mixing-Length Theory (MLT) Convection Treatment — **MANDATORY before quantitative trust in sustained multi-step evolution; formally deferred past the one-week thesis deadline**
 
 **Why this is mandatory, not optional polish.** `gradients.py`'s Schwarzschild switch
@@ -885,17 +987,29 @@ trail for both) — not a coincidence, but the same underlying idealization surf
 from opposite directions (saturated-convective rank deficiency, then marginal-convective
 mesh explosion as a real timestep collapses the outer envelope's $L$).
 
-**Interim expedient in place, not a fix (2026-08-08).** `config.
-GRAD_EFF_SWITCH_EPSILON_TIMESTEP` widens the same smoothed switch's transition width by
-~3 orders of magnitude, but ONLY for `bvp_solver.solve_timestep`'s real-$dt$ solves — a
-purely numerical regularization (confirmed, not assumed: it measurably distorts
-$T_\text{surface}$/$L_\text{surface}$ by an amount that scales with the chosen width, e.g.
-$\sim$0.17K/14x respectively between $\varepsilon=0.1$ and $\varepsilon=0.5$ — PROGRESS.md),
-not an approximation to MLT's actual physics (no convective velocity, no mixing length, no
-genuine dependence on superadiabaticity). Chosen and verified over a real 5-step evolution
-run, with margin above the measured failure boundary — but it does not know how the true
-convective flux scales with superadiabaticity, so its accuracy in the transition layer is
-unverified beyond "the bulk quantities barely move and the run doesn't crash."
+**Interim expedient in place, not a fix (2026-08-08, value revised 2026-08-11).** `config.
+GRAD_EFF_SWITCH_EPSILON_TIMESTEP` widens the same smoothed switch's transition width, but
+ONLY for `bvp_solver.solve_timestep`'s real-$dt$ solves — a purely numerical regularization
+(confirmed, not assumed: it measurably distorts $T_\text{surface}$/$L_\text{surface}$ by an
+amount that scales with the chosen width, e.g. $\sim$0.17K/14x respectively between
+$\varepsilon=0.1$ and $\varepsilon=0.5$ — PROGRESS.md), not an approximation to MLT's actual
+physics (no convective velocity, no mixing length, no genuine dependence on
+superadiabaticity).
+
+**2026-08-11 finding, strengthening this section's own "mandatory" framing**: after fixing two
+genuine, unrelated numerical kinks this same session (a P/T solver clamp with zero derivative
+in saturation, and a Bell & Lin opacity C1 discontinuity) — both plausible confounding
+contributors to this same photospheric region's difficulty — this value was re-swept against
+the actual Phase 3 validation run's real step-4 failure to test whether it could now shrink.
+It could not: $\varepsilon=0.5$ (the prior value) still fails; $\varepsilon=1.0$ is actively
+pathological (a 43-minute direct solve attempt before also failing); $\varepsilon=2.0$
+converges cleanly and was adopted (PROGRESS.md 2026-08-11 has the full sweep). The band this
+switch smooths over needed WIDENING, not narrowing, once the confounding kinks were cleared —
+direct evidence it is a genuinely marginal $\nabla_\text{rad}\sim\nabla_\text{ad}$ region, not
+a numerical artifact those other fixes were expected to shrink. Its accuracy in the transition
+layer remains unverified beyond "the bulk quantities barely move and the run doesn't crash,"
+and there is still no evidence this value's demands plateau rather than keep growing over a
+longer run.
 
 **Deliverables (design, not yet started):**
 - Standard mixing-length closure (Böhm-Vitense 1958; Kippenhahn & Weigert Ch. 7): convective

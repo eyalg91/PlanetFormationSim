@@ -14,6 +14,7 @@ M_H = 1.67262192369e-24     # Hydrogen atom mass [g]
 M_E = 9.1093837015e-28      # Electron mass [g]
 PLANCK_H = 6.62607015e-27   # Planck constant [erg s]
 SIGMA_SB = 5.670374419e-5   # Stefan-Boltzmann constant [erg cm^-2 s^-1 K^-4]
+EV_TO_ERG = 1.602176634e-12   # Electron-volt -> erg conversion (exact, 2019 SI redefinition) [erg eV^-1]
 
 # ==========================================
 # SECTION: Nebula Boundary Conditions
@@ -62,6 +63,66 @@ GAMMA = 5.0 / 3.0     # Adiabatic index of monatomic (atomic, post-dissociation)
 # outer envelope MU describes (a separate, smaller inconsistency accepted for this
 # first-order treatment - see PROGRESS.md Sub-task 2f entry).
 MU_E = 1.17          # Mean molecular weight per electron, solar-like H/He composition [dimensionless]
+
+# ==========================================
+# SECTION: H<->H2 Recombination Equilibrium (Sub-task 8b)
+# ==========================================
+# JUSTIFIED 2026-08-10 by validation.check_outer_envelope_recombination_sensitivity (Check 38:
+# Delta r_surface = -3.1% from a static mu(T) proxy, ~5x its own control floor). Also the
+# shared physical mechanism (PROGRESS.md 2026-08-10) expected to end Phase 1 (First Core
+# collapse) once T_center approaches ~2000K and Gamma_1 softens below 4/3 - built once,
+# generally in T, not as a Phase-3-only patch. ASSUMPTION: T-only (no rho dependence) - a real
+# H2 dissociation equilibrium constant depends on density too; this proxy is validated only
+# for Phase 3's outer-envelope density regime (Check 38) and must be re-checked before being
+# trusted as Phase 1's core collapse trigger (denser regime, not yet tested).
+X_HYDROGEN = 0.71     # Solar-like H mass fraction - matches MU/MU_E's own existing derivation (their comments above), not an independent literal [dimensionless]
+
+# ASSUMPTION: an internal escape hatch, NOT a user-facing physics toggle - when False,
+# eos.mean_molecular_weight/gamma_effective fall back to the constant config.MU/config.GAMMA
+# (the pre-Sub-task-8b behavior). Exists solely so bvp_solver.relax_initial_state can run its
+# first stage under the OLD physics (proven convergent) before warm-starting a second stage
+# with the real physics turned back on - see RELAX_RECOMBINATION_MICRO_DT_FRACTION's own
+# comment below for the full reasoning. Always True outside that internal use.
+USE_H2_RECOMBINATION_PHYSICS = True
+
+# REVIEWED 2026-08-11 (Senior Numerical Analyst review, PROGRESS.md has the full report):
+# bvp_solver._safe_exp_state clamps solve_bvp's trial (lnP, lnT) against float overflow during
+# early, undamped Newton excursions - but the analytic Jacobian (implicit_rhs_jacobian,
+# make_bc_jacobian_scaled) was never updated to differentiate THROUGH that clamp, so whenever
+# many mesh points saturate to the same clamp boundary simultaneously, their (still-uncorrected)
+# Jacobian rows become identical -> a genuinely singular collocation matrix, not a physical
+# convergence failure. Toggling this OFF (bvp_solver.relax_initial_state's stage 1, which never
+# needed the clamp - proven convergent before Sub-task 8b without it) avoids the inconsistency
+# entirely rather than masking it; stage 2 keeps clamping ON but switches to scipy's own
+# numerical Jacobian (fun_jac=None) instead, which differentiates the ACTUAL clamped function
+# by construction - no hand-derived formula to get out of sync. Always True in normal
+# production use (solve_timestep); this is an internal escape hatch, not a user-facing flag.
+BVP_CLAMP_EXTREME_TRIAL_VALUES = True
+
+# H2 dissociation energy: D0=4.478 eV/molecule (standard reference value) -> per-gram latent
+# heat reservoir for a FULLY molecular gram of hydrogen, EPSILON_D_H2 = X*(D0/2)/M_H [erg/g]
+# (the /2 converts "per H2 molecule" to "per H atom", since mu(T) tracks atomic fraction).
+# Cross-checked directly against the local thermal energy content of atomic gas
+# (validation.py's Check 38 discussion, PROGRESS.md 2026-08-10): 3-16x LARGER across
+# T=1000-5000K - the dominant term in the energy equation's effective heat capacity, not a
+# minor correction.
+D0_H2_EV = 4.478   # H2 dissociation energy [eV/molecule]
+EPSILON_D_H2 = X_HYDROGEN * (D0_H2_EV * EV_TO_ERG) / (2.0 * M_H)   # Specific latent heat reservoir, per gram of fully-molecular H [erg/g]
+
+# Logistic (sigmoid) proxy for the molecular fraction chi(T), 1=fully molecular (T low),
+# 0=fully atomic (T high) - deliberately WIDE, not sharp, per this project's own hard-won
+# lesson from GRAD_EFF_SWITCH_EPSILON (a narrow transition risks reintroducing exactly the
+# solver stiffness that smoothing was meant to avoid there). WIDTH=180K puts T=2000K at
+# chi~0.94 and T=3000K at chi~0.06, bracketing the target dissociation range.
+T_H2_TRANSITION_MID = 2500.0     # Logistic H<->H2 transition midpoint [K]
+T_H2_TRANSITION_WIDTH = 180.0    # Logistic transition width [K]
+
+# GAMMA (5/3, monatomic) is the ATOMIC limit; molecular H2 has 2 additional rotational
+# degrees of freedom (Cv=5/2*k_B vs 3/2*k_B), giving the standard diatomic value 7/5 - same
+# atomic-vs-molecular logic as GAMMA's own 2026-08-07 correction comment above, now applied
+# at the OPPOSITE (molecular, cold) end of the same chi(T) transition instead of assumed
+# fixed at the atomic value everywhere.
+GAMMA_MOLECULAR = 7.0 / 5.0   # Adiabatic index of diatomic (molecular H2) ideal gas [dimensionless]
 
 # ==========================================
 # SECTION: Initial Condition — Compact Post-Collapse Protoplanet (t=0)
@@ -156,6 +217,24 @@ RESIDUAL_TOL = 1.0e-4   # Maximum acceptable |residual| after fsolve reports ier
 # check without false-alarming on business-as-usual brentq precision.
 STATIC_STRUCTURE_RESIDUAL_TOL = 1.0e-2   # Maximum acceptable mass residual from solve_static_structure's brentq root-find [dimensionless]
 
+# BUG FOUND AND FIXED 2026-08-12 (Phase 1 / First Hydrostatic Core pivot calibration):
+# brentq's xtol argument is an ABSOLUTE tolerance on the ROOT VARIABLE itself (P_center, a
+# PRESSURE) - the code previously passed config.M_TOTAL*1e-12 there, a MASS-scaled quantity
+# used as a pressure tolerance by dimensional accident. Evaluates to ~1.9e18 - astronomically
+# larger than P_center in EITHER regime (~1e4 dyn/cm^2 diffuse, ~1e11-1e12 dyn/cm^2 compact),
+# meaning brentq's stopping criterion (xtol + rtol*|root|) was always dominated by this
+# oversized xtol, causing premature convergence after essentially 1-2 bisections regardless of
+# how tight rtol=BVP_TOL was set - rtol never got to do its job. Masked for the compact Phase-3
+# case (its mass_error(P_center) is steep enough there that even a coarse P_center still gave
+# an acceptably small mass residual, ~1e-3, historically) but directly exposed calibrating the
+# new diffuse ideal-gas seed (_adiabatic_center_guess_ideal_gas): residuals climbing toward and
+# past STATIC_STRUCTURE_RESIDUAL_TOL as T_center dropped, tracing back to this same
+# under-converged P_center, not a physical problem with the new seed. Fixed with a tiny,
+# genuinely negligible absolute floor (matching scipy's own brentq default order of magnitude)
+# so BVP_TOL's relative tolerance - the one actually chosen for a reason - does the real work,
+# regardless of which regime's P_center scale is in play.
+STATIC_STRUCTURE_BRENTQ_XTOL = 2.0e-12   # Absolute floor for brentq's xtol in solve_static_structure - negligible vs any physical P_center, letting BVP_TOL (rtol) govern precision [dyn/cm^2]
+
 # ==========================================
 # SECTION: Time-Stepping Parameters
 # ==========================================
@@ -220,6 +299,20 @@ ADAPTIVE_DT_GROWTH_FACTOR = 1.3   # Max dt_new/dt_used ratio per step (growth on
 ADAPTIVE_DT_MAX = 1.0e8 * SECONDS_PER_YEAR   # Defensive backstop only - not expected to bind under correct operation [s]
 ADAPTIVE_DT_MIN = 1.0e2 * SECONDS_PER_YEAR   # Absolute dt floor, against pathological stalling from a transient dT/dt or dP/dt spike [s]
 
+# ADDED 2026-08-12 (Phase 1 / First Hydrostatic Core pivot - PROGRESS.md has the full report):
+# time_stepper.run's real steps repeatedly hit LOCALIZED, transient difficulty (T_center~1300K,
+# then again near ~1500K) where the growth-capped adaptive dt failed (mesh explosion or
+# singular Jacobian) but a several-times-smaller dt at the SAME state converged directly and
+# cleanly every time - the same "smaller step near a fragile point" pattern already confirmed
+# for relax_initial_state's own pseudo-timestep and the first real step out of it. Rather than
+# keep manually diagnosing and relaunching from the last snapshot each time this recurs,
+# time_stepper.run now retries a failed step with a shrunken dt automatically - standard
+# adaptive-integrator step-REJECTION practice, and a strict robustness improvement (a failure
+# that used to crash the whole run can now recover on its own) with no effect whatsoever on
+# any step that already succeeds on its first attempt.
+STEP_RETRY_MAX_ATTEMPTS = 6      # Number of shrink-and-retry attempts before giving up and raising [dimensionless]
+STEP_RETRY_SHRINK_FACTOR = 0.5   # dt multiplier per retry (halving) - after 6 attempts, up to 64x smaller than the original proposed dt [dimensionless]
+
 # ASSUMPTION 2026-08-09 (Sub-task 10, user's explicit request): a second, physically-motivated
 # halt condition alongside R_HALT, so an indefinitely long run cannot occur if R_HALT (1 R_Jup)
 # is never reached within a physically reasonable timespan (e.g. if the contraction genuinely
@@ -244,7 +337,35 @@ T_MAX_S = 10.0e9 * SECONDS_PER_YEAR   # Total-simulated-time halt condition for 
 # SECTION: Opacity Model Flags
 # ==========================================
 
-OPACITY_SMOOTH_TRANSITIONS = False  # Bell & Lin (1994) regime switch: False = physically correct hard switch, True = logistic-blended kappa(T) near transitions
+# RESOLVED 2026-08-11 (PROGRESS.md has the full diagnostic trail): kappa(rho,T) is continuous
+# at Bell & Lin regime boundaries by construction (transition_temperature is defined as where
+# the two power laws are EQUAL), but d(kappa)/dT is NOT - adjacent regimes have different (a,b)
+# exponents, so the derivative genuinely jumps there. This was flagged as the leading
+# unconfirmed suspect for a "third wall" as far back as 2026-08-06 (the shooting-method era,
+# PLAN_BVP.md), never actually confirmed, and the project pivoted to solve_bvp instead of
+# resolving it. Directly confirmed 2026-08-11: a real solve_timestep mesh explosion (75,981
+# nodes to converge, vs ~20-50 in a normal region) traced to >1300x node-density concentration
+# within 1e-5 of the Metal grains<->Ice grain evaporation<->Ice grains boundaries - a Newton-
+# iteration/mesh-refinement pathology chasing a mathematical kink, not real physics needing
+# resolution. Turned ON (was always a stubbed, never-engaged flag before this).
+OPACITY_SMOOTH_TRANSITIONS = True  # Bell & Lin (1994) regime switch: False = physically correct hard switch (C1-discontinuous at boundaries), True = logistic-blended kappa(T) - see above
+
+# Width is in log10(T) space (NOT linear K) because Bell & Lin transitions span T~50K (Ice
+# grains) to T~20000K (Kramers/electron scattering) - a fixed linear-K width would be wildly
+# wrong at one end or the other; a fractional (dex) width scales sensibly across that whole
+# range. This is the SCALE parameter of the logistic (T_trans +- 1 width ~ 27%/73% blended,
+# matching eos.py's T_H2_TRANSITION_WIDTH convention), not the full transition span.
+#
+# REVISED DOWN from PLAN.md's original Sub-task 2 design spec ("~0.05 dex") after checking it
+# against the narrowest actual regime: Metal grain evaporation spans only ~1820-1897K (~4.2%
+# fractional) at the density probed 2026-08-11 - a literal 0.05 dex SCALE gives a full ~5-95%
+# transition span of ~34% fractional, nearly 8x WIDER than the regime itself, which would
+# smooth away its distinct identity rather than just its boundary kinks. 0.005 dex gives a
+# ~3% full span, comfortably narrower than that regime - a deliberately conservative starting
+# point, to be verified (not just trusted) against the actual Step-4 mesh-explosion case
+# before being treated as final, matching this project's established margin-sweep discipline
+# (GRAD_EFF_SWITCH_EPSILON's own tuning history).
+OPACITY_TRANSITION_SMOOTH_WIDTH_DEX = 0.005
 
 # ==========================================
 # SECTION: Reference Units (reporting only, never used in the physics equations)
@@ -398,7 +519,28 @@ GRAD_EFF_SWITCH_EPSILON = 1.0e-4   # Smoothing width of effective_gradient's min
 # production run is attempted later, re-apply the same margin-finding discipline (sweep a
 # candidate value against the actual failing step, don't assume 0.5 holds indefinitely) -
 # there is no proof yet that the marginal band's demands plateau rather than keep growing.
-GRAD_EFF_SWITCH_EPSILON_TIMESTEP = 5.0e-1   # Wider smoothing width, solve_timestep's real-dt solves only [dimensionless]
+#
+# RE-SWEPT 2026-08-11 (PI-directed soft-clamp course correction, PROGRESS.md has the full
+# report) against Phase 3 validation's real step 4 (the exact failing (state, dt) reconstructed
+# from the saved snapshots) - directly testing the hope that fixing the clamp-Jacobian bug and
+# smoothing the Bell & Lin opacity kink might let this shrink back down. It did not - the
+# OPPOSITE: eps=0.5 (unchanged) still fails on this step (now via "max mesh nodes exceeded",
+# not the old "singular Jacobian" - confirming the clamp/opacity fixes DID eliminate their own
+# failure mode, but did not touch this separate one). eps=1.0 is actively pathological (43
+# MINUTES for the direct attempt alone before also failing via alpha-continuation - a red flag
+# of real numerical fragility near that value, not just "still insufficient"). eps=2.0 converges
+# directly, fast, cleanly (2.9s, 9068 nodes); eps=5.0 also succeeds (5.9s, 13952 nodes).
+# eps=2.0 adopted - the smallest CLEANLY converging value found (margin-sweep discipline, same
+# as everywhere else in this project), not the widest.
+#
+# WHAT THIS MEANS, stated plainly: the marginal-convection band this switch smooths over is NOT
+# shrinking as the genuine kinks (clamp, opacity) get fixed - if anything the opposite. That is
+# itself evidence this band is real physics (a genuinely marginal nabla_rad~nabla_ad region, not
+# a numerical artifact this session's other fixes were expected to clear) - exactly the
+# condition PLAN.md's Sub-task 8c (mixing-length theory) already anticipates as the eventual,
+# mathematically complete replacement for this whole switch. Recommend treating Sub-task 8c as
+# increasingly overdue rather than continuing to chase this value upward step by step.
+GRAD_EFF_SWITCH_EPSILON_TIMESTEP = 2.0   # Wider smoothing width, solve_timestep's real-dt solves only [dimensionless]
 
 # ==========================================
 # SECTION: Simulation Halt Condition
@@ -415,6 +557,17 @@ GRAD_EFF_SWITCH_EPSILON_TIMESTEP = 5.0e-1   # Wider smoothing width, solve_times
 # track. It will need reinstating (with its original 2000 K value) if Stage 1 (the first
 # core, PLAN.md "Phase 3 - Extensions") is ever modeled separately.
 R_HALT = 1.0 * R_JUPITER_CM   # Surface radius at which time_stepper.run() halts (Sub-task 8) [cm]
+
+# REINSTATED 2026-08-12 (Phase 1 / First Hydrostatic Core pivot, PI directive - PROGRESS.md has
+# the full report): this is exactly the "reinstating... if Stage 1 is ever modeled separately"
+# case R_HALT's own comment above anticipated. Distinct name from the historical, now-removed
+# T_DISSOCIATION_LIMIT (that was a different-era crash-prevention limit; this is an
+# intentional, Phase-1-specific TARGET halt) - checked in time_stepper.run() alongside R_HALT/
+# T_MAX_S. 1900K, not the literal ~2000K H2-dissociation/Gamma_1<4/3 trigger itself (PLAN.md
+# "Formation Scenario and Scope"): a deliberate ~100K safety margin so the quasi-static solver
+# halts cleanly BEFORE that physical singularity (where the ideal-gas/constant-composition
+# assumption this whole Phase-1 run holds fixed would itself break down), not at it.
+PHASE1_T_CENTER_HALT = 1900.0   # Central temperature at which time_stepper.run() halts a Phase-1 run, just below the H2-dissociation onset [K]
 
 # ==========================================
 # SECTION: solve_bvp Collocation Solver (bvp_solver.py t>0, promoted from bvp_experiment.py 2026-08-08)
@@ -433,6 +586,21 @@ R_HALT = 1.0 * R_JUPITER_CM   # Surface radius at which time_stepper.run() halts
 # not derived; used only to make state_0's assumed-adiabatic construction into a genuine
 # solution of the real, time-differenced 4-ODE system before real time evolution begins.
 RELAX_DT_FRACTION = 0.01   # Fraction of T_KH_TIMESCALE_S used as relax_initial_state's pseudo-timestep [dimensionless]
+
+# TWO-STAGE RELAXATION (2026-08-10, Sub-task 8b debugging - PROGRESS.md has the full trail):
+# solve_static_structure()'s adiabatic seed assumes constant atomic mu/gamma throughout,
+# consistent with the OLD physics but a genuine, sharp inconsistency at the cool photospheric
+# boundary once mu(T)/gamma_eff(T) are real (mu jumps ~1.83x there, Check 38's own finding) -
+# asking one monolithic BVP solve to absorb BOTH the adiabat->Schwarzschild correction AND this
+# fresh composition jump from the raw seed caused a genuine Newton-iteration failure (singular
+# Jacobian, confirmed independent of GRAD_EFF_SWITCH_EPSILON width). Fix: relax_initial_state
+# now runs in two stages - stage 1 under the OLD constant-mu physics (proven convergent,
+# unchanged from pre-Sub-task-8b behavior), stage 2 a single MICRO solve_timestep call with the
+# real physics turned back on, warm-started from stage 1's already self-consistent solution -
+# letting the implicit dt-damped energy equation walk the boundary layer onto the new mu(T)
+# curve gradually, not in one undamped leap. This fraction is deliberately smaller than
+# RELAX_DT_FRACTION itself (a gentler nudge is the whole point).
+RELAX_RECOMBINATION_MICRO_DT_FRACTION = 0.001   # Fraction of T_KH_TIMESCALE_S for the recombination-physics micro-step [dimensionless]
 
 # ASSUMPTION: looser than BVP_TOL (which governs solve_static_structure's solve_ivp/brentq
 # precision, unaffected by this pivot) by design - solve_bvp's collocation residual control
@@ -495,3 +663,41 @@ BVP_ALPHA_CONTINUATION_STEPS = (0.0, 0.5, 0.9, 0.99, 0.999, 0.9999, BVP_ALPHA_MA
 JACOBIAN_VERIFY_N_POINTS = 15    # Number of randomly-sampled mesh points checked against finite differences [dimensionless]
 JACOBIAN_VERIFY_REL_STEP = 1.0e-6   # Relative finite-difference step size for the Jacobian cross-check [dimensionless]
 JACOBIAN_VERIFY_TOL = 1.0e-4     # Maximum acceptable row-normalized relative error before refusing to trust the analytic Jacobian [dimensionless]
+
+# SOFT-CLAMP (REVIEWED 2026-08-11, PI-directed architecture course correction - PROGRESS.md
+# has the full report): bvp_solver._safe_exp_state's ORIGINAL hard np.clip on (lnP, lnT)
+# prevented np.exp() float64 overflow, but had EXACTLY ZERO derivative once saturated - the
+# reason no Newton correction could ever pull a wayward trial value back (no restoring
+# gradient), AND the reason implicit_rhs_jacobian/make_bc_jacobian_scaled's chain-rule factors
+# (which multiply by the bare P, T value, implicitly assuming d(exp(lnX))/d(lnX)=1 always)
+# went actively WRONG in the saturated region rather than just imprecise - the residual no
+# longer depended on the clamped variable at all, but the Jacobian kept reporting that it did.
+# Directly confirmed as the root cause of a step-4 mesh explosion (a center-point trial state
+# collapsing to T_a=P_a=0, r_analytic~rho_c^-1/3 correspondingly diverging to ~4.2e40 cm, with
+# a genuinely singular collocation Jacobian - not a physical convergence failure).
+#
+# Replaced with a smooth softplus-based two-sided saturation (bvp_solver._safe_exp_state):
+# same saturation CENTERS as the old hard clamp (below), but the transition itself is
+# C-infinity with a strictly nonzero derivative everywhere short of float64 underflow, which
+# BVP_SOFT_CLAMP_WIDTH pushes tens of e-folds past the boundary rather than sitting exactly at
+# it - a single bad Newton step can no longer land in a truly flat-gradient region. Moved the
+# bound values here from bare module-level literals in bvp_solver.py (a pre-existing gap
+# against this file's own "no numerical literals outside config.py" rule).
+LN_P_CLAMP = 100.0   # lnP saturation center: P -> [exp(-100), exp(100)] ~ [3.7e-44, 2.7e43] dyn/cm^2, astronomically generous vs this problem's real range (P~1e-4 to 1e11 dyn/cm^2) [dimensionless, natural-log(P / 1 dyn cm^-2)]
+LN_T_MIN = 0.0        # lnT lower saturation center: T -> 1 K floor (NOT symmetric with the P clamp - a T floor much below this makes eos.density's Newton seed badly wrong once paired with a large clamped P, bvp_solver._safe_exp_state's own docstring). Still 50x below this problem's real floor, T_NEB=50K [dimensionless, natural-log(T / 1 K)]
+LN_T_MAX = 100.0      # lnT upper saturation center: T -> ~2.7e43 K ceiling, absurdly hot, never physically reached - the SAFE direction (a large T only shrinks the Newton seed's rho, it doesn't blow it up) [dimensionless, natural-log(T / 1 K)]
+
+# Width of the smooth softplus transition into saturation, in the SAME natural-log units as
+# LN_P_CLAMP/LN_T_MIN/LN_T_MAX. The BINDING constraint is LN_T_MIN=0's margin to the real
+# T floor, T_NEB=50K (lnT=ln(50)=3.91) - only ~3.9 natural-log units, far tighter than lnP's
+# ~75-91 units of margin to its own bounds. softplus((x-lo)/w) needs (x-lo)/w >~ 25 before it
+# reproduces x to float64-relevant (~1e-12 relative, i.e. << any physical measurement/solver
+# tolerance in this problem) precision - an INITIAL width=2.0 was tried first (a naive "small
+# relative to the +/-100 bounds" guess) and FAILED the sterile identity-match check
+# immediately (validation - Test 1: T distorted by 87% at lnT near the T_NEB floor, since
+# 3.91/2.0~=2 widths of margin is nowhere near enough). width=0.1 gives 3.91/0.1~=39 widths
+# of margin at the tightest point (T_NEB), comfortably past the ~25-width threshold, while
+# still retaining a meaningful (non-float64-zero) restoring derivative for ~745 widths (~75
+# natural-log units) past either boundary - see bvp_solver._soft_clamp_derivative's own
+# comment. Verified directly (validation.py Check 40) before use, not assumed.
+BVP_SOFT_CLAMP_WIDTH = 0.1   # Softplus transition width for _safe_exp_state's saturation [dimensionless, natural-log units]
