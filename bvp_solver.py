@@ -608,17 +608,38 @@ def _h2_transition_derivatives(T):
     standard closed-form logistic-derivative identities (no numerical differentiation):
     dchi/dT = -chi*(1-chi)/W (eos.molecular_fraction_derivative), d2chi/dT2 =
     chi*(1-chi)*(1-2*chi)/W^2 (differentiate dchi/dT once more, product rule).
+
+    BUG FIX 2026-08-13: mu, gamma_eff (via eos.mean_molecular_weight/gamma_effective) already
+    correctly flattened to the constant config.MU/config.GAMMA when config.
+    USE_H2_RECOMBINATION_PHYSICS=False, but the DERIVATIVE terms computed inline below
+    (dchi_dT, d2chi_dT2, dgamma_eff_dT) did not check the flag at all, and fed
+    eos.mean_molecular_weight_inv_derivative (itself independently missing the same check,
+    fixed in eos.py the same day) - so the analytic Jacobian kept reporting nonzero
+    sensitivity to T through these channels even once eos.py's residual-side functions
+    (latent_heat_capacity, mean_molecular_weight_inv_derivative) were fixed to return exactly
+    zero. Left unfixed here, that would have reintroduced the exact Jacobian/residual
+    mismatch class this project has already been bitten by twice (the P/T soft-clamp and the
+    smoothed-opacity derivative, both 2026-08-11) - a WRONG nonzero derivative is worse than a
+    missing one, since it steers Newton's correction with confidence in the wrong direction.
+    Gated once, here, rather than in each of chi/dchi/d2chi/dgamma_eff separately, so every
+    downstream consumer (_effective_heat_capacity_derivative, _thermodynamic_delta_derivatives)
+    automatically stays consistent with the now-fixed residual without its own flag check.
     """
+    mu = eos.mean_molecular_weight(T)      # already flag-respecting
+    gamma_eff = eos.gamma_effective(T)     # already flag-respecting
+    chi = eos.molecular_fraction(T)        # unused when the flag is off (returned for shape/API stability only)
+
+    if not config.USE_H2_RECOMBINATION_PHYSICS:
+        zero = np.zeros_like(np.asarray(T, dtype=float))
+        return chi, zero, zero, mu, zero, zero, gamma_eff, zero
+
     W = config.T_H2_TRANSITION_WIDTH
-    chi = eos.molecular_fraction(T)
     dchi_dT = eos.molecular_fraction_derivative(T)
     d2chi_dT2 = chi * (1.0 - chi) * (1.0 - 2.0 * chi) / W**2
 
-    mu = eos.mean_molecular_weight(T)
     d_inv_mu_dT = eos.mean_molecular_weight_inv_derivative(T)          # -(X/2)*dchi_dT
     d2_inv_mu_dT2 = -(config.X_HYDROGEN / 2.0) * d2chi_dT2              # chain rule, one more derivative
 
-    gamma_eff = eos.gamma_effective(T)
     dgamma_eff_dT = (config.GAMMA_MOLECULAR - config.GAMMA) * dchi_dT
 
     return chi, dchi_dT, d2chi_dT2, mu, d_inv_mu_dT, d2_inv_mu_dT2, gamma_eff, dgamma_eff_dT
@@ -1171,14 +1192,31 @@ class _CrashedSolve:
         self.y = y
 
 
+# Exception types this project's physics modules deliberately raise on an unphysical trial
+# state, by established convention (CLAUDE.md / PROGRESS.md 2026-08-01: "real failures should
+# surface, not be papered over") - both of the known live cases are plain `assert` statements:
+# eos.density's Newton-Raphson convergence guard, and gradients.grad_radiative's kappa>0 guard.
+# FloatingPointError/LinAlgError are included for the same reason (genuine numerical failure,
+# not a logic bug), covering scipy's own internal Newton/collocation machinery if it ever
+# raises directly instead of returning a failed status.
+_NUMERICAL_FAILURE_EXCEPTIONS = (AssertionError, FloatingPointError, np.linalg.LinAlgError)
+
+
 def _safe_solve_bvp(fun, bc, x, y, fun_jac, bc_jac):
+    """REVISED 2026-08-13: previously caught bare `except Exception`, which silently
+    reinterpreted ANY exception - including a genuine programming bug (a shape mismatch, a
+    typo, an AttributeError) - as "this (state, dt) needs alpha-continuation," masking real
+    bugs behind a numerical-non-convergence RuntimeError several call-frames up. Narrowed to
+    _NUMERICAL_FAILURE_EXCEPTIONS: an actual bug must propagate immediately as itself, not be
+    swallowed and reported as a solver failure.
+    """
     import traceback
     try:
         return solve_bvp(fun, bc, x, y, tol=config.BVP_COLLOCATION_TOL, max_nodes=config.BVP_MAX_NODES,
                           verbose=2, fun_jac=fun_jac, bc_jac=bc_jac)
-    except Exception as exc:
-        print("bvp_solver: *** solve_bvp raised during Newton iteration (not a clean failed "
-              "status) - full traceback: ***")
+    except _NUMERICAL_FAILURE_EXCEPTIONS as exc:
+        print("bvp_solver: *** solve_bvp raised a numerical-failure exception during Newton "
+              "iteration (not a clean failed status) - full traceback: ***")
         traceback.print_exc()
         return _CrashedSolve(x, y, exc)
 

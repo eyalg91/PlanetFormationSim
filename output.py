@@ -19,7 +19,10 @@ import gradients
 import opacity
 import state
 
-SNAPSHOT_DIR = "snapshots"   # relative to wherever the run is launched from, matching diagnostics.PLOT_DIR's own convention
+# HOUSEKEEPING 2026-08-13 (repository cleanup): default snapshot location now nests under
+# diagnostics.OUTPUT_ROOT (same master outputs/ tree run_output_dirs below uses), rather than
+# a bare top-level "snapshots" directory.
+SNAPSHOT_DIR = os.path.join(diagnostics.OUTPUT_ROOT, "snapshots", "default")
 
 # ==========================================
 # SECTION: Per-Run Output Directory Convention
@@ -31,11 +34,15 @@ def run_output_dirs(run_name):
     HOUSEKEEPING 2026-08-10: named runs' plots now NEST under diagnostics.PLOT_DIR as
     diagnostic_plots/run_<run_name>/, instead of sitting as a sibling diagnostic_plots_
     <run_name>/ directory in the project root - the earlier overnight/10gyr runs did the
-    latter and cluttered the root. Snapshot directories keep their existing flat
-    snapshots_<run_name>/ convention unchanged (not part of this cleanup - a much smaller
-    number of directories, one per run, not one PNG per snapshot/profile/check).
+    latter and cluttered the root.
+
+    HOUSEKEEPING 2026-08-13: snapshot directories moved off their old flat top-level
+    snapshots_<run_name>/ convention and now nest under diagnostics.OUTPUT_ROOT too
+    (outputs/snapshots/<run_name>/), so every run's snapshots AND plots live under the same
+    single outputs/ tree instead of snapshots_* siblings cluttering the project root.
     """
-    return f"snapshots_{run_name}", f"{diagnostics.PLOT_DIR}/run_{run_name}"
+    return (os.path.join(diagnostics.OUTPUT_ROOT, "snapshots", run_name),
+            os.path.join(diagnostics.PLOT_DIR, f"run_{run_name}"))
 
 
 # ==========================================

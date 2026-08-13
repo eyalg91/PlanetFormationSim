@@ -1,0 +1,29 @@
+# PlanetFormationSim — generated artifacts only. Source code (core physics modules,
+# validation.py, run_scripts/) is tracked; everything a run PRODUCES is not.
+
+# ==========================================
+# All generated simulation output (snapshots, diagnostic/evolution plots, per-run logs) -
+# output.py/diagnostics.py always write under this one master root (diagnostics.OUTPUT_ROOT).
+# ==========================================
+outputs/
+
+# ==========================================
+# Python bytecode cache - never source, regenerated automatically on every run.
+# ==========================================
+__pycache__/
+*.pyc
+*.pyo
+
+# ==========================================
+# Editor/OS cruft
+# ==========================================
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# Ad hoc local scratch files (dev_cache.py pickles, one-off diagnostic checkpoints) -
+# never meant to be shared/reviewed, regenerable on demand.
+# ==========================================
+*.pkl
+*_checkpoint.npz
+*_checkpoint.txt

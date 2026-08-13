@@ -16,7 +16,12 @@ import eos
 import gradients
 import opacity
 
-PLOT_DIR = "diagnostic_plots"   # all diagnostic PNGs save here by default, not the project root
+# HOUSEKEEPING 2026-08-13 (repository cleanup): every generated artifact (snapshots, plots,
+# logs) now nests under one master OUTPUT_ROOT rather than sitting as loose top-level
+# directories - output.py's SNAPSHOT_DIR/run_output_dirs derive from this same root, so
+# snapshots and their matching plots always land in one consistent outputs/ tree.
+OUTPUT_ROOT = "outputs"
+PLOT_DIR = os.path.join(OUTPUT_ROOT, "diagnostic_plots")   # all diagnostic PNGs save here by default, not the project root
 
 # ==========================================
 # SECTION: Generalized Virial Balance (Unconfined)

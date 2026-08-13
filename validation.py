@@ -238,6 +238,7 @@ def plot_combined_eos_pressure_vs_density() -> None:
     ax.legend()
     fig.tight_layout()
     output_path = f"{diagnostics.PLOT_DIR}/combined_eos_pressure_vs_density.png"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     print(f"Check 36 - saved {output_path} (visible check)")
@@ -310,6 +311,7 @@ def plot_transition_temperatures(output_path=f"{diagnostics.PLOT_DIR}/opacity_tr
     ax.set_title("Bell & Lin (1994) opacity regime transition temperatures")
     ax.legend(fontsize=7, loc="best")
     fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -464,6 +466,7 @@ def plot_opacity_along_synthetic_profile(output_path=f"{diagnostics.PLOT_DIR}/op
     ax_kappa.set_title("Bell & Lin opacity along the synthetic profile")
 
     fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -806,6 +809,7 @@ def plot_constant_density_profile_ode_check(output_path=f"{diagnostics.PLOT_DIR}
     ax_resid.legend(loc="best")
 
     fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -816,9 +820,30 @@ def plot_constant_density_profile_ode_check(output_path=f"{diagnostics.PLOT_DIR}
 # SECTION: Boundary Conditions — Residual Indexing and Sign Check
 # ==========================================
 
+def _live_boundary_residual(ya, yb):
+    """Physical-space 4-residual BC: r=0, L=0 at the center; P=P_photosphere (mechanical,
+    Eddington tau=2/3) and the net radiative flux balance L=4*pi*r^2*sigma_SB*(T^4-T_neb^4)
+    (thermal) at the surface.
+
+    REVISED 2026-08-13: this used to be the module-level boundary_conditions.boundary_
+    conditions() wrapper, which hardcoded config.MU (the fixed ATOMIC value) in the
+    photospheric density/opacity lookup - stale since Sub-task 8b (2026-08-10) made mu vary
+    with T (eos.mean_molecular_weight), which bvp_solver.make_bc_scaled (the LIVE t>0 boundary
+    condition) already accounts for. That wrapper was deleted as dead/unsynced duplication
+    (boundary_conditions.py's own docstring has the full history); this inline port uses
+    eos.mean_molecular_weight(T_b) instead, matching make_bc_scaled's actual physics, so this
+    check validates what solve_timestep really solves rather than a stale approximation of it.
+    """
+    r_a, _, L_a, _ = ya
+    r_b, P_b, L_b, T_b = yb
+    P_expected = boundary_conditions.photospheric_pressure(r_b, P_b, T_b, eos.mean_molecular_weight(T_b), config.MU_E)
+    L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
+    return np.array([r_a, L_a, P_b - P_expected, L_b - L_expected])
+
+
 def check_boundary_conditions_residuals() -> None:
-    """Confirm boundary_conditions() is exactly zero at the true BCs, that perturbing each of
-    ya[0], ya[2] shifts exactly its own (linear) residual component and no other, and that
+    """Confirm _live_boundary_residual() is exactly zero at the true BCs, that perturbing each
+    of ya[0], ya[2] shifts exactly its own (linear) residual component and no other, and that
     both surface conditions - the photospheric mechanical residual (implicit in P_b, since
     photospheric_pressure itself depends on P_b via eos.density -> opacity.bell_lin_opacity)
     and the net-flux radiative thermal residual (nonlinear in T_b, r_b) - match their exact
@@ -831,6 +856,14 @@ def check_boundary_conditions_residuals() -> None:
     (boundary_conditions.photospheric_pressure) since Sub-task 5 (2026-07-27). Because that
     condition is implicit in P_b, the "exact BC" reference point below is found by a small
     bracketed root-find at a chosen (r_test, T_test), not simply assumed.
+
+    REVISED AGAIN 2026-08-13 (repository cleanup): ported off the deleted module-level
+    boundary_conditions.boundary_conditions() onto _live_boundary_residual() above, which uses
+    eos.mean_molecular_weight(T) rather than the stale fixed config.MU - see that function's
+    own docstring. T_test=config.T_NEB is well into the cool, mostly-molecular regime where the
+    two values differ most, so this also closes a real coverage gap: the old version could not
+    have caught a regression in the mu(T) physics at exactly the boundary condition it matters
+    most for.
     """
     r_test = 7.0e9         # Representative surface radius [cm]
     T_test = config.T_NEB   # Surface temperature at equilibrium (thermal residual = 0 here too) [K]
@@ -842,17 +875,17 @@ def check_boundary_conditions_residuals() -> None:
     # than assumed, the same discipline used throughout this project for this exact equation
     # (bvp_solver.solve_static_structure's own photosphere event does the analogous thing).
     def mechanical_residual(P_b):
-        return P_b - boundary_conditions.photospheric_pressure(r_test, P_b, T_test, config.MU, config.MU_E)
+        return P_b - boundary_conditions.photospheric_pressure(r_test, P_b, T_test, eos.mean_molecular_weight(T_test), config.MU_E)
     P_b_test = brentq(mechanical_residual, 1.0e-6, 1.0e12, xtol=1.0e-30, rtol=1.0e-13)
 
     ya0 = np.array([0.0, P_center_test, 0.0, T_center_test])
     yb0 = np.array([r_test, P_b_test, 0.0, T_test])
-    res0 = boundary_conditions.boundary_conditions(ya0, yb0)
+    res0 = _live_boundary_residual(ya0, yb0)
 
-    print("Check 19 - boundary_conditions() residual indexing and sign check")
+    print("Check 19 - boundary condition residual indexing and sign check (live mu(T) physics)")
     print(f"  self-consistent photospheric P_b at r={r_test:.3e} cm, T={T_test} K: {P_b_test:.6e} dyn/cm^2")
     print(f"  residual at exact BCs: {res0}")
-    assert res0.shape == (4,), "boundary_conditions() must return exactly 4 residuals for a 4-ODE system"
+    assert res0.shape == (4,), "_live_boundary_residual() must return exactly 4 residuals for a 4-ODE system"
     assert res0[0] == 0.0 and res0[1] == 0.0 and res0[3] == 0.0, (
         "r_a, L_a, and thermal residuals should be exactly zero by construction at this reference point")
     assert abs(res0[2]) < 1.0e-6 * abs(P_b_test), (
@@ -867,7 +900,7 @@ def check_boundary_conditions_residuals() -> None:
     for label, which, y_idx, res_idx in linear_cases:
         ya, yb = ya0.copy(), yb0.copy()
         (ya if which == "ya" else yb)[y_idx] += delta
-        res = boundary_conditions.boundary_conditions(ya, yb)
+        res = _live_boundary_residual(ya, yb)
         shift = res - res0
         expected_shift = np.zeros(4)
         expected_shift[res_idx] = delta
@@ -882,9 +915,9 @@ def check_boundary_conditions_residuals() -> None:
     for label, y_idx, delta_here in nonlinear_cases:
         yb = yb0.copy()
         yb[y_idx] += delta_here
-        res = boundary_conditions.boundary_conditions(ya0, yb)
+        res = _live_boundary_residual(ya0, yb)
         r_b, P_b, L_b, T_b = yb
-        P_expected = boundary_conditions.photospheric_pressure(r_b, P_b, T_b, config.MU, config.MU_E)
+        P_expected = boundary_conditions.photospheric_pressure(r_b, P_b, T_b, eos.mean_molecular_weight(T_b), config.MU_E)
         L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
         expected_res2 = P_b - P_expected
         expected_res3 = L_b - L_expected
@@ -1055,6 +1088,7 @@ def plot_static_structure_profile(output_path=f"{diagnostics.PLOT_DIR}/static_st
     ax_T.legend(loc="best")
 
     fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -1162,6 +1196,7 @@ def plot_mass_reconstruction_error(output_path=f"{diagnostics.PLOT_DIR}/mass_rec
     ax.set_ylabel("relative error: |M_reconstructed - m| / m")
     ax.set_title("Mass reconstruction check (continuity eq. consistency)")
     fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
@@ -1390,7 +1425,7 @@ def check_bvp_jacobian_matches_finite_differences() -> None:
 # hot interior), and the newly-identified gap is the OPPOSITE direction, in the cool outer
 # layers where H should be recombining back into H2 as the envelope cools over Gyr timescales.
 
-_RECOMBINATION_CHECK_SNAPSHOT = "snapshots_10gyr/snapshot_00055.npz"   # t=10.02 Gyr, the most evolved (coolest, most affected) state on disk
+_RECOMBINATION_CHECK_SNAPSHOT = os.path.join(diagnostics.OUTPUT_ROOT, "snapshots", "10gyr", "snapshot_00055.npz")   # t=10.02 Gyr, the most evolved (coolest, most affected) state on disk - HOUSEKEEPING 2026-08-13: path updated for the outputs/ consolidation
 
 
 def _mu_proxy_atomic_molecular(T):

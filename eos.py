@@ -196,7 +196,17 @@ def mean_molecular_weight(T):
 def mean_molecular_weight_inv_derivative(T):
     """d(1/mu)/dT [K^-1] - feeds thermodynamic_delta's implicit-differentiation correction
     when mu=mu(T) (Sub-task 8b). 1/mu is LINEAR in chi(T) (mean_molecular_weight's own
-    derivation), so this is a simple chain-rule multiply, not a fresh derivation."""
+    derivation), so this is a simple chain-rule multiply, not a fresh derivation.
+
+    BUG FIX 2026-08-13: this derivative did NOT check config.USE_H2_RECOMBINATION_PHYSICS,
+    unlike mean_molecular_weight itself (whose VALUE correctly flattens to config.MU when the
+    flag is off) - so thermodynamic_delta's d_inv_mu_dT correction stayed silently nonzero even
+    when the flag was supposed to disable this whole physics track. Same class of gap as
+    latent_heat_capacity's own fix below - see that function's docstring for the fuller
+    mechanism and how it was found (Phase 1's T_center~1561K solve_timestep wall).
+    """
+    if not config.USE_H2_RECOMBINATION_PHYSICS:
+        return np.zeros_like(np.asarray(T, dtype=float))
     return -(config.X_HYDROGEN / 2.0) * molecular_fraction_derivative(T)
 
 
@@ -226,5 +236,25 @@ def latent_heat_capacity(T):
     absorbs extra energy beyond simple translational heating (quantified in config.py's
     EPSILON_D_H2 comment: 3-16x the local thermal energy content across T=1000-5000K - the
     DOMINANT term in c_p_eff, not a minor correction).
+
+    BUG FIX 2026-08-13: previously did NOT check config.USE_H2_RECOMBINATION_PHYSICS, unlike
+    its siblings mean_molecular_weight/gamma_effective (both correctly fall back to a flat
+    constant when the flag is off). run_phase1_first_core.py sets the flag False specifically
+    to hold Phase 1's composition "strictly constant/molecular... no recombination physics" -
+    but this function kept injecting the full logistic-shaped latent-heat spike (up to ~16x
+    the nominal c_p near T=2500K, config.py's own EPSILON_D_H2 comment) into dL/dm regardless.
+    Root-caused DIRECTLY (not just suspected) to Phase 1's solve_timestep wall at
+    T_center~1561K: reproducing the exact failing (state, dt) and zeroing only this term - with
+    nothing else changed - took the solve from "maximum mesh nodes exceeded" (>80,000 nodes,
+    both at alpha=1 and every alpha-continuation rung including alpha=0) to a clean 13-iteration,
+    3668-node convergence. The mesh explosion is the expected signature: this term is a narrow
+    (T_H2_TRANSITION_WIDTH=180K), sharply-varying feature that a Newton trial state naturally
+    wanders into as T_center climbs toward Phase 1's target (~1900K, within a few widths of
+    T_H2_TRANSITION_MID=2500K) - solve_bvp's adaptive mesh then refines around that spurious
+    feature without bound, independent of dt (structural, not temporal) and independent of the
+    alpha blend (dL/dm's c_p term is never alpha-gated, unlike dT/dm's radiative/adiabatic
+    choice - implicit_rhs_vectorized's own NaN-safe-alpha-blend comment).
     """
+    if not config.USE_H2_RECOMBINATION_PHYSICS:
+        return np.zeros_like(np.asarray(T, dtype=float))
     return -config.EPSILON_D_H2 * molecular_fraction_derivative(T)

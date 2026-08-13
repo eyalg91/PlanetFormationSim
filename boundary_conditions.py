@@ -54,9 +54,14 @@ def photospheric_pressure(r, P, T, mu, mu_e):
     interior to the photosphere), kappa = opacity.bell_lin_opacity(rho, T).
 
     Used two ways: (1) as a solve_ivp EVENT during outward integration
-    (bvp_solver._photosphere_event returns P - photospheric_pressure(r, P, T, ...), zero-
-    crossing marks the photosphere), and (2) as the boundary_conditions() mechanical
-    residual below, evaluated at the converged event point.
+    (bvp_solver._photosphere_event_adiabatic returns P - photospheric_pressure(r, P, T, ...),
+    zero-crossing marks the photosphere), and (2) as the mechanical surface residual in
+    bvp_solver.make_bc_scaled/make_bc_jacobian_scaled (the live t>0 solve_bvp boundary
+    condition - REVISED 2026-08-13: the module-level boundary_conditions() wrapper that used
+    to live in this file was a stale, unsynced duplicate of that live BC - hardcoded
+    config.MU instead of eos.mean_molecular_weight(T), the T-dependent physics make_bc_scaled
+    actually uses - removed; validation.py's check_boundary_conditions_residuals now
+    exercises this function directly with the live mu(T) physics instead).
 
     ASSUMPTION: grey atmosphere (kappa treated as constant over the thin tau=0 to 2/3
     layer) and that the atmosphere's own mass/thickness is negligible against the star's
@@ -70,22 +75,3 @@ def photospheric_pressure(r, P, T, mu, mu_e):
     return (2.0 / 3.0) * g / kappa
 
 
-# ==========================================
-# SECTION: Center and Surface Boundary Residuals
-# ==========================================
-
-def boundary_conditions(ya, yb):
-    """4 residuals: r=0, L=0 at the center; P=P_photosphere (mechanical, Eddington tau=2/3)
-    and the net radiative flux balance L=4*pi*r^2*sigma_SB*(T^4-T_neb^4) (thermal) at the
-    surface (photosphere)."""
-    r_a, _, L_a, _ = ya
-    r_b, P_b, L_b, T_b = yb
-
-    # Center (m=0): r=0 (no cavity at the envelope's center), L=0 (no energy source interior
-    # to the center, since m=0 encloses no mass to generate or carry luminosity)
-    # Surface (photosphere): P = (2/3)*g/kappa (Eddington tau=2/3, module docstring); the
-    # photosphere's net radiated luminosity balances emission at T against absorption from
-    # the ambient field at T_neb   [erg s^-1]
-    P_expected = photospheric_pressure(r_b, P_b, T_b, config.MU, config.MU_E)
-    L_expected = 4.0 * np.pi * r_b**2 * config.SIGMA_SB * (T_b**4 - config.T_NEB**4)
-    return np.array([r_a, L_a, P_b - P_expected, L_b - L_expected])
