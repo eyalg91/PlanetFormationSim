@@ -1601,11 +1601,105 @@ for `solve_timestep`'s organic (no-bootstrap) evolution once that's validated.
 
 ## 5. Change Log
 
+### 2026-08-14 — ★★★★ Overnight high-resolution Phase 1 run: first attempt crashed (a real, useful finding), second succeeded cleanly
+
+`run_scripts/run_phase1_high_res_overnight.py` (own output dir, same physical constraints as
+the baseline run - halt at 1900K, constant composition). Also added `time_stepper.run`'s
+`max_wall_clock_s` parameter (optional, default `None`, zero effect on existing callers) as a
+compute-budget safety net for unattended runs, and made the run script generate plots from
+whatever snapshots exist even if the run itself raises, rather than leaving nothing to review.
+
+**First attempt** raised `BVP_MESH_N_GRID_POINTS` (2000->3000), `BVP_MAX_NODES` (80000->
+120000), and `BVP_COLLOCATION_TOL` (1e-6->1e-7) alongside the free resolution wins. It crashed
+in `relax_initial_state`'s stage 1 - a step that had not failed once, at any $T_\text{center}$,
+anywhere in this project's session-long investigation. The iteration trace showed why: the
+residual already reached ~6-9e-7 (under the OLD 1e-6 tolerance) by iteration 8-9, then kept
+refining past that chasing the tighter 1e-7 target, and that extra refinement is what diverged
+(node count past 55,000, residual back up to 5e-3) - direct evidence that asking for more
+precision than this system can stably deliver, near the same convective-saturation degeneracy
+under investigation (§5's 2026-08-13 entries), makes things worse, not better.
+
+**Second attempt** reverted `BVP_MESH_N_GRID_POINTS`/`BVP_MAX_NODES`/`BVP_COLLOCATION_TOL` to
+config.py's own proven defaults (untouched, not just reset), keeping only `N_GRID_POINTS`
+200->1000 and `GRID_OUTER_REFINEMENT` 1e-4->1e-6 (both OUTPUT-grid-only, zero solver cost) and
+`ADAPTIVE_DT_GROWTH_FACTOR` 1.3->1.15 (time-stepping only, doesn't touch solve_bvp's mesh
+economy). Converged cleanly, 43 steps, reaching `PHASE1_T_CENTER_HALT` at
+$T_\text{center}=1938.0$K, $r_\text{surface}=193.16\,R_\text{Jup}$, $t=2804.6$ yr - 44 snapshots
+and full plots in `outputs/diagnostic_plots/run_Phase1_high_res_overnight_20260813/`.
+
 Most recent first. Each entry: what was done, and the physical/architectural reasoning.
 Entries below marked **[SUPERSEDED]** describe conclusions that later investigation
 overturned — kept rather than deleted because the reasoning inside them (numerical
 findings, derivations, literature checks) remains accurate and load-bearing for
 understanding *why* later decisions were made; only their final conclusion no longer holds.
+
+### 2026-08-13 (still later) — ★★★★★★ Deliberate stress test past PHASE1_T_CENTER_HALT: found the genuine crash at step 12 (T_center~2798K), AND a physically important finding along the way — r_surface reverses and RE-EXPANDS above ~1900K, not just a numerical curiosity
+
+**Explicit request**: push past the 1900K target to see where the solver actually gives out.
+`run_scripts/run_phase1_stress_test_past_halt.py` resumes from the baseline run's own final,
+successfully-halted state (`Phase1_baseline_rerun_20260813/snapshot_00035.npz`, T_center=
+1923.684K, t=1518.6 yr) with `PHASE1_T_CENTER_HALT` overridden to 10000K (effectively disabled,
+runtime-only — `config.py`'s persisted 1900K default is untouched). **Composition stays
+artificially frozen throughout** (`USE_H2_RECOMBINATION_PHYSICS=False`, unchanged) — nothing
+below is real Phase 1 physics past ~1900-2000K; it is a numerics-only characterization of the
+current solver, exactly as intended.
+
+**Physical finding, not just a numerical one:** steps 1-11 (T_center 1959K -> 2798K, t=1519 ->
+2043 yr) all converged (three needed one dt-halving retry each; failure signatures matched the
+2026-08-13 entries below - "max mesh nodes exceeded" on the direct attempt, occasionally
+"Singular Jacobian... iteration 1" on the alpha=0.5 continuation rung). But `r_surface`, which
+had been monotonically contracting for the entire run up to this point, **bottoms out at
+~179 R_Jup around t=1800 yr and then turns around and re-expands to ~188 R_Jup** while
+T_center keeps climbing and accelerating (superlinear: 1959->2002->2057->2126->2176->2237->
+2320->2418->2530->2654->2798K over 11 steps) — confirmed directly in `evolution_curves.png`
+(`outputs/diagnostic_plots/run_Phase1_stress_test_20260813/`), not a plotting artifact. This is
+the expected signature of forcing a fixed-composition ($\Gamma=1.4$ constant, no latent-heat
+sink) ideal gas through the temperature range where real hydrogen would be dissociating and
+absorbing the contraction's released gravitational energy: with that sink disabled, the energy
+goes straight into thermal pressure support instead, and the star unphysically re-expands
+rather than continuing to collapse. **This is a direct, visible confirmation of why
+`PHASE1_T_CENTER_HALT=1900K` is a physically-motivated boundary, not an arbitrary numerical
+safety margin** - past it, the model's own held-fixed assumptions produce qualitatively wrong
+behavior well before the numerics themselves fail.
+
+**The genuine crash**, step 12, attempting to advance from t=2043.4 yr, T_center=2797.600K,
+r_surface=188.07 R_Jup (step 11's converged state): 7 total solve attempts (the original
+proposed dt=27.401 yr, then `STEP_RETRY_SHRINK_FACTOR=0.5` applied 6 times per
+`STEP_RETRY_MAX_ATTEMPTS=6` — 27.401, 13.700, 6.850, 3.425, 1.7125, 0.856, 0.428 yr), **all
+seven failed**. Signatures varied across attempts: most via "maximum number of mesh nodes
+exceeded" on the direct $\alpha=1$ attempt (residual reaching `nan` after 40-55 iterations,
+node count running away past 77,000-79,000 against `BVP_MAX_NODES=80000`); one attempt
+(dt=1.7125 yr) via "Singular Jacobian encountered when solving the collocation system on
+iteration 1" on the $\alpha=0.5$ continuation rung (same signature as the entries below); and,
+notably, in the smaller-dt attempts **even the $\alpha=0$ pure-adiabat continuation rung — which
+had converged cleanly in every prior failure this project has seen, including every case in the
+entries below — itself started failing** the same "max mesh nodes exceeded" way. The final,
+fatal attempt (dt=0.428 yr, the smallest tried, 1/64th of the original step): direct $\alpha=1$
+ran 55 iterations to `nan` residual (239.8s), alpha-continuation's $\alpha=0$ rung then ALSO
+failed (4 iterations, residual non-monotonic — 2.16e+02 -> 1.60e-01 -> 2.35e-01 -> 5.86e+00 —
+node count 53974 with (107946) more flagged as needed, decisively over the 80000 cap). With no
+attempt left, `time_stepper.run`'s retry loop re-raised, crashing the script:
+
+```
+RuntimeError: bvp_solver: solve_bvp failed to converge even via alpha-continuation
+(status=1, The maximum number of mesh nodes is exceeded.) after 9.9s - not a genuine solution
+```
+raised from `_solve_structure_bvp` (`bvp_solver.py:1337`), via `solve_timestep`
+(`bvp_solver.py:1483`) and `time_stepper.run` (`time_stepper.py:134`) — full traceback captured
+in the run log. Exit code 1 (a genuine, unhandled crash, not a graceful halt).
+
+**Read together with the entries below:** the $\alpha=0\to0.5$ singular-Jacobian mechanism is
+still present here, but by T_center~2800K it is no longer the ONLY or even the dominant failure
+mode — the pure-adiabat $\alpha=0$ rung, previously bulletproof, is now failing too. This is
+consistent with (not yet proof of) the same near-global convective-saturation mechanism simply
+getting more severe as $T_\text{center}$ climbs further past the point that mechanism was first
+characterized at (~1600-1900K) — plausible given the star's superadiabaticity
+($\nabla_\text{rad}/\nabla_\text{ad}$) was already 2-3 orders of magnitude at the earlier,
+cooler wall. Not chased further — no speculative fix applied, per explicit instruction; this
+was a deliberate, bounded stress test to locate the crash point, which it did. 11 pre-crash
+snapshots and plots (evolution curves, structure/convective/opacity-regime profiles at t=1519,
+1802, 2043 yr) are saved in `outputs/snapshots/Phase1_stress_test_20260813/` and `outputs/
+diagnostic_plots/run_Phase1_stress_test_20260813/` for reference.
 
 ### 2026-08-13 (later) — ★★★★★★★ FIRST clean full Phase 1 run reaches PHASE1_T_CENTER_HALT (1900K) — the singular-Jacobian wall recurs twice more but is fully absorbed by the existing step-retry mechanism, not fixed
 

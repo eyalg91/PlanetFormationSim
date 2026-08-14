@@ -5,6 +5,8 @@
 # (not on solve_timestep's own critical path - bvp_solver._implicit_rhs_logm does its own
 # inline differencing), now also select_adaptive_dt's own input (Sub-task 9).
 
+import time
+
 import numpy as np
 
 import bvp_solver
@@ -76,7 +78,7 @@ def select_adaptive_dt(state_curr, state_prev, dt_used):
 # SECTION: Outer Time Loop (Kelvin-Helmholtz Contraction)
 # ==========================================
 
-def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
+def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None, max_wall_clock_s=None):
     """Advance state_prev through up to n_steps of bvp_solver.solve_timestep(state, dt),
     halting early on whichever of THREE physically-motivated conditions triggers first: the
     surface radius reaching config.R_HALT (Stage 3's cooling, degenerate-pressure-supported
@@ -91,6 +93,17 @@ def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
     the first call. state_prev should already be genuinely self-consistent with
     solve_timestep's equations (bvp_solver.relax_initial_state's output, not
     solve_static_structure's directly).
+
+    max_wall_clock_s (2026-08-14, added for unattended/overnight runs - NOT a fourth physically-
+    motivated condition like the three above, a pure compute-budget safety net): if given,
+    checked once at the START of each step (before that step's potentially expensive solve is
+    attempted) - once elapsed wall-clock time since this call began reaches it, the loop halts
+    with whatever the last successful state was, same as any other halt (snapshot saved, plots
+    still generatable from disk). Exists because a single retry-storm step near a numerically
+    fragile region (2026-08-13 stress-test findings, PROGRESS.md) can cost minutes per attempt -
+    without this, a run given a fixed compute budget could spend its entire budget stuck
+    retrying one step rather than stopping with whatever real progress it already made. Default
+    None preserves every existing caller's behavior exactly (no wall-clock check at all).
 
     dt is always the SEED timestep for step 1. If config.USE_ADAPTIVE_DT is False (default),
     it is also used for every subsequent step, unchanged from before Sub-task 9. If True,
@@ -108,18 +121,26 @@ def run(state_prev, n_steps, dt, snapshot_interval=1, snapshot_dir=None):
     """
     history = [state_prev]
     mode = "ADAPTIVE (Sub-task 9)" if config.USE_ADAPTIVE_DT else "FIXED"
+    wall_clock_note = f", max_wall_clock={max_wall_clock_s:.0f}s" if max_wall_clock_s is not None else ""
     print(f"time_stepper.run: starting KH-contraction loop, n_steps={n_steps}, dt_mode={mode}, "
           f"seed dt={dt / config.SECONDS_PER_YEAR:.4e} yr, "
           f"R_HALT={config.R_HALT / config.R_JUPITER_CM:.3f} R_Jup, "
           f"t_max={config.T_MAX_S / config.SECONDS_PER_YEAR:.3e} yr, "
-          f"PHASE1_T_CENTER_HALT={config.PHASE1_T_CENTER_HALT:.1f} K", flush=True)
+          f"PHASE1_T_CENTER_HALT={config.PHASE1_T_CENTER_HALT:.1f} K{wall_clock_note}", flush=True)
 
     if snapshot_dir is not None:
         output.save_snapshot(state_prev, 0, snapshot_dir)
 
     state = state_prev
     dt_used = dt
+    wall_clock_start = time.time()
     for step in range(1, n_steps + 1):
+        if max_wall_clock_s is not None and (time.time() - wall_clock_start) >= max_wall_clock_s:
+            print(f"time_stepper.run: wall-clock budget ({max_wall_clock_s:.0f}s) exhausted "
+                  f"before step {step} - halting with the last successful state (a compute-"
+                  f"budget safety net, not a physically-motivated halt)", flush=True)
+            break
+
         state_before_step = state
 
         # Step-retry (2026-08-12, Phase 1 pivot - PROGRESS.md has the full report): a failed
