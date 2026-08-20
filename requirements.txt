@@ -1,0 +1,11 @@
+# PlanetFormationSim — Python dependencies.
+# Pinned to the exact versions this project's current results (PROGRESS.md, outputs/) were
+# produced and verified against, not just a floor - this codebase has a documented history of
+# solver behavior (Newton/collocation convergence near the alpha=0.5 continuation rung, mesh-
+# refinement paths) being sensitive to small numerical differences, so an unpinned install on a
+# different machine is a real, not theoretical, risk of reproducing a qualitatively different
+# outcome (PROGRESS.md's 2026-08-13 entries have the specific finding this is based on).
+# Tested on Python 3.13.5.
+numpy==2.3.0
+scipy==1.15.3
+matplotlib==3.10.3
