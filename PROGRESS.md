@@ -1601,6 +1601,85 @@ for `solve_timestep`'s organic (no-bootstrap) evolution once that's validated.
 
 ## 5. Change Log
 
+### 2026-08-14 (truly final) — ★★★★ `generate_paper_plots.py`: 13-figure complete suite (the 3 previously-dropped plots were meant to be additive, not a replacement)
+
+Clarified: the luminosity profile, photosphere zoom, and pseudo-HR diagram dropped in the
+previous revision were supposed to be ADDED to the 10-figure consolidation, not replaced by it.
+Restored all three (unchanged from their original implementations) into the same script,
+bringing the total to 13. Final order: (1) evolution curves, (2) pseudo-HR diagram, (3)
+structure profiles, (4) luminosity profile, (5) opacity regime maps, (6) convective/radiative
+zones, (7) photosphere zoom, (8) 2D radial cross-sections, (9) seed vs. relaxed, (10) solver
+convergence, (11) resolution convergence, (12) contraction power law, (13) opacity hard-vs-
+smooth. No plotting logic changed in this pass, only restoration + renumbering - every function
+still matches what was already verified visually in the two prior revisions.
+
+### 2026-08-14 (final) — ★★★★ `generate_paper_plots.py` made the single source of truth for the whole 10-figure paper suite
+
+Consolidated the "standard" per-run plots (previously only produced by `output.py`'s
+`generate_all_plots`, as non-vector PNG, without academic formatting) into
+`generate_paper_plots.py` alongside the advanced/analysis figures already there, per explicit
+request that this one script cover everything: (1) evolution curves (R/T/L vs. t, the whole
+run - the main story), (2) structure profiles (T/rho/P, 3 snapshots), (3) opacity regime maps
+(3 snapshots, one shared regime colorbar), (4) convective/radiative zones (extended from a
+single halt-state panel to the same 3 snapshots - shows the near-global convective saturation
+was present from t=0, not just late), (5) 2D radial cross-sections, (6) static seed vs. relaxed,
+(7) solver convergence, (8) resolution convergence, (9) contraction power law, (10) opacity
+hard-vs-smooth. `output.py`'s own `generate_all_plots`/`plot_evolution_curves`/etc. are
+unchanged and still serve their own purpose (quick-look PNGs straight from a live run) - this
+script is the separate, publication-formatted path. The previous round's luminosity-profile,
+photosphere-zoom, and pseudo-HR-diagram figures were dropped (not in this round's 10-figure
+spec) - flagged to the user in case that was an oversight rather than deliberate. All 10 SVGs
+verified visually; no new bugs found this round (the two caught in the previous revision -
+grid lines over the cross-section disks, and the T_center-vs-t matching methodology - stay
+fixed, see the entry directly below).
+
+### 2026-08-14 (latest) — ★★★★ Paper figures revised: SVG, 10 figures, a real methodology bug caught and fixed during review
+
+Revised `run_scripts/generate_paper_plots.py` per explicit request: output switched PDF->SVG;
+Plot 6 (H2 recombination, Phase-3-specific) dropped - strictly Phase 1 now; added a flagship 2D
+radial cross-section figure (4 evolutionary snapshots x {T, rho, kappa}, azimuthally-symmetric
+projection of the 1D profile - exact, not an approximation, for a spherically symmetric model;
+every panel shares one spatial scale so on-page circle size directly encodes actual
+R_surface(t)); added three numerical/analysis figures: solver convergence (a REAL captured
+Newton-iteration residual history via stdout-capture + regex on scipy's own verbose=2 table, not
+synthetic), grid-resolution convergence (baseline vs. high-res run), and a contraction-scaling
+power-law fit ($R\propto t^{-0.241}$, 0.058 dex scatter).
+
+**Caught and fixed during self-review, before delivery:** the first resolution-convergence
+attempt matched the two runs' snapshots by elapsed simulated time $t$, and showed a puzzling
+~22% offset across the ENTIRE interior profile - not the near-photosphere-only pattern a genuine
+resolution effect should produce. Root cause, confirmed directly: the baseline and high-res runs
+use different `ADAPTIVE_DT_GROWTH_FACTOR` (1.3 vs. 1.15), and reach a given $T_\text{center}$ at
+genuinely different simulated times (baseline ~1.8x faster, e.g. 272 yr vs. 486 yr to reach
+$T_c\approx1000$-1014K) - matching by $t$ was silently comparing two different evolutionary
+stages, not testing resolution at all. Fixed by matching on $T_\text{center}$ instead: agreement
+improved to ~1-2% throughout the interior, a properly isolated, genuine grid-independence result.
+Also fixed a minor rendering issue in the cross-section figure (rcParams' default grid was
+drawing visibly over the circular disks - disabled per-panel, not meaningful for that plot type
+anyway).
+
+### 2026-08-14 (later) — ★★★ Paper figures: `run_scripts/generate_paper_plots.py`, 7 vector (PDF) figures for the final write-up
+
+Academic-formatted (large fonts, low-alpha grids, R_Jup/K/L_sun units, no LaTeX dependency -
+mathtext only) figures in `outputs/paper_plots/`: (1) static adiabatic seed vs. relaxed t=0
+state, with a relative-deviation panel (the raw profiles overlap almost exactly through the
+interior - expected, both are near-adiabatic there - so the deviation panel is what actually
+shows the relaxation's effect, concentrated in the outermost ~10% of mass); (2) L(m) at three
+snapshots; (3) T and nabla_rad vs log10(1-m/M_total), zoomed to the outer 1% of mass, with
+nabla_ad overlaid; (4) pseudo-HR diagram, L vs both T_center and R_surface, time-colored, start/
+halt marked; (5) Check 39 (opacity hard-vs-smooth) reproduced exactly, no cached state needed;
+(6) Check 38 (H2 recombination sensitivity) reproduced on a SUBSTITUTE state - the original
+cached 10 Gyr snapshot is not present in this environment, so a freshly-built Phase 3 static-
+structure seed (not relaxed - relaxing it hit the same alpha=0.5 continuation singularity under
+investigation, confirmed directly when first attempted) stands in; same methodology
+(`validation._mu_proxy_atomic_molecular`/`_reintegrate_radius`, called directly, not
+reimplemented), Delta r_surface=-2.27% vs. the original's -3.1% - same order, same sign,
+confirms the substitute is physically reasonable. Plus (7), not requested but recommended and
+added: the convective-zone map at the 1900K halt, showing the envelope convective almost
+everywhere (m/M_total~0 to ~0.999) - the direct visual counterpart of the near-global
+convective-saturation finding from the 2026-08-13 Jacobian-singularity investigation, tying the
+final physical result to the solver-architecture story.
+
 ### 2026-08-14 — ★★★★ Overnight high-resolution Phase 1 run: first attempt crashed (a real, useful finding), second succeeded cleanly
 
 `run_scripts/run_phase1_high_res_overnight.py` (own output dir, same physical constraints as
